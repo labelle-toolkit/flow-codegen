@@ -448,7 +448,15 @@ fn buildBindings(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Binding {
             .value = .{ .zig_text = try parseParamLiteral(a, entry.value_ptr.*) },
         };
     }
+    // `std.json.ObjectMap` iteration order is not deterministic — sort
+    // by param name so the in-memory order (and any `renderFlowJsonc`
+    // re-save) is stable, keeping editor diffs clean (RFC open Q 3).
+    std.mem.sort(Binding, out, {}, lessThanBinding);
     return out;
+}
+
+fn lessThanBinding(_: void, a: Binding, b: Binding) bool {
+    return std.mem.lessThan(u8, a.param, b.param);
 }
 
 fn reqStr(a: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) ![]const u8 {

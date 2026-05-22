@@ -77,6 +77,17 @@ pub const CodegenError = error{
     /// A referenced flow's `param` pin is neither wired, bound, nor
     /// has a declared `default` (RFC §3 precedence rule 3).
     MissingFlowArg,
+    /// Two distinct effective flow names sanitize to the same Zig
+    /// identifier (e.g. `a-b` and `a_b` both → `a_b`). RFC §5 keeps
+    /// effective names unique, but `sanitizeSymbol` is lossy, so a
+    /// collision would emit two `fn` definitions with the same name.
+    SymbolCollision,
+    /// A subgraph (an `OnCall` flow lowered to a `fn` — RFC §6) uses a
+    /// `GetComponent` / `SetField` node, which needs an `entity` in
+    /// scope. Subgraphs receive only declared `params` (RFC §3), so no
+    /// `entity` is available; entity-scoped nodes in a subgraph are
+    /// rejected rather than emitted against an undefined binding.
+    EntityUnavailableInSubgraph,
 };
 
 // =====================================================================
@@ -134,11 +145,40 @@ pub fn detectReferenceCycle(
     chain_out: *?[]const u8,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     chain_out.* = null;
+    const flow = registry.get(start) orelse return; // unresolved: caught at emit time
+    try detectReferenceCycleFlow(allocator, registry, flow, start, chain_out);
+}
+
+/// Like `detectReferenceCycle`, but rooted at a concrete `Flow` value
+/// rather than a registry name. This is the form `renderFlowFile` uses
+/// for the build entry point — the entry flow may be unnamed or absent
+/// from `registry`, and its `Subflow` cycles must still be rejected
+/// (RFC §4 — "caught regardless of which flow is the build entry
+/// point"). `root_name` only labels the root in the reported chain.
+pub fn detectReferenceCycleFlow(
+    allocator: std.mem.Allocator,
+    registry: *const FlowRegistry,
+    root: flow_io.Flow,
+    root_name: []const u8,
+    chain_out: *?[]const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    chain_out.* = null;
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(allocator);
     var visited = std.StringHashMap(void).init(allocator);
     defer visited.deinit();
-    try walkRefs(allocator, registry, start, &stack, &visited, chain_out);
+
+    // Walk the root's own Subflow edges. The root is pushed under
+    // `root_name` so a self/transitive reference back to it is caught
+    // even when the root is not registered under that name.
+    const label = if (root_name.len != 0) root_name else root.name;
+    try stack.append(allocator, label);
+    for (root.nodes) |n| {
+        if (n.kind == .Subflow) {
+            try walkRefs(allocator, registry, n.kind.Subflow.flow, &stack, &visited, chain_out);
+        }
+    }
+    _ = stack.pop();
 }
 
 fn walkRefs(
@@ -221,13 +261,17 @@ pub fn renderFlowFile(
     registry: *const FlowRegistry,
     options: Options,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
-    // RFC §4: cycle check runs before any emission.
-    if (entry.name.len != 0) {
+    // RFC §4: cycle check runs before any emission, rooted at the
+    // entry flow itself — so cycles are rejected even when the entry
+    // is unnamed or not registered ("caught regardless of which flow
+    // is the build entry point").
+    {
         var chain: ?[]const u8 = null;
-        detectReferenceCycle(allocator, registry, entry.name, &chain) catch |err| {
+        detectReferenceCycleFlow(allocator, registry, entry, entry.name, &chain) catch |err| {
             if (chain) |c| allocator.free(c);
             return err;
         };
+        if (chain) |c| allocator.free(c);
     }
 
     // Collect the transitive set of referenced subgraphs.
@@ -236,6 +280,11 @@ pub fn renderFlowFile(
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     try collectSubgraphs(allocator, registry, entry, &subgraphs, &seen);
+
+    // Distinct effective names that sanitize to the same identifier
+    // would emit colliding `fn` definitions — reject up front (RFC §6
+    // assumes symbols don't collide; `sanitizeSymbol` is lossy).
+    try assertNoSymbolCollision(allocator, subgraphs.items);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -348,6 +397,12 @@ fn renderSubgraphFunction(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
+    // A subgraph has no `entity` in scope — only declared params. An
+    // entity-scoped node (GetComponent / SetField) cannot be emitted
+    // against an undefined binding (RFC §3 — params are the only
+    // inputs); reject it explicitly.
+    if (anyNodeNeedsEntity(flow.nodes)) return error.EntityUnavailableInSubgraph;
+
     const symbol = try sanitizeSymbol(allocator, flow.name);
     defer allocator.free(symbol);
 
@@ -356,10 +411,14 @@ fn renderSubgraphFunction(
 
     // Multi-output subgraphs return a named result struct (RFC §6).
     // Declare it just above the function so the type is in scope.
+    // Output names are sanitized to valid Zig identifiers so a name
+    // like `hit-points` or `2nd` still compiles.
     if (outputs.len > 1) {
         try w.print("const {s}_Result = struct {{\n", .{symbol});
         for (outputs) |o| {
-            try w.print("    {s}: {s},\n", .{ o.kind.Output.name, o.kind.Output.type });
+            const field = try sanitizeSymbol(allocator, o.kind.Output.name);
+            defer allocator.free(field);
+            try w.print("    {s}: {s},\n", .{ field, o.kind.Output.type });
         }
         try w.writeAll("};\n");
     }
@@ -377,15 +436,17 @@ fn renderSubgraphFunction(
 
     // Return statement (RFC §6).
     if (outputs.len == 1) {
-        const expr = (try ctx.resolveInput(outputs[0], "value")) orelse return error.DanglingPin;
+        const expr = (try ctx.resolveInput(allocator, outputs[0], "value")) orelse return error.DanglingPin;
         defer allocator.free(expr);
         try w.print("    return {s};\n", .{expr});
     } else if (outputs.len > 1) {
         try w.writeAll("    return .{\n");
         for (outputs) |o| {
-            const expr = (try ctx.resolveInput(o, "value")) orelse return error.DanglingPin;
+            const expr = (try ctx.resolveInput(allocator, o, "value")) orelse return error.DanglingPin;
             defer allocator.free(expr);
-            try w.print("        .{s} = {s},\n", .{ o.kind.Output.name, expr });
+            const field = try sanitizeSymbol(allocator, o.kind.Output.name);
+            defer allocator.free(field);
+            try w.print("        .{s} = {s},\n", .{ field, expr });
         }
         try w.writeAll("    };\n");
     }
@@ -471,20 +532,31 @@ const GraphContext = struct {
         self.allocator.free(self.order);
     }
 
-    /// Resolve `pin` on `consumer` to a Zig expression. `null` when the
-    /// pin is disconnected (caller decides default vs error).
+    /// Resolve `pin` on `consumer` to a Zig expression, allocated on
+    /// `alloc`. `null` when the pin is disconnected (caller decides
+    /// default vs error). Per-node emission passes a scratch arena so
+    /// the returned text is reclaimed after the node; the subgraph
+    /// `return` path passes the long-lived allocator.
     fn resolveInput(
         self: *GraphContext,
+        alloc: std.mem.Allocator,
         consumer: *const flow_io.Node,
         pin: []const u8,
     ) (CodegenError || std.mem.Allocator.Error)!?[]const u8 {
         const edge = self.index.producerOf(consumer.id, pin) orelse return null;
         const producer = self.index.byId(edge.from.node) orelse return error.UnknownPin;
 
+        // A Subflow's output pins are the referenced flow's `Output`
+        // node names (RFC §3) — resolved against the registry so the
+        // scalar-vs-struct shape (RFC §6) is honoured.
+        if (producer.kind == .Subflow) {
+            return try self.resolveSubflowOutput(alloc, producer, edge.from.pin);
+        }
+
         const primary = primaryOutputPin(producer.kind);
         if (primary.len != 0 and std.mem.eql(u8, edge.from.pin, primary)) {
             return try std.fmt.allocPrint(
-                self.allocator,
+                alloc,
                 "n{d}_{s}",
                 .{ producer.id, primary },
             );
@@ -492,18 +564,50 @@ const GraphContext = struct {
         switch (producer.kind) {
             // GetComponent: non-`value` pins are field accesses.
             .GetComponent => return try std.fmt.allocPrint(
-                self.allocator,
+                alloc,
                 "n{d}_value.{s}",
-                .{ producer.id, edge.from.pin },
-            ),
-            // Subflow: a non-primary output pin names a result field.
-            .Subflow => return try std.fmt.allocPrint(
-                self.allocator,
-                "n{d}_result.{s}",
                 .{ producer.id, edge.from.pin },
             ),
             else => return error.UnknownPin,
         }
+    }
+
+    /// Resolve an output `pin` read from a `Subflow` producer. The pin
+    /// must name an `Output` node of the referenced flow (RFC §3). A
+    /// single-output subgraph returns a scalar — the pin resolves to
+    /// `n{id}_result`; a multi-output one returns a struct — the pin
+    /// resolves to `n{id}_result.<sanitized field>` (RFC §6).
+    fn resolveSubflowOutput(
+        self: *GraphContext,
+        alloc: std.mem.Allocator,
+        producer: *const flow_io.Node,
+        pin: []const u8,
+    ) (CodegenError || std.mem.Allocator.Error)![]const u8 {
+        const ref = self.registry.get(producer.kind.Subflow.flow) orelse
+            return error.UnknownFlowRef;
+
+        var output_count: usize = 0;
+        var matched = false;
+        for (ref.nodes) |n| {
+            if (n.kind != .Output) continue;
+            output_count += 1;
+            if (std.mem.eql(u8, n.kind.Output.name, pin)) matched = true;
+        }
+        // The pin must name a real Output of the referenced flow.
+        if (!matched) return error.UnknownPin;
+
+        if (output_count == 1) {
+            return try std.fmt.allocPrint(alloc, "n{d}_result", .{producer.id});
+        }
+        // Multi-output: field name is the sanitized Output name, to
+        // match the generated `<symbol>_Result` struct fields.
+        const field = try sanitizeSymbol(alloc, pin);
+        defer alloc.free(field);
+        return try std.fmt.allocPrint(
+            alloc,
+            "n{d}_result.{s}",
+            .{ producer.id, field },
+        );
     }
 };
 
@@ -650,7 +754,9 @@ fn writeNodeBody(
     ctx: *GraphContext,
     scratch: std.mem.Allocator,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
-    _ = scratch;
+    // `scratch` is a per-node arena (reset in `emitBody`) — every
+    // expression string allocated here is reclaimed once the node is
+    // emitted, so `defer free` is omitted on scratch allocations.
     switch (node.kind) {
         .GetComponent => |b| try w.print(
             "    const n{d}_value = game.getComponent(entity, {s}) orelse return;\n",
@@ -660,18 +766,15 @@ fn writeNodeBody(
             const dot = std.mem.lastIndexOfScalar(u8, b.target, '.') orelse return error.UnknownPin;
             const type_name = b.target[0..dot];
             const field_name = b.target[dot + 1 ..];
-            const value_expr = (try ctx.resolveInput(node, "value")) orelse return error.DanglingPin;
-            defer ctx.allocator.free(value_expr);
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
             try w.print(
                 "    game.setField({s}, .{s}, entity, {s});\n",
                 .{ type_name, field_name, value_expr },
             );
         },
         .BinOp => |b| {
-            const a_expr = (try ctx.resolveInput(node, "a")) orelse try ctx.allocator.dupe(u8, "0");
-            defer ctx.allocator.free(a_expr);
-            const b_expr = (try ctx.resolveInput(node, "b")) orelse try ctx.allocator.dupe(u8, "0");
-            defer ctx.allocator.free(b_expr);
+            const a_expr = (try ctx.resolveInput(scratch, node, "a")) orelse try scratch.dupe(u8, "0");
+            const b_expr = (try ctx.resolveInput(scratch, node, "b")) orelse try scratch.dupe(u8, "0");
             const op_text: []const u8 = switch (b.op) {
                 .add => "+",
                 .sub => "-",
@@ -709,9 +812,8 @@ fn writeNodeBody(
                 if (i > 0) try w.writeAll(", ");
                 var buf: [16]u8 = undefined;
                 const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
-                const expr = (try ctx.resolveInput(node, pin)) orelse
-                    try ctx.allocator.dupe(u8, "undefined");
-                defer ctx.allocator.free(expr);
+                const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                    try scratch.dupe(u8, "undefined");
                 try w.writeAll(expr);
             }
             try w.writeAll(");\n");
@@ -727,8 +829,15 @@ fn writeNodeBody(
                 if (!hasParam(ref.params, bd.param)) return error.UnknownFlowParam;
             }
 
-            const symbol = try sanitizeSymbol(ctx.allocator, ref.name);
-            defer ctx.allocator.free(symbol);
+            // Reject edges wired into a pin that names no declared
+            // param — a typo on a param pin must surface as an error,
+            // not silently fall through to the declared default.
+            for (ctx.flow.edges) |e| {
+                if (e.to.node != node.id) continue;
+                if (!hasParam(ref.params, e.to.pin)) return error.UnknownFlowParam;
+            }
+
+            const symbol = try sanitizeSymbol(scratch, ref.name);
 
             // A void subgraph (zero `Output` nodes) is lowered to a
             // bare call statement; a value-producing one binds the
@@ -741,8 +850,7 @@ fn writeNodeBody(
             }
             for (ref.params) |p| {
                 try w.writeAll(", ");
-                const arg = try resolveSubflowArg(ctx, node, p, b.bindings);
-                defer ctx.allocator.free(arg);
+                const arg = try resolveSubflowArg(scratch, ctx, node, p, b.bindings);
                 try w.writeAll(arg);
             }
             try w.writeAll(");\n");
@@ -752,23 +860,24 @@ fn writeNodeBody(
 
 /// Resolve the value supplied for `param` at a `Subflow` call site,
 /// honouring the RFC §3 precedence: wired pin → `binding` literal →
-/// declared `default`. Returns Zig source text on `ctx.allocator`.
+/// declared `default`. Returns Zig source text on `alloc`.
 fn resolveSubflowArg(
+    alloc: std.mem.Allocator,
     ctx: *GraphContext,
     subflow_node: *const flow_io.Node,
     param: flow_io.Param,
     bindings: []const flow_io.Binding,
 ) (CodegenError || std.mem.Allocator.Error)![]const u8 {
     // 1. Wired — an edge into the param-named input pin.
-    if (try ctx.resolveInput(subflow_node, param.name)) |expr| return expr;
+    if (try ctx.resolveInput(alloc, subflow_node, param.name)) |expr| return expr;
     // 2. Binding literal.
     for (bindings) |bd| {
         if (std.mem.eql(u8, bd.param, param.name)) {
-            return try ctx.allocator.dupe(u8, bd.value.zig_text);
+            return try alloc.dupe(u8, bd.value.zig_text);
         }
     }
     // 3. Declared default.
-    if (param.default) |d| return try ctx.allocator.dupe(u8, d.zig_text);
+    if (param.default) |d| return try alloc.dupe(u8, d.zig_text);
     // Neither wired, bound, nor defaulted (RFC §3 rule 3).
     return error.MissingFlowArg;
 }
@@ -876,6 +985,34 @@ pub fn sanitizeSymbol(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         i += 1;
     }
     return out;
+}
+
+/// Reject the case where two subgraphs with distinct effective names
+/// sanitize to the same Zig identifier — that would emit two `fn`s
+/// with the same symbol and fail to compile (CodegenError.SymbolCollision).
+fn assertNoSymbolCollision(
+    allocator: std.mem.Allocator,
+    subgraphs: []const flow_io.Flow,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    var by_symbol = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = by_symbol.iterator();
+        while (it.next()) |e| allocator.free(e.key_ptr.*);
+        by_symbol.deinit();
+    }
+    for (subgraphs) |sg| {
+        const symbol = try sanitizeSymbol(allocator, sg.name);
+        const gop = try by_symbol.getOrPut(symbol);
+        if (gop.found_existing) {
+            allocator.free(symbol);
+            // Same name twice is fine (registry de-dups); only a
+            // distinct name colliding is an error.
+            if (!std.mem.eql(u8, gop.value_ptr.*, sg.name))
+                return error.SymbolCollision;
+        } else {
+            gop.value_ptr.* = sg.name;
+        }
+    }
 }
 
 fn anyNodeNeedsEntity(nodes: []const flow_io.Node) bool {
