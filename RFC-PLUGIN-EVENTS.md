@@ -293,7 +293,9 @@ comptime-resolution and "no handler is a no-op" properties for free.
 `labelle-tasks` already emits through `HookDispatcher`; plugin events
 joining it is consistent, not novel.
 
-Open question O3 covers ordering determinism across flows.
+Dispatch order is settled by O3: all listeners run; the assembler emits
+handler structs sorted by flow registry name (reproducible builds), but
+the order is an unspecified contract — flows must not depend on it.
 
 ### 5. `game` / `entity` access
 
@@ -402,12 +404,24 @@ the engine work item, not blocking this RFC.
    events (a future `box2d.body_sleep`); meaningless for symmetric
    two-entity events (`collision_begin`). Possibly an optional
    `pub const primary_entity = "entity_a"` decl.
-3. **Dispatch order across flows.** `MergeHooks` calls handlers in
-   handler-struct order (`hook_dispatcher.zig:151-163`). For plugin
-   events that order is the assembler's flow-discovery order — stable
-   but implicit. Do flows need an explicit priority, or is "all
-   listeners run, order unspecified" acceptable (as it is for ECS
-   systems today)?
+3. ~~**Dispatch order across flows.**~~ **Resolved — no priority field;
+   "all listeners run, order deterministic-but-unspecified."**
+   `MergeHooks.emit` `inline for`s the handler structs and calls every
+   one that declares the hook (`hook_dispatcher.zig:148-163`), so all
+   listeners always run. The order is the order the assembler emits
+   those handler structs — **the assembler must sort flow handlers by
+   flow registry name** so builds are reproducible. As an author-facing
+   contract the order is **unspecified — flows must not depend on it**:
+   event reactions are independent side effects (count / sound /
+   particle); a flow that needs another flow to have run first should
+   express that explicitly (a `Subflow` call, or a derived event), not
+   rely on a hidden race. This matches ECS systems today, which run in
+   `SystemRegistry` order with no per-system priority. An explicit
+   `priority` is deliberately deferred: it is a non-breaking addition
+   later (a new optional field with a neutral default), and it becomes
+   genuinely necessary only alongside cancellable events (O4) — where
+   "who runs first" decides who consumes the event — so priority should
+   land *with* O4, not before it.
 4. **Cancellable / consumable events.** A raw `?*const fn(...) void`
    slot cannot signal "handled". Should a registry event payload allow a
    handler to mark the event consumed (stopping later listeners)? Out of
