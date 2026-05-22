@@ -1,186 +1,318 @@
-//! Forward codegen for the Flow editor (`.flow.zon` → Zig source).
+//! Forward codegen for the Flow editor (`.flow.jsonc` → Zig source).
 //!
 //! `renderFlowZig` turns a parsed `flow_io.Flow` into a complete `.zig`
-//! file: imports + one `pub fn` matching the flow's `Event`. The
-//! assembler (separate, follow-up issue) calls this at
-//! `zig build generate` time and writes the result under
-//! `zig-out/.../flows/<name>.zig`.
+//! file: imports + a `pub fn` for the flow's `Event`, plus — when the
+//! flow (transitively) references subgraphs — one `fn` per referenced
+//! flow. The assembler calls this at `zig build generate` time.
 //!
 //! ## Pipeline
 //!
 //! 1. Index nodes by id and build the consumer→producer pin map from
-//!    the link list.
+//!    the edge list.
 //! 2. Topologically sort the nodes (Kahn's algorithm) so a node's
 //!    inputs are always defined before the node itself emits.
-//! 3. For each node, in topo order:
-//!    - emit the preview pulse preamble (folded from #90 — see below);
-//!    - emit the node's Zig template with input pins resolved to
-//!      either the producing node's variable, or a per-kind default.
+//! 3. For each node, in topo order, emit the node's Zig template with
+//!    input pins resolved to the producing node's variable, a `param`
+//!    argument, a `binding` literal, or a per-kind default.
+//!
+//! ## Subgraph composition (RFC-FLOWS-JSONC.md §3, §6)
+//!
+//! A `Subflow` node references another flow by name. `renderFlowFile`
+//! resolves those references through a `FlowRegistry`, runs a
+//! reference-cycle check (RFC §4 — reported with the full chain), and
+//! emits **call-style** code (RFC §6):
+//!
+//! - each referenced flow becomes its own `fn`, named by a
+//!   deterministic symbol derived from its effective name;
+//! - each declared `param` is a function parameter; a `Param` node
+//!   reads it;
+//! - `Output` nodes become the function's return — a single value,
+//!   a struct of named results when there is more than one, or `void`
+//!   when the flow declares none;
+//! - a `Subflow` node lowers to a *call* of that function, every
+//!   argument supplied explicitly (wired pin → `binding` literal →
+//!   declared `default`).
 //!
 //! ## Preview pulse (folded from former issue #90)
 //!
-//! Each emitted node body is preceded by:
-//!
-//! ```zig
-//! if (game.preview) |*_p| {
-//!     _p.emitNodeEntered("<flow_name>", <node_id>) catch {};
-//! }
-//! ```
-//!
-//! The `catch {}` keeps gameplay alive when the preview socket has
-//! closed; the `if (game.preview)` guard means a production build
-//! (no `--preview-mode` on argv) pays zero cost.
+//! Each emitted node body is preceded by an `emitNodeEntered` pulse
+//! guarded by `if (game.preview)` so production builds pay nothing.
 //!
 //! ## Pin variables
 //!
-//! Pin values live in `n<node_id>_<pin>` locals. References between
-//! nodes are entirely by-name (the topo sort guarantees the producing
-//! `const` has executed). `GetComponent` is a special case — it
-//! produces a single `n<id>_value` binding for the whole component,
-//! and downstream consumers can ask for any pin name on that node;
-//! the codegen treats non-`value` pin names as field accesses
-//! (`n<id>_value.<pin>`). This is what makes the issue #46 sketch
-//! (with `GetComponent → BinOp.a` via pin `"x"`) emit sensible Zig.
-//!
-//! ## Entity resolution (v1)
-//!
-//! `GetComponent` and `SetField` need an entity. The resolution is
-//! intentionally minimal in v1:
-//!
-//! - For `.OnCreate` / `.OnDestroy`, the event's `arg_entity` is the
-//!   identifier name used in the emitted code.
-//! - For `.OnUpdate`, there's no obvious entity context yet. If any
-//!   node needs one, the codegen emits a stub
-//!   `const entity: EntityId = undefined; // TODO(#42)` so the file
-//!   still parses; system-style iteration (`for (game.entitiesWith…) |…|`)
-//!   is deferred until the engine API lands.
-//!
-//! ## Disconnected pins
-//!
-//! Per-kind defaults — the renderer is forgiving where it can be:
-//!
-//! - `BinOp.a` / `BinOp.b`: default to `0` (numeric identity-ish).
-//! - `Call.arg<k>`: default to `undefined` (caller already chose the
-//!   shape of the call).
-//! - `SetField.value`: no default — disconnected `value` is an error
-//!   (`DanglingPin`) because a write with no input is meaningless.
+//! Pin values live in `n<node_id>_<pin>` locals. `GetComponent`
+//! produces a single `n<id>_value` binding and downstream consumers
+//! may ask for any pin name (treated as a field access).
 
 const std = @import("std");
 const flow_io = @import("flow_io.zig");
 
-/// Format string for `@import` paths to component type files in the
-/// assembler's project layout. Zig resolves `@import` paths relative
-/// to the importing file's directory, and generated flows live at
-/// `<project>/scripts/flows/<name>.zig` (the v1 convention enforced
-/// by `flow_scanner` in labelle-assembler). Components live at
-/// `<project>/components/<Name>.zig` — two directories up. The `{s}`
-/// substitutes the component type name (`Position`, `Velocity`, …).
 const components_import_path_fmt = "../../components/{s}.zig";
 
-/// Caller-facing configuration. `flow_name` is the stem of the
-/// source `.flow.zon` file — used as the first argument to
-/// `Preview.emitNodeEntered` so the editor can correlate node-entered
-/// events with the on-disk flow. Callers typically derive it via
-/// `flow_io.displayNameFromPath`.
+/// Caller-facing configuration for a single-flow render.
 pub const Options = struct {
     flow_name: []const u8,
 };
 
-/// Codegen-side failure modes. Allocation failures from the supplied
-/// allocator are merged via `CodegenError || std.mem.Allocator.Error`
-/// on the public signature.
+/// Codegen-side failure modes.
 pub const CodegenError = error{
     /// Topo sort couldn't make progress — the graph contains a cycle.
     CycleDetected,
-    /// A required input pin has no incoming link and no per-kind
-    /// default (e.g. `SetField.value`).
+    /// A required input pin has no incoming edge and no default.
     DanglingPin,
-    /// A link names a `to.pin` that isn't part of the consumer
-    /// node's input pin signature.
+    /// An edge names a `to.pin` that isn't an input pin on the
+    /// consumer node.
     UnknownPin,
-    /// A `GetComponent` / `SetField` references a type name that
-    /// contains a `.` (namespaced like `foo.bar.Baz`). v1 codegen
-    /// emits `const <Name> = @import(...);` lines for each referenced
-    /// type, and `const foo.bar.Baz = ...` isn't valid Zig. Bare
-    /// component names only for now; namespaced types are a follow-up.
+    /// A `GetComponent` / `SetField` references a namespaced type.
     NamespacedComponentType,
-    /// Future-proofing for additional `NodeKind` variants. v1 never
-    /// raises this — every shipped variant has a template.
+    /// Future-proofing for additional `NodeKind` variants.
     UnsupportedNodeKind,
+    /// A `Subflow` node references a flow name not in the registry.
+    UnknownFlowRef,
+    /// A `Subflow` reference graph contains a cycle (RFC §4).
+    FlowReferenceCycle,
+    /// A `Subflow` `binding` names a param the referenced flow does
+    /// not declare (RFC §3 — `error.UnknownFlowParam`).
+    UnknownFlowParam,
+    /// A referenced flow's `param` pin is neither wired, bound, nor
+    /// has a declared `default` (RFC §3 precedence rule 3).
+    MissingFlowArg,
 };
 
-/// Render a parsed flow as a Zig source file. Caller owns the
-/// returned bytes (`allocator.free`).
+// =====================================================================
+// Flow registry — name-keyed map for Subflow resolution (RFC §5)
+// =====================================================================
+
+/// A flat, name-keyed registry of flows. `Subflow` references resolve
+/// against it (RFC §5 — flows live in their own namespace, distinct
+/// from prefabs/scenes). Borrows the `Flow` values from the caller.
+pub const FlowRegistry = struct {
+    map: std.StringHashMap(flow_io.Flow),
+
+    pub const RegistryError = error{
+        /// Two flow files share an effective name (RFC §5 —
+        /// `error.DuplicateFlowName`).
+        DuplicateFlowName,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) FlowRegistry {
+        return .{ .map = std.StringHashMap(flow_io.Flow).init(allocator) };
+    }
+
+    pub fn deinit(self: *FlowRegistry) void {
+        self.map.deinit();
+    }
+
+    /// Register `flow` under its effective name. A duplicate effective
+    /// name is `error.DuplicateFlowName` (RFC §5).
+    pub fn add(self: *FlowRegistry, flow: flow_io.Flow) !void {
+        const gop = try self.map.getOrPut(flow.name);
+        if (gop.found_existing) return RegistryError.DuplicateFlowName;
+        gop.value_ptr.* = flow;
+    }
+
+    pub fn get(self: *const FlowRegistry, name: []const u8) ?flow_io.Flow {
+        return self.map.get(name);
+    }
+};
+
+// =====================================================================
+// Cycle detection over Subflow references (RFC §4)
+// =====================================================================
+
+/// Walk the `Subflow` reference graph rooted at `start` and reject any
+/// cycle. On a cycle, `chain_out` is set to a human-readable chain
+/// (`A -> B -> A`) allocated on `allocator` — the caller owns it and
+/// frees it; on success `chain_out` is left `null`.
+///
+/// This is the RFC §4 check. flow-codegen and the GUI run the same
+/// walk and emit the same chain diagnostic.
+pub fn detectReferenceCycle(
+    allocator: std.mem.Allocator,
+    registry: *const FlowRegistry,
+    start: []const u8,
+    chain_out: *?[]const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    chain_out.* = null;
+    var stack: std.ArrayList([]const u8) = .empty;
+    defer stack.deinit(allocator);
+    var visited = std.StringHashMap(void).init(allocator);
+    defer visited.deinit();
+    try walkRefs(allocator, registry, start, &stack, &visited, chain_out);
+}
+
+fn walkRefs(
+    allocator: std.mem.Allocator,
+    registry: *const FlowRegistry,
+    name: []const u8,
+    stack: *std.ArrayList([]const u8),
+    visited: *std.StringHashMap(void),
+    chain_out: *?[]const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    // On-stack name → cycle. Report the full chain (RFC §4).
+    for (stack.items) |s| {
+        if (std.mem.eql(u8, s, name)) {
+            chain_out.* = try formatChain(allocator, stack.items, name);
+            return error.FlowReferenceCycle;
+        }
+    }
+    // Fully explored already — skip (a DAG diamond is not a cycle).
+    if (visited.contains(name)) return;
+
+    const flow = registry.get(name) orelse return; // unresolved: caught at emit time
+    try stack.append(allocator, name);
+    for (flow.nodes) |n| {
+        if (n.kind == .Subflow) {
+            try walkRefs(allocator, registry, n.kind.Subflow.flow, stack, visited, chain_out);
+        }
+    }
+    _ = stack.pop();
+    try visited.put(name, {});
+}
+
+fn formatChain(
+    allocator: std.mem.Allocator,
+    stack: []const []const u8,
+    closing: []const u8,
+) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    // Start the chain at the first occurrence of `closing`.
+    var begin: usize = 0;
+    for (stack, 0..) |s, i| {
+        if (std.mem.eql(u8, s, closing)) {
+            begin = i;
+            break;
+        }
+    }
+    for (stack[begin..]) |s| {
+        try w.writeAll(s);
+        try w.writeAll(" -> ");
+    }
+    try w.writeAll(closing);
+    return aw.toOwnedSlice();
+}
+
+// =====================================================================
+// Public entry points
+// =====================================================================
+
+/// Render a single flow as a Zig source file. When the flow references
+/// subgraphs, prefer `renderFlowFile` — this entry point emits no
+/// subgraph functions and treats a `Subflow` node as `UnknownFlowRef`
+/// unless an empty registry happens to suffice.
 pub fn renderFlowZig(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
     options: Options,
+) (CodegenError || FlowRegistry.RegistryError || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
+    var registry = FlowRegistry.init(allocator);
+    defer registry.deinit();
+    return renderFlowFile(allocator, flow, &registry, options);
+}
+
+/// Render `entry` as a Zig file: its event `pub fn`, plus a `fn` for
+/// every flow transitively reachable through `Subflow` nodes (RFC §6).
+/// `registry` resolves those references. Caller owns the returned bytes.
+pub fn renderFlowFile(
+    allocator: std.mem.Allocator,
+    entry: flow_io.Flow,
+    registry: *const FlowRegistry,
+    options: Options,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
-    // Index, validate, and topo-sort up front so we can stream the
-    // output linearly without back-patching. `index` lives on the
-    // caller's allocator (small, freed before return).
-    var index = try buildIndex(allocator, flow);
-    defer index.deinit();
-
-    const order = try topoSort(allocator, flow, &index);
-    defer allocator.free(order);
-
-    // Validate every link's pin names against the consumer's input
-    // pin signature. Output-side pin names are intentionally NOT
-    // validated — GetComponent treats any output pin as a field
-    // accessor (see module doc), so anything else would be a false
-    // negative.
-    for (flow.links) |l| {
-        const consumer = index.byId(l.to.node) orelse unreachable; // validated upstream
-        if (!isInputPin(consumer.kind, l.to.pin)) return error.UnknownPin;
+    // RFC §4: cycle check runs before any emission.
+    if (entry.name.len != 0) {
+        var chain: ?[]const u8 = null;
+        detectReferenceCycle(allocator, registry, entry.name, &chain) catch |err| {
+            if (chain) |c| allocator.free(c);
+            return err;
+        };
     }
+
+    // Collect the transitive set of referenced subgraphs.
+    var subgraphs: std.ArrayList(flow_io.Flow) = .empty;
+    defer subgraphs.deinit(allocator);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    try collectSubgraphs(allocator, registry, entry, &subgraphs, &seen);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
 
-    // File header. The `Game` / `EntityId` types are conventionally
-    // imported from the consuming project; we re-export the
-    // assumption here so the emitted file is self-contained as far
-    // as Zig is concerned. The assembler will replace these imports
-    // with project-specific ones later.
+    // File header.
     try w.writeAll("//! Generated by labelle-gui codegen — DO NOT EDIT.\n");
     try w.writeAll("//! Source: ");
     try w.print("{f}", .{std.zig.fmtString(options.flow_name)});
-    try w.writeAll(".flow.zon\n\n");
+    try w.writeAll(".flow.jsonc\n\n");
     try w.writeAll("const std = @import(\"std\");\n");
     try w.writeAll("const game_mod = @import(\"game\");\n");
     try w.writeAll("const Game = game_mod.Game;\n");
     try w.writeAll("const EntityId = game_mod.EntityId;\n");
 
-    // Component imports: every type-name referenced by a
-    // `GetComponent` or `SetField` node needs a matching
-    // `@import("../../components/<Name>.zig").<Name>` so the generated
-    // file resolves under the assembler's project layout. We sort
-    // for deterministic output and de-duplicate so a single type
-    // referenced from multiple nodes emits only one import. See
-    // issue #101.
-    const component_types = try collectComponentTypes(allocator, flow);
+    // Component imports — union across the entry flow and all
+    // referenced subgraphs, de-duplicated, sorted (issue #101).
+    const component_types = try collectComponentTypesAll(allocator, entry, subgraphs.items);
     defer allocator.free(component_types);
     for (component_types) |type_name| {
-        try w.writeAll("const ");
-        try w.writeAll(type_name);
-        try w.writeAll(" = @import(\"");
-        try w.print(components_import_path_fmt, .{type_name});
-        try w.writeAll("\").");
-        try w.writeAll(type_name);
-        try w.writeAll(";\n");
+        try w.print(
+            "const {s} = @import(\"" ++ components_import_path_fmt ++ "\").{s};\n",
+            .{ type_name, type_name, type_name },
+        );
     }
     try w.writeAll("\n");
 
-    // Function signature, derived from the event variant.
+    // Entry flow → its event `pub fn`.
+    try renderEntryFunction(allocator, w, entry, registry, options.flow_name);
+
+    // Subgraphs → one `fn` each (RFC §6).
+    for (subgraphs.items) |sg| {
+        try w.writeAll("\n");
+        try renderSubgraphFunction(allocator, w, sg, registry);
+    }
+
+    return aw.toOwnedSlice();
+}
+
+/// Depth-first collect of every flow reachable through `Subflow`
+/// nodes, excluding `entry` itself. Order is deterministic
+/// (discovery order). Assumes the cycle check already passed.
+fn collectSubgraphs(
+    allocator: std.mem.Allocator,
+    registry: *const FlowRegistry,
+    flow: flow_io.Flow,
+    out: *std.ArrayList(flow_io.Flow),
+    seen: *std.StringHashMap(void),
+) (CodegenError || std.mem.Allocator.Error)!void {
+    for (flow.nodes) |n| {
+        if (n.kind != .Subflow) continue;
+        const ref_name = n.kind.Subflow.flow;
+        if (seen.contains(ref_name)) continue;
+        const ref = registry.get(ref_name) orelse return error.UnknownFlowRef;
+        try seen.put(ref_name, {});
+        try out.append(allocator, ref);
+        try collectSubgraphs(allocator, registry, ref, out, seen);
+    }
+}
+
+// =====================================================================
+// Function emission
+// =====================================================================
+
+fn renderEntryFunction(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    flow: flow_io.Flow,
+    registry: *const FlowRegistry,
+    flow_name: []const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    var ctx = try GraphContext.init(allocator, flow, registry);
+    defer ctx.deinit();
+
     try writeFnHeader(w, flow.event);
 
-    // Node templates reference a local `entity` binding. For OnUpdate
-    // there's no inherent entity, so we emit a TODO stub. For
-    // OnCreate/OnDestroy we alias the user-chosen `arg_entity` name
-    // to `entity` so the templates work regardless of whether the
-    // flow named the parameter `entity`, `self`, `victim`, etc.
+    // Entity binding for OnCreate/OnDestroy/OnUpdate templates.
     if (anyNodeNeedsEntity(flow.nodes)) {
         switch (flow.event) {
             .OnUpdate => {
@@ -197,38 +329,188 @@ pub fn renderFlowZig(
                     try w.print("    const entity = {s};\n", .{b.arg_entity});
                 }
             },
+            .OnCall => {},
         }
     }
 
-    // Walk in topo order, emitting preview pulse + node body for each.
-    // Per-node scratch arena keeps the small string allocations from
-    // pin-resolution from churning the caller's allocator.
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    for (order) |id| {
-        const node = index.byId(id) orelse unreachable;
-        try writePreviewPulse(w, options.flow_name, node.id);
-        try writeNodeBody(w, node, flow, &index, scratch.allocator());
-        _ = scratch.reset(.retain_capacity);
+    try emitBody(allocator, w, &ctx, flow_name);
+    try w.writeAll("}\n");
+}
+
+/// Emit one subgraph as a `fn` (RFC §6): params → fn args, `Output`
+/// nodes → return value, body in topo order.
+fn renderSubgraphFunction(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    flow: flow_io.Flow,
+    registry: *const FlowRegistry,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    var ctx = try GraphContext.init(allocator, flow, registry);
+    defer ctx.deinit();
+
+    const symbol = try sanitizeSymbol(allocator, flow.name);
+    defer allocator.free(symbol);
+
+    const outputs = try collectOutputs(allocator, flow);
+    defer allocator.free(outputs);
+
+    // Multi-output subgraphs return a named result struct (RFC §6).
+    // Declare it just above the function so the type is in scope.
+    if (outputs.len > 1) {
+        try w.print("const {s}_Result = struct {{\n", .{symbol});
+        for (outputs) |o| {
+            try w.print("    {s}: {s},\n", .{ o.kind.Output.name, o.kind.Output.type });
+        }
+        try w.writeAll("};\n");
     }
 
+    // Signature: `fn <symbol>(game: *Game, <param>: <type>, …) <ret> {`
+    try w.print("fn {s}(game: *Game", .{symbol});
+    for (flow.params) |p| {
+        try w.print(", {s}: {s}", .{ p.name, p.type });
+    }
+    try w.writeAll(") ");
+    try writeReturnType(w, symbol, outputs);
+    try w.writeAll(" {\n");
+
+    try emitBody(allocator, w, &ctx, flow.name);
+
+    // Return statement (RFC §6).
+    if (outputs.len == 1) {
+        const expr = (try ctx.resolveInput(outputs[0], "value")) orelse return error.DanglingPin;
+        defer allocator.free(expr);
+        try w.print("    return {s};\n", .{expr});
+    } else if (outputs.len > 1) {
+        try w.writeAll("    return .{\n");
+        for (outputs) |o| {
+            const expr = (try ctx.resolveInput(o, "value")) orelse return error.DanglingPin;
+            defer allocator.free(expr);
+            try w.print("        .{s} = {s},\n", .{ o.kind.Output.name, expr });
+        }
+        try w.writeAll("    };\n");
+    }
     try w.writeAll("}\n");
-    return aw.toOwnedSlice();
+}
+
+/// Subgraph return type (RFC §6): `void` for zero `Output` nodes, the
+/// single output's declared `type` for one, and the generated
+/// `<symbol>_Result` struct for many. `Output.type` carries the Zig
+/// type (defaulting to `f32` on disk); precise inference through the
+/// pin type-system is deferred (RFC open question 2 / #44).
+fn writeReturnType(
+    w: *std.Io.Writer,
+    symbol: []const u8,
+    outputs: []const *const flow_io.Node,
+) !void {
+    if (outputs.len == 0) {
+        try w.writeAll("void");
+    } else if (outputs.len == 1) {
+        try w.writeAll(outputs[0].kind.Output.type);
+    } else {
+        try w.print("{s}_Result", .{symbol});
+    }
+}
+
+/// Emit the topo-sorted node bodies for a flow into `w`.
+fn emitBody(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    for (ctx.order) |id| {
+        const node = ctx.index.byId(id) orelse unreachable;
+        try writePreviewPulse(w, flow_name, node.id);
+        try writeNodeBody(w, node, ctx, scratch.allocator());
+        _ = scratch.reset(.retain_capacity);
+    }
 }
 
 // =====================================================================
-// Index + topo sort
+// Graph context — index + topo order, shared by entry & subgraph paths
 // =====================================================================
 
-/// Lookup helpers used during codegen. Owns no flow memory — every
-/// slice borrows lifetime from the caller's `Flow`.
+const GraphContext = struct {
+    allocator: std.mem.Allocator,
+    flow: flow_io.Flow,
+    registry: *const FlowRegistry,
+    index: Index,
+    order: []u32,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        flow: flow_io.Flow,
+        registry: *const FlowRegistry,
+    ) (CodegenError || std.mem.Allocator.Error)!GraphContext {
+        var index = try buildIndex(allocator, flow);
+        errdefer index.deinit();
+
+        const order = try topoSort(allocator, flow);
+        errdefer allocator.free(order);
+
+        // Validate every edge's `to.pin` against the consumer's input
+        // pin signature.
+        for (flow.edges) |e| {
+            const consumer = index.byId(e.to.node) orelse unreachable;
+            if (!isInputPin(consumer.kind, e.to.pin)) return error.UnknownPin;
+        }
+
+        return .{
+            .allocator = allocator,
+            .flow = flow,
+            .registry = registry,
+            .index = index,
+            .order = order,
+        };
+    }
+
+    fn deinit(self: *GraphContext) void {
+        self.index.deinit();
+        self.allocator.free(self.order);
+    }
+
+    /// Resolve `pin` on `consumer` to a Zig expression. `null` when the
+    /// pin is disconnected (caller decides default vs error).
+    fn resolveInput(
+        self: *GraphContext,
+        consumer: *const flow_io.Node,
+        pin: []const u8,
+    ) (CodegenError || std.mem.Allocator.Error)!?[]const u8 {
+        const edge = self.index.producerOf(consumer.id, pin) orelse return null;
+        const producer = self.index.byId(edge.from.node) orelse return error.UnknownPin;
+
+        const primary = primaryOutputPin(producer.kind);
+        if (primary.len != 0 and std.mem.eql(u8, edge.from.pin, primary)) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "n{d}_{s}",
+                .{ producer.id, primary },
+            );
+        }
+        switch (producer.kind) {
+            // GetComponent: non-`value` pins are field accesses.
+            .GetComponent => return try std.fmt.allocPrint(
+                self.allocator,
+                "n{d}_value.{s}",
+                .{ producer.id, edge.from.pin },
+            ),
+            // Subflow: a non-primary output pin names a result field.
+            .Subflow => return try std.fmt.allocPrint(
+                self.allocator,
+                "n{d}_result.{s}",
+                .{ producer.id, edge.from.pin },
+            ),
+            else => return error.UnknownPin,
+        }
+    }
+};
+
 const Index = struct {
     allocator: std.mem.Allocator,
     by_id: std.AutoHashMap(u32, *const flow_io.Node),
-    /// `(to.node, to.pin) → from-node-id`. The key includes both
-    /// fields because a single consumer node may have several input
-    /// pins, each fed by a different producer.
-    producers: std.HashMap(EdgeKey, *const flow_io.Link, EdgeKeyContext, std.hash_map.default_max_load_percentage),
+    producers: std.HashMap(EdgeKey, *const flow_io.Edge, EdgeKeyContext, std.hash_map.default_max_load_percentage),
 
     fn deinit(self: *Index) void {
         self.by_id.deinit();
@@ -239,7 +521,7 @@ const Index = struct {
         return self.by_id.get(id);
     }
 
-    fn producerOf(self: *const Index, consumer: u32, pin: []const u8) ?*const flow_io.Link {
+    fn producerOf(self: *const Index, consumer: u32, pin: []const u8) ?*const flow_io.Edge {
         return self.producers.get(.{ .node = consumer, .pin = pin });
     }
 };
@@ -265,45 +547,32 @@ fn buildIndex(allocator: std.mem.Allocator, flow: flow_io.Flow) !Index {
     var idx: Index = .{
         .allocator = allocator,
         .by_id = std.AutoHashMap(u32, *const flow_io.Node).init(allocator),
-        .producers = std.HashMap(EdgeKey, *const flow_io.Link, EdgeKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
+        .producers = std.HashMap(EdgeKey, *const flow_io.Edge, EdgeKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
     };
     errdefer idx.deinit();
 
     for (flow.nodes) |*n| {
         try idx.by_id.put(n.id, n);
     }
-    // Links borrow `to.pin` straight from the flow's arena, which
-    // outlives the index, so the hash map can store the slice
-    // without copying.
-    for (flow.links) |*l| {
-        try idx.producers.put(.{ .node = l.to.node, .pin = l.to.pin }, l);
+    for (flow.edges) |*e| {
+        try idx.producers.put(.{ .node = e.to.node, .pin = e.to.pin }, e);
     }
     return idx;
 }
 
-/// Kahn's algorithm — produces an order where every node's
-/// dependencies appear before it. Ties break by ascending node id so
-/// the output is deterministic.
+/// Kahn's algorithm — dependencies before dependents, ties by id.
 fn topoSort(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
-    index: *const Index,
 ) (CodegenError || std.mem.Allocator.Error)![]u32 {
-    // In-degree count: for each node, how many of its input pins
-    // are fed by an incoming link. We don't care about pin identity
-    // here, just the count.
     var indeg = std.AutoHashMap(u32, usize).init(allocator);
     defer indeg.deinit();
-    for (flow.nodes) |n| {
-        try indeg.put(n.id, 0);
-    }
-    for (flow.links) |l| {
-        const entry = indeg.getPtr(l.to.node) orelse return error.CycleDetected;
+    for (flow.nodes) |n| try indeg.put(n.id, 0);
+    for (flow.edges) |e| {
+        const entry = indeg.getPtr(e.to.node) orelse return error.CycleDetected;
         entry.* += 1;
     }
 
-    // Seed the ready set with every zero-indegree node, sorted by id
-    // for deterministic output.
     var ready: std.ArrayList(u32) = .empty;
     defer ready.deinit(allocator);
     for (flow.nodes) |n| {
@@ -316,26 +585,21 @@ fn topoSort(
     var emitted: usize = 0;
 
     while (ready.items.len > 0) {
-        // Pop the smallest id to keep the sort stable.
         const next = ready.orderedRemove(0);
         order[emitted] = next;
         emitted += 1;
 
-        // Decrement the indegree of every node `next` feeds. Any
-        // that hit zero join the ready set in id order.
         var added: std.ArrayList(u32) = .empty;
         defer added.deinit(allocator);
-        for (flow.links) |l| {
-            if (l.from.node != next) continue;
-            const e = indeg.getPtr(l.to.node).?;
-            if (e.* > 0) {
-                e.* -= 1;
-                if (e.* == 0) try added.append(allocator, l.to.node);
+        for (flow.edges) |e| {
+            if (e.from.node != next) continue;
+            const d = indeg.getPtr(e.to.node).?;
+            if (d.* > 0) {
+                d.* -= 1;
+                if (d.* == 0) try added.append(allocator, e.to.node);
             }
         }
         std.mem.sort(u32, added.items, {}, std.sort.asc(u32));
-        // Merge `added` into `ready` keeping the latter sorted. A
-        // small list — linear insertion is fine.
         for (added.items) |id| {
             var i: usize = 0;
             while (i < ready.items.len and ready.items[i] < id) : (i += 1) {}
@@ -343,16 +607,12 @@ fn topoSort(
         }
     }
 
-    if (emitted != flow.nodes.len) {
-        return error.CycleDetected; // errdefer above frees `order`
-    }
-
-    _ = index; // unused but kept in the signature for future heuristics
+    if (emitted != flow.nodes.len) return error.CycleDetected;
     return order;
 }
 
 // =====================================================================
-// Emission helpers
+// Node body emission
 // =====================================================================
 
 fn writeFnHeader(w: anytype, ev: flow_io.Event) !void {
@@ -369,13 +629,12 @@ fn writeFnHeader(w: anytype, ev: flow_io.Event) !void {
             "pub fn onDestroy(game: *Game, {s}: EntityId) void {{\n",
             .{b.arg_entity},
         ),
+        // An OnCall flow used as the file entry point still needs a
+        // callable surface — emit a parameterless `pub fn onCall`.
+        .OnCall => try w.writeAll("pub fn onCall(game: *Game) void {\n"),
     }
 }
 
-/// Folded from former issue #90 — pulse the preview socket on every
-/// node entry. Failure is swallowed (`catch {}`) so a closed socket
-/// is invisible to gameplay; the `if (game.preview)` guard skips
-/// the work entirely in production builds.
 fn writePreviewPulse(w: anytype, flow_name: []const u8, node_id: u32) !void {
     try w.writeAll("    if (game.preview) |*_p| {\n");
     try w.print(
@@ -388,31 +647,31 @@ fn writePreviewPulse(w: anytype, flow_name: []const u8, node_id: u32) !void {
 fn writeNodeBody(
     w: anytype,
     node: *const flow_io.Node,
-    flow: flow_io.Flow,
-    index: *const Index,
+    ctx: *GraphContext,
     scratch: std.mem.Allocator,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    _ = scratch;
     switch (node.kind) {
         .GetComponent => |b| try w.print(
             "    const n{d}_value = game.getComponent(entity, {s}) orelse return;\n",
             .{ node.id, b.type },
         ),
         .SetField => |b| {
-            // `target` is "T.field"; split on the last `.` so type
-            // names with their own dots (`foo.bar.Baz.field`) work.
             const dot = std.mem.lastIndexOfScalar(u8, b.target, '.') orelse return error.UnknownPin;
             const type_name = b.target[0..dot];
             const field_name = b.target[dot + 1 ..];
-
-            const value_expr = (try resolveInput(node, "value", flow, index, scratch)) orelse return error.DanglingPin;
+            const value_expr = (try ctx.resolveInput(node, "value")) orelse return error.DanglingPin;
+            defer ctx.allocator.free(value_expr);
             try w.print(
                 "    game.setField({s}, .{s}, entity, {s});\n",
                 .{ type_name, field_name, value_expr },
             );
         },
         .BinOp => |b| {
-            const a_expr = (try resolveInput(node, "a", flow, index, scratch)) orelse "0";
-            const b_expr = (try resolveInput(node, "b", flow, index, scratch)) orelse "0";
+            const a_expr = (try ctx.resolveInput(node, "a")) orelse try ctx.allocator.dupe(u8, "0");
+            defer ctx.allocator.free(a_expr);
+            const b_expr = (try ctx.resolveInput(node, "b")) orelse try ctx.allocator.dupe(u8, "0");
+            defer ctx.allocator.free(b_expr);
             const op_text: []const u8 = switch (b.op) {
                 .add => "+",
                 .sub => "-",
@@ -432,89 +691,115 @@ fn writeNodeBody(
             "    const n{d}_value = {s};\n",
             .{ node.id, b.name },
         ),
+        // A Param node yields a declared parameter's value (RFC §3).
+        // The parameter is in scope as a function argument of the same
+        // name.
+        .Param => |b| try w.print(
+            "    const n{d}_value = {s};\n",
+            .{ node.id, b.param },
+        ),
+        // An Output node carries no body — its `value` pin is read by
+        // the function's `return` (see renderSubgraphFunction).
+        .Output => {},
         .Call => |b| {
-            // Highest connected `arg<k>` index sets the arity (see
-            // `countCallArgs`); gaps fill with `undefined`, matching
-            // the disconnected-pin default rule.
-            const arity = countCallArgs(flow, node.id);
+            const arity = countCallArgs(ctx.flow, node.id);
             try w.print("    const n{d}_result = {s}(", .{ node.id, b.callee });
             var i: usize = 0;
             while (i < arity) : (i += 1) {
                 if (i > 0) try w.writeAll(", ");
-                // 16 bytes fits "arg" + max-width usize comfortably;
-                // overflow here would be a logic bug, not a runtime
-                // condition the caller can hit.
                 var buf: [16]u8 = undefined;
                 const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
-                const expr = (try resolveInput(node, pin, flow, index, scratch)) orelse "undefined";
+                const expr = (try ctx.resolveInput(node, pin)) orelse
+                    try ctx.allocator.dupe(u8, "undefined");
+                defer ctx.allocator.free(expr);
                 try w.writeAll(expr);
+            }
+            try w.writeAll(");\n");
+        },
+        // A Subflow node lowers to a *call* of the referenced flow's
+        // generated function (RFC §6). Each param argument is supplied
+        // explicitly: wired pin → binding literal → declared default.
+        .Subflow => |b| {
+            const ref = ctx.registry.get(b.flow) orelse return error.UnknownFlowRef;
+
+            // Reject bindings naming a param the ref doesn't declare.
+            for (b.bindings) |bd| {
+                if (!hasParam(ref.params, bd.param)) return error.UnknownFlowParam;
+            }
+
+            const symbol = try sanitizeSymbol(ctx.allocator, ref.name);
+            defer ctx.allocator.free(symbol);
+
+            // A void subgraph (zero `Output` nodes) is lowered to a
+            // bare call statement; a value-producing one binds the
+            // result so downstream pins can read `n<id>_result`.
+            const ref_void = !anyOutput(ref.nodes);
+            if (ref_void) {
+                try w.print("    {s}(game", .{symbol});
+            } else {
+                try w.print("    const n{d}_result = {s}(game", .{ node.id, symbol });
+            }
+            for (ref.params) |p| {
+                try w.writeAll(", ");
+                const arg = try resolveSubflowArg(ctx, node, p, b.bindings);
+                defer ctx.allocator.free(arg);
+                try w.writeAll(arg);
             }
             try w.writeAll(");\n");
         },
     }
 }
 
-/// Resolve `pin` on `consumer` to a Zig expression string. Returns
-/// `null` if the pin is disconnected (the caller decides whether
-/// that's an error or a default). The returned slice is allocated
-/// on `scratch`; the caller's per-node arena reset reclaims it.
-fn resolveInput(
-    consumer: *const flow_io.Node,
-    pin: []const u8,
-    flow: flow_io.Flow,
-    index: *const Index,
-    scratch: std.mem.Allocator,
-) (CodegenError || std.mem.Allocator.Error)!?[]const u8 {
-    _ = flow;
-    const link = index.producerOf(consumer.id, pin) orelse return null;
-    const producer = index.byId(link.from.node) orelse return error.UnknownPin;
-
-    // Producer-side default: every kind ships with a "primary"
-    // output pin; if the link names it, the local variable is the
-    // value. Otherwise we fall through to per-kind special cases.
-    const primary = primaryOutputPin(producer.kind);
-    if (std.mem.eql(u8, link.from.pin, primary)) {
-        return try std.fmt.allocPrint(scratch, "n{d}_{s}", .{ producer.id, primary });
+/// Resolve the value supplied for `param` at a `Subflow` call site,
+/// honouring the RFC §3 precedence: wired pin → `binding` literal →
+/// declared `default`. Returns Zig source text on `ctx.allocator`.
+fn resolveSubflowArg(
+    ctx: *GraphContext,
+    subflow_node: *const flow_io.Node,
+    param: flow_io.Param,
+    bindings: []const flow_io.Binding,
+) (CodegenError || std.mem.Allocator.Error)![]const u8 {
+    // 1. Wired — an edge into the param-named input pin.
+    if (try ctx.resolveInput(subflow_node, param.name)) |expr| return expr;
+    // 2. Binding literal.
+    for (bindings) |bd| {
+        if (std.mem.eql(u8, bd.param, param.name)) {
+            return try ctx.allocator.dupe(u8, bd.value.zig_text);
+        }
     }
-
-    // GetComponent treats non-`value` output pins as field
-    // accessors on the bound component value. This is what makes
-    // the #46 sketch (`GetComponent → BinOp.a` via pin `"x"`)
-    // produce `n1_value.x` rather than UnknownPin.
-    switch (producer.kind) {
-        .GetComponent => {
-            return try std.fmt.allocPrint(
-                scratch,
-                "n{d}_value.{s}",
-                .{ producer.id, link.from.pin },
-            );
-        },
-        else => return error.UnknownPin,
-    }
+    // 3. Declared default.
+    if (param.default) |d| return try ctx.allocator.dupe(u8, d.zig_text);
+    // Neither wired, bound, nor defaulted (RFC §3 rule 3).
+    return error.MissingFlowArg;
 }
+
+// =====================================================================
+// Pin signatures
+// =====================================================================
 
 fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
     return switch (k) {
-        .GetComponent, .Literal, .Identifier => "value",
-        .BinOp, .Call => "result",
-        // SetField has no outputs; "primary" is a no-op for it
-        // (resolveInput never asks because consumers can't link
-        // *from* a SetField in any kind we ship).
-        .SetField => "",
+        .GetComponent, .Literal, .Identifier, .Param => "value",
+        .BinOp, .Call, .Subflow => "result",
+        .SetField, .Output => "",
     };
 }
 
 fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
     return switch (k) {
-        // Producers — no inputs.
-        .GetComponent, .Literal, .Identifier => false,
+        // Pure producers.
+        .GetComponent, .Literal, .Identifier, .Param => false,
         .SetField => std.mem.eql(u8, pin, "value"),
+        .Output => std.mem.eql(u8, pin, "value"),
         .BinOp => std.mem.eql(u8, pin, "a") or std.mem.eql(u8, pin, "b"),
         .Call => isCallArgPin(pin),
+        // A Subflow's input pins are its referenced flow's params —
+        // any non-empty name is accepted here; an unknown param is
+        // caught against the registry at emit time.
+        .Subflow => pin.len != 0,
     };
 }
 
-/// `arg0`, `arg1`, … `arg<u32>`. Anything else is rejected.
 fn isCallArgPin(pin: []const u8) bool {
     if (!std.mem.startsWith(u8, pin, "arg")) return false;
     const tail = pin[3..];
@@ -525,70 +810,71 @@ fn isCallArgPin(pin: []const u8) bool {
     return true;
 }
 
-/// Largest `arg<k>` index linking *into* `node_id`, plus one. So a
-/// node with `arg0` and `arg2` connected returns 3 — arity is set by
-/// the highest connected index, not the count of present links, so
-/// argument positions stay stable.
 fn countCallArgs(flow: flow_io.Flow, node_id: u32) usize {
     var max_idx: ?usize = null;
-    for (flow.links) |l| {
-        if (l.to.node != node_id) continue;
-        if (!std.mem.startsWith(u8, l.to.pin, "arg")) continue;
-        const tail = l.to.pin[3..];
-        const idx = std.fmt.parseInt(usize, tail, 10) catch continue;
+    for (flow.edges) |e| {
+        if (e.to.node != node_id) continue;
+        if (!std.mem.startsWith(u8, e.to.pin, "arg")) continue;
+        const idx = std.fmt.parseInt(usize, e.to.pin[3..], 10) catch continue;
         if (max_idx == null or idx > max_idx.?) max_idx = idx;
     }
     return if (max_idx) |m| m + 1 else 0;
 }
 
-/// Walk the flow's nodes and collect every component type-name
-/// referenced by `GetComponent` (verbatim `type` field) or
-/// `SetField` (the segment of `target` left of the LAST `.`, matching
-/// the split rule used by the `SetField` template — see
-/// `writeNodeBody`). The returned slice is allocated on `allocator`,
-/// is alphabetically sorted, and contains no duplicates so the
-/// caller can emit one `@import` per name with deterministic order.
-///
-/// `SetField.target` values without any `.` are skipped — they're
-/// rejected as `UnknownPin` further down the pipeline, and we don't
-/// want to crash building the import set on a flow that's about to
-/// fail validation anyway.
-fn collectComponentTypes(
+// =====================================================================
+// Helpers
+// =====================================================================
+
+fn hasParam(params: []const flow_io.Param, name: []const u8) bool {
+    for (params) |p| if (std.mem.eql(u8, p.name, name)) return true;
+    return false;
+}
+
+fn anyOutput(nodes: []const flow_io.Node) bool {
+    for (nodes) |n| if (n.kind == .Output) return true;
+    return false;
+}
+
+/// Collect the `Output` nodes of a flow, in ascending-id order so the
+/// generated return struct field order is deterministic (RFC §6).
+fn collectOutputs(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
-) (CodegenError || std.mem.Allocator.Error)![][]const u8 {
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    var list: std.ArrayList([]const u8) = .empty;
+) ![]*const flow_io.Node {
+    var list: std.ArrayList(*const flow_io.Node) = .empty;
     errdefer list.deinit(allocator);
-
-    for (flow.nodes) |n| {
-        const type_name: ?[]const u8 = switch (n.kind) {
-            .GetComponent => |b| b.type,
-            .SetField => |b| blk: {
-                const dot = std.mem.lastIndexOfScalar(u8, b.target, '.') orelse break :blk null;
-                break :blk b.target[0..dot];
-            },
-            else => null,
-        };
-        if (type_name) |t| {
-            if (t.len == 0) continue;
-            // Bare identifiers only — namespaced types (`foo.bar.Baz`)
-            // would emit `const foo.bar.Baz = @import(...);`, which
-            // isn't valid Zig. Surface as a typed error so the
-            // assembler can give a useful diagnostic; tracked for v2.
-            if (std.mem.indexOfScalar(u8, t, '.') != null) return error.NamespacedComponentType;
-            const gop = try seen.getOrPut(t);
-            if (!gop.found_existing) try list.append(allocator, t);
-        }
+    for (flow.nodes) |*n| {
+        if (n.kind == .Output) try list.append(allocator, n);
     }
-
     const out = try list.toOwnedSlice(allocator);
-    std.mem.sort([]const u8, out, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    std.mem.sort(*const flow_io.Node, out, {}, struct {
+        fn lt(_: void, a: *const flow_io.Node, b: *const flow_io.Node) bool {
+            return a.id < b.id;
         }
     }.lt);
+    return out;
+}
+
+/// Deterministically derive a valid Zig identifier from a flow's
+/// effective name (RFC §6 — "sanitized to a valid Zig identifier").
+/// Non-identifier characters become `_`; a leading digit is prefixed
+/// with `_`. Caller owns the returned bytes.
+pub fn sanitizeSymbol(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const prefix_underscore = name.len == 0 or (name[0] >= '0' and name[0] <= '9');
+    const len = name.len + @intFromBool(prefix_underscore);
+    const out = try allocator.alloc(u8, if (len == 0) 1 else len);
+    var i: usize = 0;
+    if (prefix_underscore) {
+        out[0] = '_';
+        i = 1;
+    }
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_';
+        out[i] = if (ok) c else '_';
+        i += 1;
+    }
     return out;
 }
 
@@ -600,4 +886,54 @@ fn anyNodeNeedsEntity(nodes: []const flow_io.Node) bool {
         }
     }
     return false;
+}
+
+/// Collect component type names referenced across the entry flow and
+/// every subgraph — de-duplicated, alphabetically sorted.
+fn collectComponentTypesAll(
+    allocator: std.mem.Allocator,
+    entry: flow_io.Flow,
+    subgraphs: []const flow_io.Flow,
+) (CodegenError || std.mem.Allocator.Error)![][]const u8 {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    try collectComponentTypesInto(entry, &seen, &list, allocator);
+    for (subgraphs) |sg| {
+        try collectComponentTypesInto(sg, &seen, &list, allocator);
+    }
+
+    const out = try list.toOwnedSlice(allocator);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out;
+}
+
+fn collectComponentTypesInto(
+    flow: flow_io.Flow,
+    seen: *std.StringHashMap(void),
+    list: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    for (flow.nodes) |n| {
+        const type_name: ?[]const u8 = switch (n.kind) {
+            .GetComponent => |b| b.type,
+            .SetField => |b| blk: {
+                const dot = std.mem.lastIndexOfScalar(u8, b.target, '.') orelse break :blk null;
+                break :blk b.target[0..dot];
+            },
+            else => null,
+        };
+        if (type_name) |t| {
+            if (t.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, t, '.') != null) return error.NamespacedComponentType;
+            const gop = try seen.getOrPut(t);
+            if (!gop.found_existing) try list.append(allocator, t);
+        }
+    }
 }

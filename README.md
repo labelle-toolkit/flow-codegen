@@ -1,15 +1,25 @@
 # flow_codegen
 
-Pure-Zig parser and codegen for `.flow.zon` files. Sub-package of
+Pure-Zig parser and codegen for `.flow.jsonc` files. Sub-package of
 `labelle-gui`, mirroring `labelle-engine`'s `audio_backend` and
 `labelle-gfx`'s `spatial_grid` sub-packages.
 
-Two modules live here:
+The on-disk format is `.flow.jsonc` — a JSONC graph with a flat node
+schema and named-registry subgraph composition; see
+[`RFC-FLOWS-JSONC.md`](RFC-FLOWS-JSONC.md).
 
-- `flow_io` — read/write the `.flow.zon` on-disk schema (issue #46).
-- `codegen` — turn a parsed `Flow` into a `.zig` source file
-  (issue #50). Topo-sorts the graph, emits a preview pulse preamble
-  per node, and renders per-kind templates.
+Three modules live here:
+
+- `jsonc` — strips JSONC (`//` / `/* */` comments, trailing commas)
+  down to plain JSON for `std.json`.
+- `flow_io` — read/write the flat `.flow.jsonc` on-disk schema:
+  `nodes` + `edges`, top-level `params`, and the `Param` / `Output` /
+  `Subflow` node types.
+- `codegen` — turn a parsed `Flow` into a `.zig` source file. Topo-sorts
+  the graph, emits a preview pulse preamble per node, renders per-kind
+  templates, and lowers `Subflow` references to call-style Zig (one
+  `fn` per referenced flow) via a name-keyed `FlowRegistry` with
+  reference-cycle detection.
 
 Consumed by `labelle-gui` (the editor that authors flow files) and
 `labelle-assembler` (which generates Zig code at `zig build generate`
