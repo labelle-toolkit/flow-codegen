@@ -1291,6 +1291,156 @@ pub const SubflowTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, binds[2].param, "zeta"));
     }
 
+    test "rejects subgraph whose name collides with the entry handler" {
+        const allocator = std.testing.allocator;
+        // A subgraph named exactly "onCall" produces a `fn onCall`,
+        // colliding with the entry flow's `pub fn onCall`.
+        const sub_src =
+            \\{
+            \\  "name": "onCall",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        // Entry is an OnCall flow → its `pub fn` is `onCall`.
+        const entry_src =
+            \\{
+            \\  "name": "uses_oncall_named",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "onCall", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        var sub = try flow_io.parseFlow(allocator, sub_src);
+        defer sub.deinit();
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(sub.flow);
+        try reg.add(entry.flow);
+
+        try std.testing.expectError(
+            error.SymbolCollision,
+            flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "uses_oncall_named" }),
+        );
+    }
+
+    test "rejects entry Output names that collide after sanitization" {
+        const allocator = std.testing.allocator;
+        // "a-b" and "a_b" are distinct Output names but both sanitize
+        // to the Zig field identifier "a_b".
+        const entry_src =
+            \\{
+            \\  "name": "colliding_outputs",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "x", "type": "f32", "default": 1.0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Param", "param": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "a-b", "value_type": "f32", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Output", "name": "a_b", "value_type": "f32", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(entry.flow);
+
+        try std.testing.expectError(
+            error.SymbolCollision,
+            flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "colliding_outputs" }),
+        );
+    }
+
+    test "OnCall entry with a single Output returns it" {
+        const allocator = std.testing.allocator;
+        const entry_src =
+            \\{
+            \\  "name": "scoring",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "base", "type": "f32", "default": 3.0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Param", "param": "base", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "score", "value_type": "f32", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(entry.flow);
+
+        const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "scoring" });
+        defer allocator.free(out);
+        // The entry `pub fn` returns the Output's declared type.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, base: f32) f32 {") != null);
+        // …and emits the return statement reading the wired pin.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "return n1_value;") != null);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "OnCall entry with multiple Outputs returns a result struct" {
+        const allocator = std.testing.allocator;
+        const entry_src =
+            \\{
+            \\  "name": "stats",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "base", "type": "f32", "default": 1.0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Param", "param": "base", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "hp", "value_type": "f32", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Output", "name": "mp", "value_type": "f32", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(entry.flow);
+
+        const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "stats" });
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const onCall_Result = struct {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, base: f32) onCall_Result {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".hp = n1_value,") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".mp = n1_value,") != null);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
     test "multi-output subgraph sanitizes Output names into struct fields" {
         const allocator = std.testing.allocator;
         // Output names with hyphens / leading digits must sanitize so

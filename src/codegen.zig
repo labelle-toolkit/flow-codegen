@@ -283,8 +283,11 @@ pub fn renderFlowFile(
 
     // Distinct effective names that sanitize to the same identifier
     // would emit colliding `fn` definitions — reject up front (RFC §6
-    // assumes symbols don't collide; `sanitizeSymbol` is lossy).
-    try assertNoSymbolCollision(allocator, subgraphs.items);
+    // assumes symbols don't collide; `sanitizeSymbol` is lossy). The
+    // entry `pub fn` name (`onUpdate`/`onCreate`/`onDestroy`/`onCall`)
+    // is checked too: a subgraph whose name sanitizes to one of those
+    // would emit a `fn` colliding with the file's `pub fn`.
+    try assertNoSymbolCollision(allocator, entryFunctionName(entry.event), subgraphs.items);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -359,7 +362,35 @@ fn renderEntryFunction(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
-    try writeFnHeader(w, flow);
+    // An `OnCall` flow used as the file entry point is a subgraph in
+    // its own right (RFC §3/§6): its `Output` nodes form the return
+    // value, exactly as for a referenced subgraph. The lifecycle
+    // events (`OnUpdate`/`OnCreate`/`OnDestroy`) are fixed-signature
+    // engine callbacks and always return `void`; any `Output` nodes
+    // there carry no return (kept as-is).
+    const entry_fn = entryFunctionName(flow.event);
+    const outputs = if (flow.event == .OnCall)
+        try collectOutputs(allocator, flow)
+    else
+        try allocator.alloc(*const flow_io.Node, 0);
+    defer allocator.free(outputs);
+
+    // Distinct Output names sanitizing to one identifier would emit a
+    // result struct with duplicate fields — reject up front.
+    try assertNoOutputCollision(allocator, outputs);
+
+    // Multi-output entry returns a named result struct (RFC §6).
+    if (outputs.len > 1) {
+        try w.print("const {s}_Result = struct {{\n", .{entry_fn});
+        for (outputs) |o| {
+            const field = try sanitizeSymbol(allocator, o.kind.Output.name);
+            defer allocator.free(field);
+            try w.print("    {s}: {s},\n", .{ field, o.kind.Output.type });
+        }
+        try w.writeAll("};\n");
+    }
+
+    try writeFnHeader(w, flow, outputs);
 
     // Entity binding for OnCreate/OnDestroy/OnUpdate templates.
     if (anyNodeNeedsEntity(flow.nodes)) {
@@ -383,6 +414,23 @@ fn renderEntryFunction(
     }
 
     try emitBody(allocator, w, &ctx, flow_name);
+
+    // Return statement for an OnCall entry with declared Outputs.
+    if (outputs.len == 1) {
+        const expr = (try ctx.resolveInput(allocator, outputs[0], "value")) orelse return error.DanglingPin;
+        defer allocator.free(expr);
+        try w.print("    return {s};\n", .{expr});
+    } else if (outputs.len > 1) {
+        try w.writeAll("    return .{\n");
+        for (outputs) |o| {
+            const expr = (try ctx.resolveInput(allocator, o, "value")) orelse return error.DanglingPin;
+            defer allocator.free(expr);
+            const field = try sanitizeSymbol(allocator, o.kind.Output.name);
+            defer allocator.free(field);
+            try w.print("        .{s} = {s},\n", .{ field, expr });
+        }
+        try w.writeAll("    };\n");
+    }
     try w.writeAll("}\n");
 }
 
@@ -408,6 +456,10 @@ fn renderSubgraphFunction(
 
     const outputs = try collectOutputs(allocator, flow);
     defer allocator.free(outputs);
+
+    // Distinct Output names that sanitize to one identifier would emit
+    // a result struct with duplicate fields — reject up front.
+    try assertNoOutputCollision(allocator, outputs);
 
     // Multi-output subgraphs return a named result struct (RFC §6).
     // Declare it just above the function so the type is in scope.
@@ -723,7 +775,12 @@ fn topoSort(
 /// top-level `params` are appended as fn parameters — same as a
 /// subgraph — so `Param` nodes in the entry flow resolve their reads
 /// to in-scope identifiers (RFC §3).
-fn writeFnHeader(w: anytype, flow: flow_io.Flow) !void {
+///
+/// `outputs` is the entry flow's `Output` nodes (empty for lifecycle
+/// events, which always return `void`). When non-empty — an `OnCall`
+/// entry — the return type follows the subgraph rule (RFC §6): the
+/// single output's `type`, or the `<entry_fn>_Result` struct.
+fn writeFnHeader(w: anytype, flow: flow_io.Flow, outputs: []const *const flow_io.Node) !void {
     switch (flow.event) {
         .OnUpdate => |b| try w.print(
             "pub fn onUpdate(game: *Game, {s}: f32",
@@ -744,7 +801,9 @@ fn writeFnHeader(w: anytype, flow: flow_io.Flow) !void {
     for (flow.params) |p| {
         try w.print(", {s}: {s}", .{ p.name, p.type });
     }
-    try w.writeAll(") void {\n");
+    try w.writeAll(") ");
+    try writeReturnType(w, entryFunctionName(flow.event), outputs);
+    try w.writeAll(" {\n");
 }
 
 fn writePreviewPulse(w: anytype, flow_name: []const u8, node_id: u32) !void {
@@ -972,6 +1031,39 @@ fn collectOutputs(
     return out;
 }
 
+/// Reject the case where two `Output` nodes with distinct names
+/// sanitize to the same Zig identifier — the multi-output result
+/// struct (RFC §6) would then declare two fields with the same name
+/// and fail to compile (CodegenError.SymbolCollision). Single- and
+/// zero-output flows cannot collide, so the check is a no-op there.
+fn assertNoOutputCollision(
+    allocator: std.mem.Allocator,
+    outputs: []const *const flow_io.Node,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    if (outputs.len < 2) return;
+    var by_field = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = by_field.iterator();
+        while (it.next()) |e| allocator.free(e.key_ptr.*);
+        by_field.deinit();
+    }
+    for (outputs) |o| {
+        const name = o.kind.Output.name;
+        const field = try sanitizeSymbol(allocator, name);
+        const gop = try by_field.getOrPut(field);
+        if (gop.found_existing) {
+            allocator.free(field);
+            // Two Output nodes may legitimately share a name in a
+            // malformed graph; either way distinct names mapping to
+            // one field is the unrecoverable case.
+            if (!std.mem.eql(u8, gop.value_ptr.*, name))
+                return error.SymbolCollision;
+        } else {
+            gop.value_ptr.* = name;
+        }
+    }
+}
+
 /// Deterministically derive a valid Zig identifier from a flow's
 /// effective name (RFC §6 — "sanitized to a valid Zig identifier").
 /// Non-identifier characters become `_`; a leading digit is prefixed
@@ -995,30 +1087,63 @@ pub fn sanitizeSymbol(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return out;
 }
 
-/// Reject the case where two subgraphs with distinct effective names
-/// sanitize to the same Zig identifier — that would emit two `fn`s
-/// with the same symbol and fail to compile (CodegenError.SymbolCollision).
+/// The `pub fn` name emitted for a flow used as the file entry point,
+/// keyed by its `Event`. These four names occupy the file's top-level
+/// symbol namespace alongside the subgraph `fn`s.
+fn entryFunctionName(event: flow_io.Event) []const u8 {
+    return switch (event) {
+        .OnUpdate => "onUpdate",
+        .OnCreate => "onCreate",
+        .OnDestroy => "onDestroy",
+        .OnCall => "onCall",
+    };
+}
+
+/// Reject the case where two file-level symbols with distinct effective
+/// names sanitize to the same Zig identifier — that would emit two
+/// definitions with the same symbol and fail to compile
+/// (CodegenError.SymbolCollision). Covers both the subgraph `fn`s and
+/// the entry `pub fn` (`entry_fn_name`): a subgraph whose name
+/// sanitizes to e.g. `onCall` collides with the entry handler.
 fn assertNoSymbolCollision(
     allocator: std.mem.Allocator,
+    entry_fn_name: []const u8,
     subgraphs: []const flow_io.Flow,
 ) (CodegenError || std.mem.Allocator.Error)!void {
-    var by_symbol = std.StringHashMap([]const u8).init(allocator);
+    // Each symbol maps to the source it was emitted from. A subgraph
+    // claiming the entry handler's identifier is always a collision —
+    // even if its flow name happens to equal `entry_fn_name` — because
+    // the entry `pub fn` and a subgraph `fn` are two distinct
+    // definitions in one file.
+    const Source = union(enum) { entry, subgraph: []const u8 };
+    var by_symbol = std.StringHashMap(Source).init(allocator);
     defer {
         var it = by_symbol.iterator();
         while (it.next()) |e| allocator.free(e.key_ptr.*);
         by_symbol.deinit();
+    }
+    // Seed with the entry `pub fn` name. It is already a valid Zig
+    // identifier, so it equals its own sanitized form.
+    {
+        const seed = try allocator.dupe(u8, entry_fn_name);
+        const gop = try by_symbol.getOrPut(seed);
+        if (gop.found_existing) allocator.free(seed) else gop.value_ptr.* = .entry;
     }
     for (subgraphs) |sg| {
         const symbol = try sanitizeSymbol(allocator, sg.name);
         const gop = try by_symbol.getOrPut(symbol);
         if (gop.found_existing) {
             allocator.free(symbol);
-            // Same name twice is fine (registry de-dups); only a
-            // distinct name colliding is an error.
-            if (!std.mem.eql(u8, gop.value_ptr.*, sg.name))
-                return error.SymbolCollision;
+            switch (gop.value_ptr.*) {
+                // Colliding with the entry handler is always fatal.
+                .entry => return error.SymbolCollision,
+                // Same subgraph name twice is fine (registry de-dups);
+                // only a distinct name colliding is an error.
+                .subgraph => |prev| if (!std.mem.eql(u8, prev, sg.name))
+                    return error.SymbolCollision,
+            }
         } else {
-            gop.value_ptr.* = sg.name;
+            gop.value_ptr.* = .{ .subgraph = sg.name };
         }
     }
 }
