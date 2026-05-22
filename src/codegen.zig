@@ -301,9 +301,10 @@ pub fn renderFlowFile(
 
     // Each flow's declared `params` must not collide (after
     // sanitization) with each other or the fixed `fn` params —
-    // checked for the entry flow and every referenced subgraph.
-    try assertNoParamCollision(allocator, entry);
-    for (subgraphs.items) |sg| try assertNoParamCollision(allocator, sg);
+    // checked for the entry flow and every referenced subgraph. The
+    // entry reserves its lifecycle arg; a subgraph does not.
+    try assertNoParamCollision(allocator, entry, .entry);
+    for (subgraphs.items) |sg| try assertNoParamCollision(allocator, sg, .subgraph);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -1209,14 +1210,28 @@ fn putOwnedKey(
     if (gop.found_existing) allocator.free(key);
 }
 
+/// How a flow is lowered — it decides which fixed `fn` parameters
+/// occupy the signature alongside the declared `params`.
+const FlowRole = enum {
+    /// File entry point — `writeFnHeader` emits `game` plus the
+    /// lifecycle dt/entity arg.
+    entry,
+    /// Flow referenced by a `Subflow` node — `renderSubgraphFunction`
+    /// emits only `game` and the declared `params`, regardless of the
+    /// flow's `event`.
+    subgraph,
+};
+
 /// Reject a flow whose declared `params`, after sanitization, collide
-/// with each other or with a fixed `fn` parameter — `game`, or the
-/// lifecycle arg (`OnUpdate` dt / `OnCreate`+`OnDestroy` entity). Such
-/// a flow parses cleanly yet emits a signature with duplicate
-/// parameter identifiers, which Zig rejects (`ParamNameCollision`).
+/// with each other or with a fixed `fn` parameter. Such a flow parses
+/// cleanly yet emits a signature with duplicate parameter identifiers,
+/// which Zig rejects (`ParamNameCollision`). The fixed parameters
+/// depend on `role`: every flow takes `game`; an `entry` flow also
+/// takes the lifecycle dt/entity arg, whereas a `subgraph` does not.
 fn assertNoParamCollision(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
+    role: FlowRole,
 ) (CodegenError || std.mem.Allocator.Error)!void {
     var seen = std.StringHashMap(void).init(allocator);
     defer {
@@ -1225,16 +1240,17 @@ fn assertNoParamCollision(
         seen.deinit();
     }
 
-    // Fixed parameters always present in the emitted signature: every
-    // flow takes `game`, and a lifecycle event adds its dt/entity arg
-    // verbatim — exactly as `writeFnHeader` emits them.
+    // Every emitted signature takes `game`. Only an `entry` flow also
+    // takes the lifecycle dt/entity arg (`writeFnHeader`); a subgraph
+    // takes `game` + declared params alone (`renderSubgraphFunction`),
+    // so its `event` arg must not be reserved here.
     try putOwnedKey(allocator, &seen, "game");
-    switch (flow.event) {
+    if (role == .entry) switch (flow.event) {
         .OnUpdate => |b| try putOwnedKey(allocator, &seen, b.arg_dt),
         .OnCreate => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
         .OnDestroy => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
         .OnCall => {},
-    }
+    };
 
     for (flow.params) |p| {
         const name = try sanitizeSymbol(allocator, p.name);

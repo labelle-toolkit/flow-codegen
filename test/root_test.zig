@@ -1492,106 +1492,154 @@ pub const SubflowTests = struct {
         if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
         try expect.equal(ast.errors.len, @as(usize, 0));
     }
+};
 
-    test "param names are sanitized in the emitted signature" {
+// =====================================================================
+// Codegen validation — flows that parse cleanly but would otherwise
+// emit Zig that fails to compile (PR #6 review follow-up)
+// =====================================================================
+
+/// Unlike the suites above, these build each `flow_io.Flow` directly
+/// with a `zspec` factory rather than parsing JSONC: the concern is
+/// purely how `renderFlowFile` lowers a structurally-valid graph, so
+/// the parser is deliberately kept out of the loop.
+pub const CodegenValidationTests = zspec.context("codegen rejects flows that would emit invalid Zig", struct {
+    /// `flow_io.Flow` factory — an empty `OnCall` flow by default;
+    /// each test overrides only the fields under test. The factory
+    /// supplies every field (it does not fall back to struct field
+    /// defaults), so `params` / `nodes` / `edges` default to empty.
+    const FlowFactory = zspec.Factory.define(flow_io.Flow, .{
+        .name = "flow",
+        .event = flow_io.Event{ .OnCall = {} },
+        .params = &.{},
+        .nodes = &.{},
+        .edges = &.{},
+    });
+
+    /// Assert `src` is syntactically valid Zig — generated code must
+    /// compile. Mirrors the `std.zig.Ast.parse` check used elsewhere.
+    fn expectParses(allocator: std.mem.Allocator, src: []const u8) !void {
+        const z = try allocator.allocSentinel(u8, src.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..src.len], src);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{src});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "sanitizes param names in the emitted signature" {
         const allocator = std.testing.allocator;
         // `hit-points` is not a valid Zig identifier — it must
         // sanitize consistently in the `fn` signature and the `Param`
         // node read so the emitted source compiles.
-        const entry_src =
-            \\{
-            \\  "name": "sanitize_param",
-            \\  "event": { "type": "OnCall" },
-            \\  "params": [ { "name": "hit-points", "type": "f32", "default": 1.0 } ],
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Param", "param": "hit-points", "pos": [0, 0] },
-            \\    { "id": 2, "type": "Output", "name": "out", "value_type": "f32", "pos": [0, 0] }
-            \\  ],
-            \\  "edges": [
-            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
-            \\  ]
-            \\}
-        ;
-        var entry = try flow_io.parseFlow(allocator, entry_src);
-        defer entry.deinit();
+        var params = [_]flow_io.Param{
+            .{ .name = "hit-points", .type = "f32", .default = .{ .zig_text = "1.0" } },
+        };
+        var nodes = [_]flow_io.Node{
+            .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Param = .{ .param = "hit-points" } } },
+            .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .Output = .{ .name = "out" } } },
+        };
+        var edges = [_]flow_io.Edge{
+            .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 2, .pin = "value" } },
+        };
+        const flow = FlowFactory.build(.{
+            .name = "sanitize_param",
+            .params = &params,
+            .nodes = &nodes,
+            .edges = &edges,
+        });
 
         var reg = flow_codegen.FlowRegistry.init(allocator);
         defer reg.deinit();
-        try reg.add(entry.flow);
+        try reg.add(flow);
 
-        const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "sanitize_param" });
+        const out = try flow_codegen.renderFlowFile(allocator, flow, &reg, .{ .flow_name = "sanitize_param" });
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, hit_points: f32) f32 {") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = hit_points;") != null);
-
-        const z = try allocator.allocSentinel(u8, out.len, 0);
-        defer allocator.free(z);
-        @memcpy(z[0..out.len], out);
-        var ast = try std.zig.Ast.parse(allocator, z, .zig);
-        defer ast.deinit(allocator);
-        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
-        try expect.equal(ast.errors.len, @as(usize, 0));
+        try expect.toContain(out, "pub fn onCall(game: *Game, hit_points: f32) f32 {");
+        try expect.toContain(out, "const n1_value = hit_points;");
+        try expectParses(allocator, out);
     }
 
     test "rejects a param colliding with the fixed game parameter" {
         const allocator = std.testing.allocator;
         // A param named `game` would emit `fn (game: *Game, game: f32)`
         // — duplicate parameter identifiers, which Zig rejects.
-        const entry_src =
-            \\{
-            \\  "name": "param_clash",
-            \\  "event": { "type": "OnCall" },
-            \\  "params": [ { "name": "game", "type": "f32", "default": 1.0 } ],
-            \\  "nodes": [],
-            \\  "edges": []
-            \\}
-        ;
-        var entry = try flow_io.parseFlow(allocator, entry_src);
-        defer entry.deinit();
+        var params = [_]flow_io.Param{.{ .name = "game", .type = "f32" }};
+        const flow = FlowFactory.build(.{ .name = "param_clash", .params = &params });
 
         var reg = flow_codegen.FlowRegistry.init(allocator);
         defer reg.deinit();
-        try reg.add(entry.flow);
+        try reg.add(flow);
 
         try std.testing.expectError(
             error.ParamNameCollision,
-            flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "param_clash" }),
+            flow_codegen.renderFlowFile(allocator, flow, &reg, .{ .flow_name = "param_clash" }),
         );
+    }
+
+    test "allows a subgraph param named after a lifecycle arg" {
+        const allocator = std.testing.allocator;
+        // A reusable flow declared with `OnUpdate` but referenced as a
+        // subgraph emits `fn (game, <params>)` — no `dt` arg — so a
+        // param named `dt` is NOT a collision (regression: the
+        // collision check must not reserve a subgraph's lifecycle arg).
+        var sub_params = [_]flow_io.Param{
+            .{ .name = "dt", .type = "f32", .default = .{ .zig_text = "0.016" } },
+        };
+        var sub_nodes = [_]flow_io.Node{
+            .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Param = .{ .param = "dt" } } },
+            .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .Output = .{ .name = "out" } } },
+        };
+        var sub_edges = [_]flow_io.Edge{
+            .{ .from = .{ .node = 1, .pin = "value" }, .to = .{ .node = 2, .pin = "value" } },
+        };
+        const sub = FlowFactory.build(.{
+            .name = "tick_helper",
+            .event = flow_io.Event{ .OnUpdate = .{} },
+            .params = &sub_params,
+            .nodes = &sub_nodes,
+            .edges = &sub_edges,
+        });
+        var entry_nodes = [_]flow_io.Node{
+            .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Subflow = .{ .flow = "tick_helper" } } },
+        };
+        const entry = FlowFactory.build(.{
+            .name = "uses_tick_helper",
+            .event = flow_io.Event{ .OnUpdate = .{} },
+            .nodes = &entry_nodes,
+        });
+
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(sub);
+        try reg.add(entry);
+
+        const out = try flow_codegen.renderFlowFile(allocator, entry, &reg, .{ .flow_name = "uses_tick_helper" });
+        defer allocator.free(out);
+        // The subgraph `fn` takes only `game` + its declared `dt`.
+        try expect.toContain(out, "fn tick_helper(game: *Game, dt: f32) f32 {");
+        try expectParses(allocator, out);
     }
 
     test "rejects a subgraph whose name sanitizes to the bare underscore" {
         const allocator = std.testing.allocator;
         // A flow named `-` sanitizes to `_`, which Zig reserves as the
         // discard identifier and rejects as a `fn` name.
-        const sub_src =
-            \\{
-            \\  "name": "-",
-            \\  "event": { "type": "OnCall" },
-            \\  "nodes": [],
-            \\  "edges": []
-            \\}
-        ;
-        const entry_src =
-            \\{
-            \\  "name": "uses_underscore",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "-", "pos": [0, 0] } ],
-            \\  "edges": []
-            \\}
-        ;
-        var sub = try flow_io.parseFlow(allocator, sub_src);
-        defer sub.deinit();
-        var entry = try flow_io.parseFlow(allocator, entry_src);
-        defer entry.deinit();
+        const sub = FlowFactory.build(.{ .name = "-" });
+        var entry_nodes = [_]flow_io.Node{
+            .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Subflow = .{ .flow = "-" } } },
+        };
+        const entry = FlowFactory.build(.{ .name = "uses_underscore", .nodes = &entry_nodes });
 
         var reg = flow_codegen.FlowRegistry.init(allocator);
         defer reg.deinit();
-        try reg.add(sub.flow);
-        try reg.add(entry.flow);
+        try reg.add(sub);
+        try reg.add(entry);
 
         try std.testing.expectError(
             error.InvalidFlowName,
-            flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "uses_underscore" }),
+            flow_codegen.renderFlowFile(allocator, entry, &reg, .{ .flow_name = "uses_underscore" }),
         );
     }
 
@@ -1600,24 +1648,18 @@ pub const SubflowTests = struct {
         // An `OnCall` entry is a subgraph in its own right (RFC §3/§6)
         // — no `entity` in scope, so a `GetComponent` node there can't
         // be emitted, exactly as inside a referenced subgraph.
-        const entry_src =
-            \\{
-            \\  "name": "oncall_entity",
-            \\  "event": { "type": "OnCall" },
-            \\  "nodes": [ { "id": 1, "type": "GetComponent", "component": "Health", "pos": [0, 0] } ],
-            \\  "edges": []
-            \\}
-        ;
-        var entry = try flow_io.parseFlow(allocator, entry_src);
-        defer entry.deinit();
+        var nodes = [_]flow_io.Node{
+            .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .GetComponent = .{ .type = "Health" } } },
+        };
+        const flow = FlowFactory.build(.{ .name = "oncall_entity", .nodes = &nodes });
 
         var reg = flow_codegen.FlowRegistry.init(allocator);
         defer reg.deinit();
-        try reg.add(entry.flow);
+        try reg.add(flow);
 
         try std.testing.expectError(
             error.EntityUnavailableInSubgraph,
-            flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "oncall_entity" }),
+            flow_codegen.renderFlowFile(allocator, flow, &reg, .{ .flow_name = "oncall_entity" }),
         );
     }
-};
+});
