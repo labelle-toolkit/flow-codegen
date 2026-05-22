@@ -335,6 +335,40 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
     }
 
+    test "renderFlowJsonc emits valid JSON for string literals and defaults" {
+        const allocator = std.testing.allocator;
+        // A param string `default` and a `Literal` node string value
+        // both carry embedded quotes / escapes. They must re-serialize
+        // as JSON-escaped strings — not Zig-escaped text spliced raw,
+        // which would break the JSON — and survive render→parse→render.
+        const src =
+            \\{
+            \\  "name": "lit",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "label", "type": "[]const u8", "default": "hi \"there\"" } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": "\"a\\tb\"", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        // The rendered text must itself parse — i.e. it is valid JSON.
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(l2.flow.params.len, @as(usize, 1));
+
+        // Idempotent re-render — the escaped literal survived intact.
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
     test "saveFlow + loadFromFile round trip via tmpDir" {
         const allocator = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});

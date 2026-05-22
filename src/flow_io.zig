@@ -261,6 +261,10 @@ fn buildFlow(
     const event = try buildEvent(obj.get("event") orelse return error.MalformedFlow);
     const params = try buildParams(a, obj.get("params"));
     const nodes = try buildNodes(a, obj.get("nodes") orelse return error.MalformedFlow);
+    // `links` was the pre-rename (RFC §2) name for `edges`. A file
+    // still using it would otherwise load with zero connections and
+    // pass validation — reject the stale key rather than ignore it.
+    if (obj.get("edges") == null and obj.get("links") != null) return error.MalformedFlow;
     const edges = try buildEdges(a, obj.get("edges"));
 
     return .{
@@ -579,7 +583,8 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
                 .{ std.zig.fmtString(p.name), std.zig.fmtString(p.type) },
             );
             if (p.default) |d| {
-                try w.print(", \"default\": {s}", .{jsonLiteral(d.zig_text)});
+                try w.writeAll(", \"default\": ");
+                try writeParamLiteral(w, allocator, d.zig_text);
             }
             try w.writeAll(" }");
             if (i + 1 < flow.params.len) try w.writeAll(",");
@@ -596,7 +601,7 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     try w.writeAll("  \"nodes\": [\n");
     for (sorted_nodes, 0..) |n, i| {
         try w.print("    {{ \"id\": {d}, \"type\": \"{s}\"", .{ n.id, nodeTypeName(n.kind) });
-        try writeNodePayload(w, n.kind);
+        try writeNodePayload(w, allocator, n.kind);
         try w.print(", \"pos\": [{d}, {d}] }}", .{ n.pos[0], n.pos[1] });
         if (i + 1 < sorted_nodes.len) try w.writeAll(",");
         try w.writeAll("\n");
@@ -623,11 +628,54 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     return aw.toOwnedSlice();
 }
 
-/// A param literal's `zig_text` is Zig source. For round-trippable
-/// JSONC output the common scalar forms map straight back to JSON;
-/// anything else is emitted as a JSON string so the file stays valid.
-fn jsonLiteral(zig_text: []const u8) []const u8 {
-    return zig_text;
+/// Write `s` into `w` as a JSON string literal — quoted and
+/// JSON-escaped. `renderFlowJsonc` emits JSON, so string content must
+/// use JSON escapes; `std.zig.fmtString` uses Zig's, which diverge
+/// (`\xNN`, `\'`, …) and would produce invalid JSON for some inputs.
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0c => try w.writeAll("\\f"),
+        else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
+/// True when `text` is a JSON-native scalar — `true`, `false`, or a
+/// finite number — that can be emitted to JSONC unquoted and parse
+/// straight back. Anything else must be written as a JSON string.
+fn isJsonScalar(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false")) return true;
+    if (text.len == 0) return false;
+    const f = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(f);
+}
+
+/// Write a param `default` / `Subflow` binding value as JSON. A scalar
+/// `zig_text` (bool / number) is already valid JSON and emitted
+/// verbatim. A Zig string literal — what `parseParamLiteral` stores
+/// for a JSON string default — is decoded to its content and
+/// re-emitted as a JSON string, so the file stays valid JSON and
+/// round-trips back through `parseParamLiteral`.
+fn writeParamLiteral(w: anytype, allocator: std.mem.Allocator, zig_text: []const u8) !void {
+    if (zig_text.len >= 2 and zig_text[0] == '"') {
+        const content = std.zig.string_literal.parseAlloc(allocator, zig_text) catch {
+            // Not a well-formed Zig string literal — emit the raw text
+            // as a JSON string rather than splice invalid JSON.
+            try writeJsonString(w, zig_text);
+            return;
+        };
+        defer allocator.free(content);
+        try writeJsonString(w, content);
+        return;
+    }
+    try w.writeAll(zig_text);
 }
 
 fn lessThanNode(_: void, a: Node, b: Node) bool {
@@ -646,12 +694,22 @@ fn nodeTypeName(k: NodeKind) []const u8 {
     return @tagName(k);
 }
 
-fn writeNodePayload(w: anytype, k: NodeKind) !void {
+fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void {
     switch (k) {
         .GetComponent => |b| try w.print(", \"component\": \"{f}\"", .{std.zig.fmtString(b.type)}),
         .SetField => |b| try w.print(", \"target\": \"{f}\"", .{std.zig.fmtString(b.target)}),
         .BinOp => |b| try w.print(", \"op\": \"{s}\"", .{@tagName(b.op)}),
-        .Literal => |b| try w.print(", \"value\": \"{f}\"", .{std.zig.fmtString(b.value)}),
+        // `value` is Zig expression text: a JSON-native scalar is
+        // written bare so it round-trips through `literalValue`'s
+        // number/bool arms; anything else as a JSON string.
+        .Literal => |b| {
+            try w.writeAll(", \"value\": ");
+            if (isJsonScalar(b.value)) {
+                try w.writeAll(b.value);
+            } else {
+                try writeJsonString(w, b.value);
+            }
+        },
         .Identifier => |b| try w.print(", \"name\": \"{f}\"", .{std.zig.fmtString(b.name)}),
         .Call => |b| try w.print(", \"callee\": \"{f}\"", .{std.zig.fmtString(b.callee)}),
         .Param => |b| try w.print(", \"param\": \"{f}\"", .{std.zig.fmtString(b.param)}),
@@ -665,10 +723,8 @@ fn writeNodePayload(w: anytype, k: NodeKind) !void {
                 try w.writeAll(", \"bindings\": {");
                 for (b.bindings, 0..) |bd, i| {
                     if (i > 0) try w.writeAll(",");
-                    try w.print(" \"{f}\": {s}", .{
-                        std.zig.fmtString(bd.param),
-                        jsonLiteral(bd.value.zig_text),
-                    });
+                    try w.print(" \"{f}\": ", .{std.zig.fmtString(bd.param)});
+                    try writeParamLiteral(w, allocator, bd.value.zig_text);
                 }
                 try w.writeAll(" }");
             }
