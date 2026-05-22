@@ -2,7 +2,7 @@
 //!
 //! Lives inside `labelle-gui` (mirroring `labelle-engine`'s
 //! `audio_backend` / `labelle-gfx`'s `spatial_grid` sub-packages) so
-//! `labelle-assembler` can depend on the pure-Zig `.flow.zon` parser
+//! `labelle-assembler` can depend on the pure-Zig `.flow.jsonc` parser
 //! and codegen without pulling in the gui's imgui/zgui stack.
 //!
 //! The gui-side projector / renderers / types modules stay in
@@ -14,4 +14,4 @@
 
 pub const flow_io = @import("flow_io.zig");
 pub const codegen = @import("codegen.zig");
-pub const convert = @import("convert.zig");
+pub const jsonc = @import("jsonc.zig");
