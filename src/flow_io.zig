@@ -282,22 +282,26 @@ fn buildEvent(v: std.json.Value) ParseError!Event {
     if (t != .string) return error.MalformedFlow;
 
     if (std.mem.eql(u8, t.string, "OnUpdate")) {
-        return .{ .OnUpdate = .{ .arg_dt = strField(v.object, "arg_dt", "dt") } };
+        return .{ .OnUpdate = .{ .arg_dt = try strField(v.object, "arg_dt", "dt") } };
     } else if (std.mem.eql(u8, t.string, "OnCreate")) {
-        return .{ .OnCreate = .{ .arg_entity = strField(v.object, "arg_entity", "entity") } };
+        return .{ .OnCreate = .{ .arg_entity = try strField(v.object, "arg_entity", "entity") } };
     } else if (std.mem.eql(u8, t.string, "OnDestroy")) {
-        return .{ .OnDestroy = .{ .arg_entity = strField(v.object, "arg_entity", "entity") } };
+        return .{ .OnDestroy = .{ .arg_entity = try strField(v.object, "arg_entity", "entity") } };
     } else if (std.mem.eql(u8, t.string, "OnCall")) {
         return .OnCall;
     }
     return error.UnknownEventType;
 }
 
-fn strField(obj: std.json.ObjectMap, key: []const u8, default: []const u8) []const u8 {
-    if (obj.get(key)) |v| {
-        if (v == .string) return v.string;
-    }
-    return default;
+/// An optional string field: `default` when the key is absent, the
+/// string when present. A present-but-non-string value is a malformed
+/// file (rejected) rather than silently defaulted — otherwise the
+/// on-disk event arg would diverge from the generated `pub fn`
+/// signature.
+fn strField(obj: std.json.ObjectMap, key: []const u8, default: []const u8) ParseError![]const u8 {
+    const v = obj.get(key) orelse return default;
+    if (v != .string) return error.MalformedFlow;
+    return v.string;
 }
 
 fn buildParams(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Param {
