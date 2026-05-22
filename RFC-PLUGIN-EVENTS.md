@@ -54,6 +54,12 @@ This delivers what v1 lacked:
 3. **A unified emit/dispatch model.** Plugin events ride the same
    buffered/sync emit path as `GameEvents`. No new mechanism to learn,
    no second buffer to drain, no second registry to keep in sync.
+4. **Flows are event sources too.** A new `Emit` node lowers to
+   `game.emit(.{ .<qualified_tag> = .{ ... } })`, so a flow can fire
+   events as well as listen to them — without a new mechanism (§8).
+   Event *declarations* stay where they already live (`events/*.zig`
+   for game events, `pub const Events` for plugins); flows reference
+   them by name in both directions.
 
 ## Motivation
 
@@ -458,6 +464,71 @@ v1. flow-codegen ships a converter pass (parallel to the
 rewrites legacy `OnEvent` blocks once it can resolve
 `module`+`callback` to a merged-union variant.
 
+### 8. flow-codegen emission: the `Emit` node
+
+Flows are also event *sources*. A new `NodeKind.Emit` lets a flow fire
+any event the merged union already carries — game events declared in
+`events/*.zig` (#422) or plugin events declared in `pub const Events`
+(§1). Event **declarations** stay in those two places; the flow is an
+emitter, not a declaration site (this is option A — see "Rejected
+alternatives" for the flow-declares-events option, deferred).
+
+```jsonc
+{ "id": 7, "type": "Emit",
+  "event": "my_game.player_attacked",
+  "pos": [400, 200] }
+```
+
+- `event` uses the same dotted name resolver phase 1 builds for
+  `OnEvent`. An unknown name is `error.UnknownEvent` against the
+  `.flow.jsonc`, reported with the same diagnostic as the listener side.
+- The node's **input pins are the payload struct's fields**, reflected
+  via `@typeInfo(VariantType).@"struct".fields` — the same reflection
+  `OnEvent` uses to build its handler signature, just running in the
+  opposite direction. An unwired payload field is `error.DanglingPin`.
+- `Emit` has no output pin — it lowers to a statement, not an
+  expression — and so `discardUnconsumedResult` (`codegen.zig:634-651`)
+  skips it the same way it skips `SetField` and a void `Subflow`.
+
+**Codegen** lowers an `Emit` node to a one-liner against `game.emit`:
+
+```zig
+// generated body, pin-resolved inputs (n3_value, n5_value, …):
+game.emit(.{ .my_game__player_attacked = .{
+    .attacker = n3_value,
+    .damage   = n5_value,
+} });
+```
+
+- The variant tag is the same plugin-qualified form phase 1 emits
+  (`<plugin>__<event>` for plugin events; the existing field name for
+  game `events/*.zig` events, which are already flat in `GameEvents`).
+- Calls **`game.emit`**, not `game.emitSync` — buffered/end-of-frame is
+  the right default (it is what every #422 use site does), and
+  re-entrancy from a flow body emitting mid-tick would compound the
+  caveats `emitSync` itself warns about (`game.zig:458-476`). A
+  later opt-in `"sync": true` on the `Emit` node is the cheap escape
+  hatch when one is wanted; not in this phase.
+- Needs `game` in scope. Lifecycle flows (`OnUpdate`/`OnCreate`/
+  `OnDestroy`) have it directly; `OnEvent` flows have it through the
+  `game_ptr` field-injection (§5). So `Emit` works in every flow type
+  — including in an `OnEvent` flow re-emitting a derived event, which
+  is the natural way to chain.
+
+**Validation** (`flow_io.zig:validate`):
+
+- `Emit` joins the node-kind switch with no special structural rule
+  beyond "every named input pin has an edge" (handled at codegen as
+  `DanglingPin`).
+- An `Emit` whose `event` does not resolve at codegen is rejected
+  there, not in `validate` — the resolver lives in the assembler
+  (phase 1) and `validate` runs without it (`flow_io.zig` has no
+  registry handle).
+
+This is one new `NodeKind` variant, one validate arm, and one codegen
+template — small enough to ship with phase 3 (the rest of the
+flow-codegen new-form work).
+
 ## Migration
 
 Two independent migrations — flow side and plugin side — staged so
@@ -591,7 +662,9 @@ Ordered so each phase compiles and ships independently.
    the handler signature from the resolved variant's struct fields,
    emits a hook-handler struct with the `game_ptr` field for entity-
    scoped nodes, and lifts the entity/`Subflow` rejections for new-form
-   flows. Ship the legacy→name converter.
+   flows. Also add the **`Emit` node** (§8): a new `NodeKind` variant
+   with payload-field input pins, lowering to `game.emit(.{ .<tag> =
+   .{...} })`. Ship the legacy→name converter.
 4. **`labelle-assembler`** — collect flow handler structs and append
    them to the `GameHooks` receiver tuple
    (`main_zig.zig:2714-2720`); initialize their `game_ptr` field the
@@ -653,3 +726,20 @@ for that event — which is the registry, just built bottom-up and
 undiscoverable. And it still cannot give the handler `game`. The
 plugin must participate; §1 makes that a clean, conventional
 declaration matching the three existing plugin-export conventions.
+
+### Flow files declare their own events (option B)
+
+The `Emit` node (§8) only references events declared elsewhere
+(`events/*.zig` for game events, `pub const Events` for plugins). An
+alternative was to let a flow file itself declare an event payload —
+a top-level `"events": [...]` block — and have the assembler walk
+flow files as a third declaration source. Rejected for v1: it
+fragments the source-of-truth for an event's payload across three
+discovery sites, complicates the assembler's scanner (it would have
+to extract type information from `.flow.jsonc`, not just `.zig`
+declarations), and offers no capability the two existing sites do
+not. A flow author who needs a custom event creates
+`events/my_event.zig` once and references it from any number of
+emitters and listeners — the same authoring path scripts already
+use. Plausible later add if authors ask for self-contained flow
+event declarations; not in scope here.
