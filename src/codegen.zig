@@ -444,6 +444,19 @@ fn renderEntryFunction(
         }
     }
 
+    // Discard the fixed parameters up front. A flow need not reference
+    // `game` or its lifecycle `dt`/`entity` arg — Zig rejects an unused
+    // parameter, so a bare `_ = x;` keeps an unreferenced one from
+    // breaking the build. A later genuine use of the same name is
+    // still valid (`_ = x;` only satisfies the use requirement).
+    try w.writeAll("    _ = game;\n");
+    switch (flow.event) {
+        .OnUpdate => |b| try w.print("    _ = {s};\n", .{b.arg_dt}),
+        .OnCreate => |b| try w.print("    _ = {s};\n", .{b.arg_entity}),
+        .OnDestroy => |b| try w.print("    _ = {s};\n", .{b.arg_entity}),
+        .OnCall => {},
+    }
+
     try emitBody(allocator, w, &ctx, flow_name);
 
     // Return statement for an OnCall entry with declared Outputs.
@@ -572,8 +585,34 @@ fn emitBody(
         const node = ctx.index.byId(id) orelse unreachable;
         try writePreviewPulse(w, flow_name, node.id);
         try writeNodeBody(w, node, ctx, scratch.allocator());
+        try discardUnconsumedResult(w, node, ctx);
         _ = scratch.reset(.retain_capacity);
     }
+}
+
+/// Emit `_ = n<id>_<pin>;` for a node whose result value is bound to a
+/// `const` but read by no downstream edge — e.g. a terminal `Call`
+/// invoked purely for its side effect. Without this the unreferenced
+/// `const` is an "unused local constant" compile error. Nodes that
+/// emit a bare statement (`SetField`, a void `Subflow`) and `Output`
+/// nodes bind no value and are skipped.
+fn discardUnconsumedResult(
+    w: *std.Io.Writer,
+    node: *const flow_io.Node,
+    ctx: *GraphContext,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    const pin = primaryOutputPin(node.kind);
+    if (pin.len == 0) return; // SetField / Output bind nothing.
+    // A `Subflow` only binds a result when the referenced flow has
+    // `Output` nodes; a void one is lowered to a bare call statement.
+    if (node.kind == .Subflow) {
+        const ref = ctx.registry.get(node.kind.Subflow.flow) orelse return;
+        if (!anyOutput(ref.nodes)) return;
+    }
+    for (ctx.flow.edges) |e| {
+        if (e.from.node == node.id) return; // consumed by some edge
+    }
+    try w.print("    _ = n{d}_{s};\n", .{ node.id, pin });
 }
 
 // =====================================================================
