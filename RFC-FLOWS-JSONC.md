@@ -1,6 +1,6 @@
 # RFC: Flows as `.flow.jsonc` — a composable flow-graph format
 
-**Status:** Proposed
+**Status:** Accepted
 **Repos affected:** `flow-codegen`, `labelle-gui`, `labelle-assembler`
 **Related:** RFC #560 (unify scenes and prefabs), #561 (registry scan),
 #562 (override merge rules), #569 (shared tree-walker / cycle detection),
@@ -175,9 +175,10 @@ Two node types make the interface concrete:
 - **`Param`** reads a declared parameter and exposes its value as a pin
   output, so inner nodes wire to it like any other source. A `Param`
   node naming an undeclared parameter is a load-time error.
-- **`Output`** consumes a value on a pin input and names it as one of
-  the subgraph's results. The set of `Output` node names *is* the
-  subgraph's output-pin set; duplicate names are a load-time error.
+- **`Output`** consumes a value on its `value` input pin and names it
+  as one of the subgraph's results. The set of `Output` node names *is*
+  the subgraph's output-pin set; duplicate names are a load-time error.
+  A flow may declare zero `Output` nodes (a pure side-effecting flow).
 
 #### A `Subflow` node references and binds
 
@@ -267,7 +268,9 @@ flow-codegen's `renderFlowZig` is updated to:
 3. Emit each referenced flow as its **own Zig function**: each declared
    `param` is a function parameter; a `Param` node reads it; the
    `Output` nodes become the function's return — a single value, or a
-   struct of named results when there is more than one. The function
+   struct of named results when there is more than one, or `void` when
+   the flow declares none (and its `Subflow` node then projects no
+   output pins). The function
    symbol is derived deterministically from the flow's effective name
    (sanitized to a valid Zig identifier); effective names are already
    unique per §5, so symbols do not collide.
