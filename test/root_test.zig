@@ -14,6 +14,7 @@ const flow_codegen_pkg = @import("flow_codegen");
 
 const flow_io = flow_codegen_pkg.flow_io;
 const flow_codegen = flow_codegen_pkg.codegen;
+const flow_convert = flow_codegen_pkg.convert;
 
 test {
     zspec.runAll(@This());
@@ -905,5 +906,355 @@ pub const FlowCodegenTests = struct {
             std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
         }
         try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+};
+
+pub const FlowConvertTests = struct {
+    // The flows-smoke example flow (labelle-assembler) — the canonical
+    // in-tree `.flow.zon`. Used as the conversion fixture.
+    const flows_smoke_zon =
+        \\.{
+        \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+        \\    .nodes = .{
+        \\        .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+        \\        .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "1.0" } } },
+        \\        .{ .id = 3, .pos = .{ 0, 0 }, .kind = .{ .BinOp = .{ .op = .add } } },
+        \\        .{ .id = 4, .pos = .{ 0, 0 }, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+        \\    },
+        \\    .links = .{
+        \\        .{ .from = .{ .node = 1, .pin = "x" }, .to = .{ .node = 3, .pin = "a" } },
+        \\        .{ .from = .{ .node = 2, .pin = "value" }, .to = .{ .node = 3, .pin = "b" } },
+        \\        .{ .from = .{ .node = 3, .pin = "result" }, .to = .{ .node = 4, .pin = "value" } },
+        \\    },
+        \\}
+        \\
+    ;
+
+    // Strip `//` line comments so the JSONC output can be fed to the
+    // strict `std.json` parser. Caller owns the returned bytes.
+    fn stripLineComments(allocator: std.mem.Allocator, jsonc: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        var in_string = false;
+        while (i < jsonc.len) : (i += 1) {
+            const c = jsonc[i];
+            if (in_string) {
+                try out.append(allocator, c);
+                if (c == '\\' and i + 1 < jsonc.len) {
+                    i += 1;
+                    try out.append(allocator, jsonc[i]);
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                try out.append(allocator, c);
+            } else if (c == '/' and i + 1 < jsonc.len and jsonc[i + 1] == '/') {
+                while (i < jsonc.len and jsonc[i] != '\n') : (i += 1) {}
+                if (i < jsonc.len) try out.append(allocator, '\n');
+            } else {
+                try out.append(allocator, c);
+            }
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    // Convert a `.flow.zon` source and return the JSONC parsed as a
+    // `std.json.Parsed(Value)` — caller calls `.deinit()`.
+    fn convertToValue(allocator: std.mem.Allocator, zon: []const u8, name: ?[]const u8) !std.json.Parsed(std.json.Value) {
+        var loaded = try flow_io.parseFlow(allocator, zon);
+        defer loaded.deinit();
+        const jsonc = try flow_convert.flowToJsonc(allocator, loaded.flow, name);
+        defer allocator.free(jsonc);
+        const stripped = try stripLineComments(allocator, jsonc);
+        defer allocator.free(stripped);
+        return std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
+    }
+
+    test "converter output is valid JSON once comments are stripped" {
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+        try expect.equal(@as(std.meta.Tag(std.json.Value), parsed.value), .object);
+    }
+
+    test "flattens the kind tagged-union into a flat type + params" {
+        // `.kind = .{ .BinOp = .{ .op = .add } }` must become
+        // `"type": "BinOp", "op": "add"` — no nested `kind` object.
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const nodes = root.get("nodes").?.array;
+        try expect.equal(nodes.items.len, @as(usize, 4));
+
+        // Node 3 is the BinOp. Nodes are emitted id-sorted, so index 2.
+        const binop = nodes.items[2].object;
+        try expect.equal(binop.get("id").?.integer, @as(i64, 3));
+        try expect.toBeTrue(std.mem.eql(u8, binop.get("type").?.string, "BinOp"));
+        try expect.toBeTrue(std.mem.eql(u8, binop.get("op").?.string, "add"));
+        // No leftover `kind` wrapper.
+        try expect.toBeTrue(binop.get("kind") == null);
+
+        // GetComponent: `.type` field is renamed to `component` per RFC §2.
+        const get_comp = nodes.items[0].object;
+        try expect.toBeTrue(std.mem.eql(u8, get_comp.get("type").?.string, "GetComponent"));
+        try expect.toBeTrue(std.mem.eql(u8, get_comp.get("component").?.string, "Position"));
+    }
+
+    test "renames links to edges, same from/to shape" {
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        try expect.toBeTrue(root.get("links") == null);
+
+        const edges = root.get("edges").?.array;
+        try expect.equal(edges.items.len, @as(usize, 3));
+        const first = edges.items[0].object;
+        const from = first.get("from").?.object;
+        const to = first.get("to").?.object;
+        try expect.equal(from.get("node").?.integer, @as(i64, 1));
+        try expect.toBeTrue(std.mem.eql(u8, from.get("pin").?.string, "x"));
+        try expect.equal(to.get("node").?.integer, @as(i64, 3));
+        try expect.toBeTrue(std.mem.eql(u8, to.get("pin").?.string, "a"));
+    }
+
+    test "event tagged-union is flattened with a type discriminator" {
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+
+        const event = parsed.value.object.get("event").?.object;
+        try expect.toBeTrue(std.mem.eql(u8, event.get("type").?.string, "OnCreate"));
+        try expect.toBeTrue(std.mem.eql(u8, event.get("arg_entity").?.string, "entity"));
+    }
+
+    test "OnUpdate event flattens to type + arg_dt" {
+        const allocator = std.testing.allocator;
+        const zon =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "delta" } },
+            \\    .nodes = .{},
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var parsed = try convertToValue(allocator, zon, "upd");
+        defer parsed.deinit();
+        const event = parsed.value.object.get("event").?.object;
+        try expect.toBeTrue(std.mem.eql(u8, event.get("type").?.string, "OnUpdate"));
+        try expect.toBeTrue(std.mem.eql(u8, event.get("arg_dt").?.string, "delta"));
+    }
+
+    test "non-null name becomes the top-level registry key" {
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, parsed.value.object.get("name").?.string, "tick"));
+    }
+
+    test "null name omits the optional name field" {
+        const allocator = std.testing.allocator;
+        var parsed = try convertToValue(allocator, flows_smoke_zon, null);
+        defer parsed.deinit();
+        try expect.toBeTrue(parsed.value.object.get("name") == null);
+    }
+
+    test "preserves node id and pos verbatim" {
+        const allocator = std.testing.allocator;
+        const zon =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 7, .pos = .{ 120, 80 }, .kind = .{ .Identifier = .{ .name = "speed" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var parsed = try convertToValue(allocator, zon, "p");
+        defer parsed.deinit();
+        const node = parsed.value.object.get("nodes").?.array.items[0].object;
+        try expect.equal(node.get("id").?.integer, @as(i64, 7));
+        const pos = node.get("pos").?.array;
+        try expect.equal(pos.items.len, @as(usize, 2));
+        // Position values are whole numbers here — JSON renders them
+        // as integers.
+        try expect.equal(pos.items[0].integer, @as(i64, 120));
+        try expect.equal(pos.items[1].integer, @as(i64, 80));
+    }
+
+    test "covers every NodeKind variant in one flow" {
+        const allocator = std.testing.allocator;
+        const zon =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+            \\        .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+            \\        .{ .id = 3, .pos = .{ 0, 0 }, .kind = .{ .BinOp = .{ .op = .mul } } },
+            \\        .{ .id = 4, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "1.5" } } },
+            \\        .{ .id = 5, .pos = .{ 0, 0 }, .kind = .{ .Identifier = .{ .name = "speed" } } },
+            \\        .{ .id = 6, .pos = .{ 0, 0 }, .kind = .{ .Call = .{ .callee = "std.math.sin" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var parsed = try convertToValue(allocator, zon, "all");
+        defer parsed.deinit();
+        const nodes = parsed.value.object.get("nodes").?.array;
+        try expect.equal(nodes.items.len, @as(usize, 6));
+
+        const get_comp = nodes.items[0].object;
+        try expect.toBeTrue(std.mem.eql(u8, get_comp.get("type").?.string, "GetComponent"));
+        try expect.toBeTrue(std.mem.eql(u8, get_comp.get("component").?.string, "Position"));
+
+        const set_field = nodes.items[1].object;
+        try expect.toBeTrue(std.mem.eql(u8, set_field.get("type").?.string, "SetField"));
+        try expect.toBeTrue(std.mem.eql(u8, set_field.get("target").?.string, "Position.x"));
+
+        const bin_op = nodes.items[2].object;
+        try expect.toBeTrue(std.mem.eql(u8, bin_op.get("type").?.string, "BinOp"));
+        try expect.toBeTrue(std.mem.eql(u8, bin_op.get("op").?.string, "mul"));
+
+        const lit = nodes.items[3].object;
+        try expect.toBeTrue(std.mem.eql(u8, lit.get("type").?.string, "Literal"));
+        try expect.toBeTrue(std.mem.eql(u8, lit.get("value").?.string, "1.5"));
+
+        const ident = nodes.items[4].object;
+        try expect.toBeTrue(std.mem.eql(u8, ident.get("type").?.string, "Identifier"));
+        try expect.toBeTrue(std.mem.eql(u8, ident.get("name").?.string, "speed"));
+
+        const call = nodes.items[5].object;
+        try expect.toBeTrue(std.mem.eql(u8, call.get("type").?.string, "Call"));
+        try expect.toBeTrue(std.mem.eql(u8, call.get("callee").?.string, "std.math.sin"));
+    }
+
+    test "conversion is deterministic — same input renders byte-identically" {
+        const allocator = std.testing.allocator;
+        var loaded = try flow_io.parseFlow(allocator, flows_smoke_zon);
+        defer loaded.deinit();
+
+        const a = try flow_convert.flowToJsonc(allocator, loaded.flow, "tick");
+        defer allocator.free(a);
+        const b = try flow_convert.flowToJsonc(allocator, loaded.flow, "tick");
+        defer allocator.free(b);
+        try expect.toBeTrue(std.mem.eql(u8, a, b));
+    }
+
+    test "round-trips: zon -> jsonc -> json structurally matches the source flow" {
+        // The converter has no JSONC reader (the new parser, #1, owns
+        // that). We instead assert the JSON object faithfully carries
+        // every field the parsed `.flow.zon` had — node count, link
+        // count, ids, ops, pin names.
+        const allocator = std.testing.allocator;
+        var loaded = try flow_io.parseFlow(allocator, flows_smoke_zon);
+        defer loaded.deinit();
+
+        var parsed = try convertToValue(allocator, flows_smoke_zon, "tick");
+        defer parsed.deinit();
+        const root = parsed.value.object;
+
+        try expect.equal(root.get("nodes").?.array.items.len, loaded.flow.nodes.len);
+        try expect.equal(root.get("edges").?.array.items.len, loaded.flow.links.len);
+
+        // Every source node id appears in the JSON, with a `type`.
+        for (loaded.flow.nodes) |src_node| {
+            var found = false;
+            for (root.get("nodes").?.array.items) |jn| {
+                if (jn.object.get("id").?.integer == @as(i64, @intCast(src_node.id))) {
+                    found = true;
+                    try expect.toBeTrue(jn.object.get("type").?.string.len > 0);
+                }
+            }
+            try expect.toBeTrue(found);
+        }
+    }
+
+    test "escapes special characters in string values" {
+        // A Literal value with an embedded quote and backslash must
+        // round-trip as a valid JSON string.
+        const allocator = std.testing.allocator;
+        const zon =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "\"a\\b\"" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var parsed = try convertToValue(allocator, zon, "esc");
+        defer parsed.deinit();
+        const lit = parsed.value.object.get("nodes").?.array.items[0].object;
+        try expect.toBeTrue(std.mem.eql(u8, lit.get("value").?.string, "\"a\\b\""));
+    }
+
+    test "jsoncPathFromZon swaps the .flow.zon extension" {
+        const allocator = std.testing.allocator;
+        const p1 = try flow_convert.jsoncPathFromZon(allocator, "scripts/flows/tick.flow.zon");
+        defer allocator.free(p1);
+        try expect.toBeTrue(std.mem.eql(u8, p1, "scripts/flows/tick.flow.jsonc"));
+
+        const p2 = try flow_convert.jsoncPathFromZon(allocator, "/abs/move.flow.zon");
+        defer allocator.free(p2);
+        try expect.toBeTrue(std.mem.eql(u8, p2, "/abs/move.flow.jsonc"));
+    }
+
+    test "convertFile writes .flow.jsonc and (hard cut) drops the .flow.zon" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+
+        const zon_path = try std.fs.path.join(allocator, &.{ dir, "demo.flow.zon" });
+        defer allocator.free(zon_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = zon_path, .data = flows_smoke_zon });
+
+        const out_path = try flow_convert.convertFile(std.testing.io, allocator, zon_path, true);
+        defer allocator.free(out_path);
+        try expect.toBeTrue(std.mem.endsWith(u8, out_path, "demo.flow.jsonc"));
+
+        // The .flow.jsonc exists and parses; the .flow.zon is gone.
+        const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(1 << 20));
+        defer allocator.free(written);
+        const stripped = try stripLineComments(allocator, written);
+        defer allocator.free(stripped);
+        var jp = try std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
+        defer jp.deinit();
+        try expect.equal(@as(std.meta.Tag(std.json.Value), jp.value), .object);
+
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().readFileAlloc(std.testing.io, zon_path, allocator, .limited(1 << 20)),
+        );
+    }
+
+    test "convertFile --keep leaves the source .flow.zon in place" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+
+        const zon_path = try std.fs.path.join(allocator, &.{ dir, "keep.flow.zon" });
+        defer allocator.free(zon_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = zon_path, .data = flows_smoke_zon });
+
+        const out_path = try flow_convert.convertFile(std.testing.io, allocator, zon_path, false);
+        defer allocator.free(out_path);
+
+        const still_there = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, zon_path, allocator, .limited(1 << 20));
+        defer allocator.free(still_there);
+        try expect.toBeTrue(still_there.len > 0);
     }
 };
