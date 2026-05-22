@@ -532,6 +532,52 @@ This is one new `NodeKind` variant, one validate arm, and one codegen
 template — small enough to ship with phase 3 (the rest of the
 flow-codegen new-form work).
 
+### 9. Entity pin on `GetComponent` / `SetField` — flows wire payload entities in
+
+Today `GetComponent` (`flow-codegen/src/codegen.zig:1049`) hard-codes
+the identifier `entity`:
+
+```zig
+const n{d}_value = game.getComponent(entity, {s}) orelse return;
+```
+
+That works for lifecycle flows (`OnCreate`/`OnDestroy`) where `entity`
+is a function parameter. It does **not** work for an `OnEvent` flow:
+there is no lifecycle `entity` — the entity (or entities) the flow
+cares about live in the payload (`payload.entity_a`,
+`payload.entity_b`, …). v1 `OnEvent` rejects entity-scoped nodes for
+exactly this reason (`anyNodeNeedsEntity`, `codegen.zig:531`).
+
+This RFC lifts that rejection by giving `GetComponent` and `SetField`
+an **optional `entity` input pin**:
+
+- **Wired (the `OnEvent` case).** The pin's incoming expression
+  becomes the entity argument. The flow author wires
+  `payload.entity_a` (via the payload-field accessor a `Param`-style
+  read produces) to the entity pin; codegen emits
+  `game.getComponent(<wired_expr>, ComponentType)`. Different nodes
+  in the same flow can target *different* entities — e.g. one
+  `GetComponent` reads `payload.entity_a`'s `Position`, another
+  reads `payload.entity_b`'s. This is what symmetric two-entity
+  events (`collision_begin`) actually need; a "primary entity"
+  marker (the withdrawn O2) cannot express it.
+- **Unwired (lifecycle flows, back-compat).** Falls back to the
+  in-scope `entity` identifier; existing `OnCreate`/`OnDestroy`
+  flows do not need to be touched. `OnUpdate` keeps its existing TODO
+  until real entity selection (issue #42) lands.
+
+Validation: an entity-scoped node in a flow with no `entity` in scope
+*and* no wire on the entity pin is `error.DanglingPin`, reported
+against the `.flow.jsonc`. That replaces the v1 blanket-rejection
+(`anyNodeNeedsEntity` → `error.EntityUnavailableInSubgraph`) with a
+per-node check — a flow can mix entity-scoped and non-entity-scoped
+nodes freely.
+
+This is the v1 mechanism for "events that receive an entity ID as a
+parameter." Withdraws O2 (no payload-side marker needed) and folds
+into phase 3 alongside the new-form `OnEvent` work — same node-body
+templates, same scope.
+
 ## Migration
 
 Two independent migrations — flow side and plugin side — staged so
@@ -579,12 +625,17 @@ receiver tuple. No new engine API required.
    The event declaration *is* its payload struct, matching the flat
    `Components`/`Systems`/`GizmoCategories` conventions. Future
    metadata is an additive `pub const` decl beside the payload fields.
-2. **Primary-entity convention.** Should an event payload be able to
-   *mark* one field as "the entity" so an event flow gets an automatic
-   `entity` binding like `OnCreate` does? Useful for single-entity
-   events (a future `box2d.body_sleep`); meaningless for symmetric
-   two-entity events (`collision_begin`). Possibly an optional
-   `pub const primary_entity = "entity_a"` decl.
+2. ~~**Primary-entity convention.**~~ **Withdrawn — entity IDs are
+   ordinary payload fields; flows wire them in through an entity pin
+   on `GetComponent`/`SetField` (§9).** "Single-entity event" is not a
+   meaningful ECS concept: entity IDs flow *through* systems, an event
+   is not "about" one entity. What is genuinely needed is for event
+   payloads to *carry* entity IDs as ordinary fields (`entity_a: u32`,
+   `entity_b: u32`, …) — which the flat-form §1 already supports —
+   and for flows to *use* those entity IDs in `GetComponent`/`SetField`
+   nodes, which §9 addresses by giving those nodes an optional
+   `entity` input pin. No marker decl on the payload struct is needed;
+   a flow can target either, both, or neither entity per node.
 3. ~~**Dispatch order across flows.**~~ **Resolved — scanner sort
    (numeric filename prefix, then alphabetical); no `priority` field on
    notification events.** `MergeHooks.emit` `inline for`s every
@@ -654,15 +705,17 @@ receiver tuple. No new engine API required.
    `PluginEvents` variant name list, §2) instead of the v1 free-text
    `module`+`callback` fields. Tracked with `labelle-gui` `flow_io.zig`,
    not this RFC.
-7. **(New) Thread `game` through `HookDispatcher` instead of
-   `game_ptr` field injection?** §5 keeps the shipped
-   `fn(receiver_self, payload)` handler signature and reuses the
-   `game_ptr` field convention the engine already uses for every hook
-   struct (`game.zig:419-429`). A more invasive alternative would
-   change `HookDispatcher.emit` to pass `game` as a first argument,
-   removing the `*anyopaque` downcast — but it changes the signature
-   of every shipped hook handler in the engine (game-side and
-   plugin-side). Out of scope for this RFC; flagged so it is not lost.
+7. ~~**Thread `game` through `HookDispatcher` instead of `game_ptr`?**~~
+   **Resolved — keep `game_ptr`.** Passing `game` through the
+   dispatcher boundary by value is not viable: `game` is `Game(...)`,
+   a struct parameterized over the renderer, ECS, input, audio, gui,
+   hooks tuple, and components — too large to copy per dispatch. A
+   typed `*Game` pointer would force `HookDispatcher` to become
+   generic over the game type and propagate that comptime parameter
+   into every dispatch call site engine-wide. The `game_ptr: *anyopaque`
+   field convention (`game.zig:419-429`) keeps the dispatcher
+   type-erased and the handler ergonomically simple — one downcast on
+   use. The `*anyopaque` cast is the price, and it is small.
 
 ## Phased implementation plan
 
