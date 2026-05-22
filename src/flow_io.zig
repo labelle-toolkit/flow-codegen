@@ -49,19 +49,37 @@ pub const Event = union(enum) {
     OnCreate: struct { arg_entity: []const u8 = "entity" },
     OnDestroy: struct { arg_entity: []const u8 = "entity" },
     OnCall,
-    /// Binds the flow to a plugin's callback variable. `module` is the
-    /// `@import` name of the plugin that owns it (e.g. `"box2d"`),
-    /// `callback` the exported `pub var` slot (e.g.
-    /// `"on_collision_begin"`), and `params` the callback's signature.
-    /// Codegen emits a handler matching `params` verbatim — so it is
-    /// assignable to the plugin's `?*const fn(...)` slot — and a `setup`
-    /// that installs it. An `OnEvent` handler runs from a plugin
-    /// callback: it gets no `game` and no `entity`.
+    /// Subscribes the flow to a plugin- or game-declared event.
+    ///
+    /// Two forms (RFC-PLUGIN-EVENTS §7):
+    ///
+    /// 1. **New form (`name` set, `module`/`callback` null).** Names the
+    ///    event by its dotted name (e.g. `"box2d.collision_begin"`) and
+    ///    leaves payload signature resolution to the assembler's
+    ///    comptime name resolver (phase 1). Codegen of the new form is
+    ///    deferred until that resolver lands — see `renderEventEntry`.
+    /// 2. **Legacy form (`module` + `callback` set, `name` null).** v1
+    ///    behaviour: binds the flow to a plugin's `pub var ?*const fn`
+    ///    slot. `params` spells the callback's signature verbatim;
+    ///    codegen emits a handler matching it and a `setup()` that
+    ///    installs it. A v1 `OnEvent` handler gets no `game` and no
+    ///    `entity`.
+    ///
+    /// Exactly one of (`name`) or (`module` + `callback`) is set —
+    /// `buildEvent` rejects both-set and neither-set as `MalformedFlow`.
     OnEvent: struct {
-        module: []const u8,
-        callback: []const u8,
-        /// The callback's parameters — reuses `Param` (the `default`
-        /// field is unused; an event signature is fixed by the plugin).
+        /// New-form: plugin-qualified event name
+        /// (`"box2d.collision_begin"`). When set, `module`/`callback`
+        /// must be null.
+        name: ?[]const u8 = null,
+        /// Legacy: `@import` name of the plugin (e.g. `"box2d"`).
+        module: ?[]const u8 = null,
+        /// Legacy: the exported `pub var` slot
+        /// (`"on_collision_begin"`).
+        callback: ?[]const u8 = null,
+        /// Legacy: the callback's parameters — reuses `Param` (the
+        /// `default` field is unused; an event signature is fixed by
+        /// the plugin). Empty for the new form.
         params: []Param = &.{},
     },
 };
@@ -111,6 +129,7 @@ pub const Binding = struct {
 ///   - Param                  — read a declared parameter (RFC §3)
 ///   - Output                 — name a result pin (RFC §3)
 ///   - Subflow                — reference another flow (RFC §3)
+///   - Emit                   — fire a custom event (RFC-PLUGIN-EVENTS §8)
 pub const NodeKind = union(enum) {
     GetComponent: struct { type: []const u8 },
     SetField: struct { target: []const u8 },
@@ -133,6 +152,13 @@ pub const NodeKind = union(enum) {
         /// Literal bindings for unwired param pins. Owned by the arena.
         bindings: []Binding = &.{},
     },
+    /// `Emit` fires a custom event (RFC-PLUGIN-EVENTS §8). `event` is
+    /// the dotted name (`"<plugin>.<event>"` for plugin events, or the
+    /// bare name for game-scanned `events/*.zig` events) — resolved by
+    /// the assembler's comptime name resolver (phase 1). The node's
+    /// input pins are the payload struct's fields, reflected at codegen
+    /// time; lowering deferred until the resolver lands.
+    Emit: struct { event: []const u8 },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -305,13 +331,45 @@ fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
     } else if (std.mem.eql(u8, t.string, "OnCall")) {
         return .OnCall;
     } else if (std.mem.eql(u8, t.string, "OnEvent")) {
+        // Two forms (RFC-PLUGIN-EVENTS §7): `name` for the new
+        // resolver-backed form, `module` + `callback` for the legacy v1
+        // form. Both set or neither set is a malformed file.
+        const name_opt = try optStr(a, v.object, "name");
+        const module_opt = try optStr(a, v.object, "module");
+        const callback_opt = try optStr(a, v.object, "callback");
+        const params = try buildParams(a, v.object.get("params"));
+
+        const has_new = name_opt != null;
+        const has_legacy = module_opt != null and callback_opt != null;
+        const has_legacy_partial = (module_opt != null) != (callback_opt != null);
+
+        // `module` without `callback` (or vice versa) is structurally
+        // incomplete — neither form is satisfied.
+        if (has_legacy_partial) return error.MalformedFlow;
+        // Mixed forms: `name` plus a legacy field is ambiguous.
+        if (has_new and (module_opt != null or callback_opt != null))
+            return error.MalformedFlow;
+        // Neither form was supplied.
+        if (!has_new and !has_legacy) return error.MalformedFlow;
+
         return .{ .OnEvent = .{
-            .module = try reqStr(a, v.object, "module"),
-            .callback = try reqStr(a, v.object, "callback"),
-            .params = try buildParams(a, v.object.get("params")),
+            .name = name_opt,
+            .module = module_opt,
+            .callback = callback_opt,
+            .params = params,
         } };
     }
     return error.UnknownEventType;
+}
+
+/// An optional string field: `null` when the key is absent, the dup'd
+/// string when present. A present-but-non-string value is a malformed
+/// file (rejected) rather than silently dropped. Unlike `strField`, a
+/// missing key returns `null`; unlike `reqStr`, it does not error.
+fn optStr(a: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const v = o.get(key) orelse return null;
+    if (v != .string) return error.MalformedFlow;
+    return try a.dupe(u8, v.string);
 }
 
 /// An optional string field: `default` when the key is absent, the
@@ -445,6 +503,12 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
             .flow = try reqStr(a, o, "flow"),
             .bindings = try buildBindings(a, o.get("bindings")),
         } };
+    } else if (std.mem.eql(u8, type_name, "Emit")) {
+        // `Emit` fires a custom event by dotted name
+        // (RFC-PLUGIN-EVENTS §8). Codegen rejects an unknown name with
+        // a sourced diagnostic; validate just confirms the field is
+        // present — the assembler's resolver is the source of truth.
+        return .{ .Emit = .{ .event = try reqStr(a, o, "event") } };
     }
     return error.UnknownNodeType;
 }
@@ -791,6 +855,10 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
                 try w.writeAll(" }");
             }
         },
+        .Emit => |b| {
+            try w.writeAll(", \"event\": ");
+            try writeJsonString(w, b.event);
+        },
     }
 }
 
@@ -813,10 +881,23 @@ fn writeEvent(w: anytype, ev: Event) !void {
         },
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
         .OnEvent => |b| {
-            try w.writeAll("{ \"type\": \"OnEvent\", \"module\": ");
-            try writeJsonString(w, b.module);
-            try w.writeAll(", \"callback\": ");
-            try writeJsonString(w, b.callback);
+            try w.writeAll("{ \"type\": \"OnEvent\"");
+            // New form: `name` is set, legacy fields are null. Legacy
+            // form: `module` + `callback` (and optionally `params`).
+            // `buildEvent` enforces exactly one form, so we render
+            // whichever is set without re-validating.
+            if (b.name) |n| {
+                try w.writeAll(", \"name\": ");
+                try writeJsonString(w, n);
+            }
+            if (b.module) |m| {
+                try w.writeAll(", \"module\": ");
+                try writeJsonString(w, m);
+            }
+            if (b.callback) |c| {
+                try w.writeAll(", \"callback\": ");
+                try writeJsonString(w, c);
+            }
             if (b.params.len != 0) {
                 try w.writeAll(", \"params\": [");
                 for (b.params, 0..) |p, i| {

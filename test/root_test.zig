@@ -193,8 +193,10 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
         const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(std.mem.eql(u8, ev.module, "box2d"));
-        try expect.toBeTrue(std.mem.eql(u8, ev.callback, "on_collision_begin"));
+        // Legacy form: `module`+`callback` set, `name` null.
+        try expect.toBeTrue(ev.name == null);
+        try expect.toBeTrue(std.mem.eql(u8, ev.module.?, "box2d"));
+        try expect.toBeTrue(std.mem.eql(u8, ev.callback.?, "on_collision_begin"));
         try expect.equal(ev.params.len, @as(usize, 2));
         try expect.toBeTrue(std.mem.eql(u8, ev.params[0].name, "entity_a"));
         try expect.toBeTrue(std.mem.eql(u8, ev.params[1].type, "u32"));
@@ -226,6 +228,143 @@ pub const FlowIoTests = struct {
         const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
         defer allocator.free(rendered2);
         try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "parses a new-form OnEvent with the name field" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS §7: the new form names the event and lets
+        // the assembler's resolver derive the payload type. `module` /
+        // `callback` / `params` are absent.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
+        const ev = loaded.flow.event.OnEvent;
+        try expect.toBeTrue(ev.name != null);
+        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "box2d.collision_begin"));
+        try expect.toBeTrue(ev.module == null);
+        try expect.toBeTrue(ev.callback == null);
+        try expect.equal(ev.params.len, @as(usize, 0));
+    }
+
+    test "round-trips a new-form OnEvent flow through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "on_collision",
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
+        try expect.toBeTrue(l2.flow.event.OnEvent.name != null);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name.?, "box2d.collision_begin"));
+        // Legacy fields stay null on the round-tripped form.
+        try expect.toBeTrue(l2.flow.event.OnEvent.module == null);
+        try expect.toBeTrue(l2.flow.event.OnEvent.callback == null);
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "rejects an OnEvent with both name and legacy fields set" {
+        const allocator = std.testing.allocator;
+        // Exactly one form (`name` xor `module`+`callback`) is allowed.
+        // Mixing them is a malformed flow.
+        const src =
+            \\{
+            \\  "event": {
+            \\    "type": "OnEvent", "name": "box2d.collision_begin",
+            \\    "module": "box2d", "callback": "on_collision_begin"
+            \\  },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects an OnEvent with neither name nor legacy fields set" {
+        const allocator = std.testing.allocator;
+        // An empty `OnEvent` event payload — no resolver name, no
+        // legacy callback — is unparseable.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects an OnEvent with a partial legacy form (module only)" {
+        const allocator = std.testing.allocator;
+        // `module` without `callback` (or vice versa) is structurally
+        // incomplete — neither form is satisfied.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "module": "box2d" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "parses and round-trips an Emit node" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS §8: an `Emit` node fires a custom event by
+        // dotted name. The parser accepts it; codegen lowering is
+        // deferred until the assembler's resolver lands.
+        const src =
+            \\{
+            \\  "name": "emitter",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Emit", "event": "my_game.player_attacked", "pos": [400, 200] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), l1.flow.nodes[0].kind), .Emit);
+        try expect.toBeTrue(std.mem.eql(u8, l1.flow.nodes[0].kind.Emit.event, "my_game.player_attacked"));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), l2.flow.nodes[0].kind), .Emit);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.nodes[0].kind.Emit.event, "my_game.player_attacked"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "rejects an Emit node with no event field" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "Emit", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
     }
 
     test "rejects unknown node type" {
@@ -582,6 +721,161 @@ pub const FlowCodegenTests = struct {
         , "setf");
         defer allocator.free(out);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, entity, n4_value);") != null);
+    }
+
+    test "lifecycle GetComponent with a wired entity pin uses the wired expression" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS §9: a wired `entity` input pin overrides
+        // the in-scope `entity` identifier. The producing node here is
+        // an `Identifier` that names a field of a hypothetical payload
+        // (`payload.entity_a`) — `Identifier` emits its `name` text
+        // verbatim, so it stands in for any future payload-field
+        // accessor without coupling this test to the resolver.
+        const out = try render(allocator,
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "self" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Identifier", "name": "self", "pos": [0, 0] },
+            \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "entity" } } ]
+            \\}
+        , "wired_get");
+        defer allocator.free(out);
+        // The entity argument is the wired pin's expression, not bare
+        // `entity` — even though the OnCreate parameter is named
+        // `self` (which would have triggered a `const entity = self;`
+        // back-compat binding in the unwired case).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(n1_value, Position)") != null);
+        // No back-compat `entity` binding: every entity-scoped node
+        // here wires its pin, so the lifecycle binding is suppressed.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const entity = self;") == null);
+
+        // Sanity: the emitted Zig must parse.
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "lifecycle SetField with a wired entity pin uses the wired expression" {
+        const allocator = std.testing.allocator;
+        // Same wiring as the GetComponent case, but for SetField — the
+        // entity argument moves from bare `entity` to the wired pin.
+        const out = try render(allocator,
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Identifier", "name": "other", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": "42", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetField", "target": "Position.x", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "entity" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        , "wired_set");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, n1_value, n2_value);") != null);
+    }
+
+    test "lifecycle flow mixes wired and unwired entity-scoped nodes" {
+        const allocator = std.testing.allocator;
+        // One `GetComponent` wires its entity pin; another reads bare
+        // `entity` from the lifecycle param. The lifecycle binding
+        // stays in place — `anyNeedsBareEntity` triggers it — and the
+        // wired node still gets the wired expression.
+        const out = try render(allocator,
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Identifier", "name": "other", "pos": [0, 0] },
+            \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] },
+            \\    { "id": 3, "type": "GetComponent", "component": "Health", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "entity" } } ]
+            \\}
+        , "mixed_get");
+        defer allocator.free(out);
+        // Node 2 reads the wired expression; node 3 falls back to
+        // the in-scope lifecycle `entity`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(n1_value, Position)") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(entity, Health)") != null);
+    }
+
+    test "OnCall entry with a wired entity-pin GetComponent is allowed" {
+        const allocator = std.testing.allocator;
+        // An `OnCall` entry has no in-scope `entity`. RFC-PLUGIN-EVENTS
+        // §9 lifts the v1 blanket-rejection: a `GetComponent` whose
+        // `entity` input pin is wired is fine — the wired expression
+        // is the entity argument.
+        const out = try render(allocator,
+            \\{
+            \\  "name": "oncall_wired",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "subject", "type": "u32" } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Param", "param": "subject", "pos": [0, 0] },
+            \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "entity" } } ]
+            \\}
+        , "oncall_wired");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(n1_value, Position)") != null);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "new-form OnEvent codegen is deferred (UnsupportedNodeKind)" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS §7 / phase 3 scaffold: the parser accepts
+        // the new form but codegen needs the assembler's resolver
+        // (phase 1). Until that lands, the codegen errors loudly so a
+        // flow author cannot accidentally ship a flow that silently
+        // emits the wrong shape.
+        var loaded = try flow_io.parseFlow(allocator,
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [], "edges": []
+            \\}
+        );
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.UnsupportedNodeKind,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "new_form" }),
+        );
+    }
+
+    test "Emit node codegen is deferred (UnsupportedNodeKind)" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS §8 / phase 3 scaffold: same reason as the
+        // new-form OnEvent codegen — needs the resolver. Parser
+        // accepts the node; codegen errors.
+        var loaded = try flow_io.parseFlow(allocator,
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Emit", "event": "my_game.fired", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        );
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.UnsupportedNodeKind,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "emitter" }),
+        );
     }
 
     test "topo-sorts dependent nodes correctly" {
@@ -1398,10 +1692,12 @@ pub const SubflowTests = struct {
         );
     }
 
-    test "rejects an entity-scoped node inside a subgraph" {
+    test "rejects an entity-scoped node inside a subgraph with no entity-pin wire" {
         const allocator = std.testing.allocator;
-        // A subgraph has no `entity` in scope — a GetComponent node
-        // there cannot be emitted.
+        // A subgraph has no `entity` in scope; a `GetComponent` with no
+        // wire on its `entity` input pin (RFC-PLUGIN-EVENTS §9) is
+        // `DanglingPin` against the offending node. Replaces the v1
+        // blanket `EntityUnavailableInSubgraph`.
         const sub_src =
             \\{
             \\  "name": "needs_entity",
@@ -1429,7 +1725,7 @@ pub const SubflowTests = struct {
         try reg.add(entry.flow);
 
         try std.testing.expectError(
-            error.EntityUnavailableInSubgraph,
+            error.DanglingPin,
             flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "uses_needs_entity" }),
         );
     }
@@ -1808,11 +2104,13 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         );
     }
 
-    test "rejects an entity-scoped node in an OnCall entry flow" {
+    test "rejects an entity-scoped node in an OnCall entry flow with no entity-pin wire" {
         const allocator = std.testing.allocator;
         // An `OnCall` entry is a subgraph in its own right (RFC §3/§6)
-        // — no `entity` in scope, so a `GetComponent` node there can't
-        // be emitted, exactly as inside a referenced subgraph.
+        // — no `entity` in scope. An entity-scoped node without a wire
+        // on its `entity` input pin (RFC-PLUGIN-EVENTS §9) is
+        // `DanglingPin`. Replaces the v1 blanket
+        // `EntityUnavailableInSubgraph`.
         var nodes = [_]flow_io.Node{
             .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .GetComponent = .{ .type = "Health" } } },
         };
@@ -1823,7 +2121,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         try reg.add(flow);
 
         try std.testing.expectError(
-            error.EntityUnavailableInSubgraph,
+            error.DanglingPin,
             flow_codegen.renderFlowFile(allocator, flow, &reg, .{ .flow_name = "oncall_entity" }),
         );
     }
