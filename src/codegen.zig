@@ -359,7 +359,7 @@ fn renderEntryFunction(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
-    try writeFnHeader(w, flow.event);
+    try writeFnHeader(w, flow);
 
     // Entity binding for OnCreate/OnDestroy/OnUpdate templates.
     if (anyNodeNeedsEntity(flow.nodes)) {
@@ -719,24 +719,32 @@ fn topoSort(
 // Node body emission
 // =====================================================================
 
-fn writeFnHeader(w: anytype, ev: flow_io.Event) !void {
-    switch (ev) {
+/// Emit the `pub fn` header for the file entry point. The flow's
+/// top-level `params` are appended as fn parameters — same as a
+/// subgraph — so `Param` nodes in the entry flow resolve their reads
+/// to in-scope identifiers (RFC §3).
+fn writeFnHeader(w: anytype, flow: flow_io.Flow) !void {
+    switch (flow.event) {
         .OnUpdate => |b| try w.print(
-            "pub fn onUpdate(game: *Game, {s}: f32) void {{\n",
+            "pub fn onUpdate(game: *Game, {s}: f32",
             .{b.arg_dt},
         ),
         .OnCreate => |b| try w.print(
-            "pub fn onCreate(game: *Game, {s}: EntityId) void {{\n",
+            "pub fn onCreate(game: *Game, {s}: EntityId",
             .{b.arg_entity},
         ),
         .OnDestroy => |b| try w.print(
-            "pub fn onDestroy(game: *Game, {s}: EntityId) void {{\n",
+            "pub fn onDestroy(game: *Game, {s}: EntityId",
             .{b.arg_entity},
         ),
         // An OnCall flow used as the file entry point still needs a
-        // callable surface — emit a parameterless `pub fn onCall`.
-        .OnCall => try w.writeAll("pub fn onCall(game: *Game) void {\n"),
+        // callable surface — emit `pub fn onCall`.
+        .OnCall => try w.writeAll("pub fn onCall(game: *Game"),
     }
+    for (flow.params) |p| {
+        try w.print(", {s}: {s}", .{ p.name, p.type });
+    }
+    try w.writeAll(") void {\n");
 }
 
 fn writePreviewPulse(w: anytype, flow_name: []const u8, node_id: u32) !void {

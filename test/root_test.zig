@@ -393,6 +393,32 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCreate(game: *Game, self: EntityId) void") != null);
     }
 
+    test "entry function declares top-level params so Param nodes resolve" {
+        const allocator = std.testing.allocator;
+        const out = try render(allocator,
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "damage", "type": "f32", "default": 5.0 } ],
+            \\  "nodes": [ { "id": 1, "type": "Param", "param": "damage", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        , "entry_with_param");
+        defer allocator.free(out);
+        // The entry `pub fn` declares the param as a fn argument.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, damage: f32) void") != null);
+        // The Param node reads the in-scope argument.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = damage;") != null);
+
+        // The emitted Zig must parse.
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
     test "renders Literal node as a const binding" {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
