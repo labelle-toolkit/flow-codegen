@@ -1,6 +1,6 @@
 # RFC: Flows as `.flow.jsonc` — a composable flow-graph format
 
-**Status:** Draft
+**Status:** Accepted
 **Repos affected:** `flow-codegen`, `labelle-gui`, `labelle-assembler`
 **Related:** RFC #560 (unify scenes and prefabs), #561 (registry scan),
 #562 (override merge rules), #569 (shared tree-walker / cycle detection),
