@@ -409,13 +409,15 @@ pub const FlowCodegenTests = struct {
         return flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = name });
     }
 
-    test "renders OnUpdate event signature with custom arg_dt name" {
+    test "renders OnUpdate event as the engine per-frame `tick` entry" {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{ "event": { "type": "OnUpdate", "arg_dt": "delta" }, "nodes": [], "edges": [] }
         , "demo");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onUpdate(game: *Game, delta: f32) void") != null);
+        // `OnUpdate` lowers to `tick` — the script-runner's per-frame
+        // entry point — so the flow is actually dispatched each frame.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn tick(game: anytype, delta: f32) void") != null);
     }
 
     test "renders OnCreate event signature" {
@@ -424,7 +426,7 @@ pub const FlowCodegenTests = struct {
             \\{ "event": { "type": "OnCreate", "arg_entity": "self" }, "nodes": [], "edges": [] }
         , "spawn");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCreate(game: *Game, self: EntityId) void") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCreate(game: anytype, self: EntityId) void") != null);
     }
 
     test "entry function declares top-level params so Param nodes resolve" {
@@ -439,7 +441,7 @@ pub const FlowCodegenTests = struct {
         , "entry_with_param");
         defer allocator.free(out);
         // The entry `pub fn` declares the param as a fn argument.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, damage: f32) void") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: anytype, damage: f32) void") != null);
         // The Param node reads the in-scope argument.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = damage;") != null);
 
@@ -746,7 +748,7 @@ pub const SubflowTests = struct {
         defer allocator.free(out);
 
         // The subgraph becomes its own fn: params → fn args.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn combat_subgraph(game: *Game, damage: f32) f32 {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn combat_subgraph(game: anytype, damage: f32) f32 {") != null);
         // A Param node reads the argument.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = damage;") != null);
         // The single Output becomes a return.
@@ -837,7 +839,7 @@ pub const SubflowTests = struct {
 
         const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "tick_void" });
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn void_sub(game: *Game) void {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn void_sub(game: anytype) void {") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "    void_sub(game);") != null);
     }
 
@@ -1090,7 +1092,7 @@ pub const SubflowTests = struct {
         const out = try flow_codegen.renderFlowFile(allocator, l_entry.flow, &reg, .{ .flow_name = "uses_multi" });
         defer allocator.free(out);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const multi_Result = struct {") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn multi(game: *Game, x: f32) multi_Result {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn multi(game: anytype, x: f32) multi_Result {") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "return .{") != null);
     }
 
@@ -1421,7 +1423,7 @@ pub const SubflowTests = struct {
         const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "scoring" });
         defer allocator.free(out);
         // The entry `pub fn` returns the Output's declared type.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, base: f32) f32 {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: anytype, base: f32) f32 {") != null);
         // …and emits the return statement reading the wired pin.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "return n1_value;") != null);
 
@@ -1462,7 +1464,7 @@ pub const SubflowTests = struct {
         const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "stats" });
         defer allocator.free(out);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const onCall_Result = struct {") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: *Game, base: f32) onCall_Result {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: anytype, base: f32) onCall_Result {") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, ".hp = n1_value,") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, ".mp = n1_value,") != null);
 
@@ -1590,14 +1592,14 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
 
         const out = try flow_codegen.renderFlowFile(allocator, flow, &reg, .{ .flow_name = "sanitize_param" });
         defer allocator.free(out);
-        try expect.toContain(out, "pub fn onCall(game: *Game, hit_points: f32) f32 {");
+        try expect.toContain(out, "pub fn onCall(game: anytype, hit_points: f32) f32 {");
         try expect.toContain(out, "const n1_value = hit_points;");
         try expectParses(allocator, out);
     }
 
     test "rejects a param colliding with the fixed game parameter" {
         const allocator = std.testing.allocator;
-        // A param named `game` would emit `fn (game: *Game, game: f32)`
+        // A param named `game` would emit `fn (game: anytype, game: f32)`
         // — duplicate parameter identifiers, which Zig rejects.
         var params = [_]flow_io.Param{.{ .name = "game", .type = "f32" }};
         const flow = FlowFactory.build(.{ .name = "param_clash", .params = &params });
@@ -1652,7 +1654,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         const out = try flow_codegen.renderFlowFile(allocator, entry, &reg, .{ .flow_name = "uses_tick_helper" });
         defer allocator.free(out);
         // The subgraph `fn` takes only `game` + its declared `dt`.
-        try expect.toContain(out, "fn tick_helper(game: *Game, dt: f32) f32 {");
+        try expect.toContain(out, "fn tick_helper(game: anytype, dt: f32) f32 {");
         try expectParses(allocator, out);
     }
 

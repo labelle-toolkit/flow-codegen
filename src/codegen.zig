@@ -423,59 +423,94 @@ fn renderEntryFunction(
 
     try writeFnHeader(allocator, w, flow, outputs);
 
+    // Render the body into a buffer first, so we can see which fixed
+    // parameters it actually references. Zig rejects *both* an unused
+    // parameter and a pointless `_ = x;` discard of a used one — so a
+    // parameter is discarded only when the body never mentions it.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body_aw.deinit();
+    const bw = &body_aw.writer;
+
     // Entity binding for OnCreate/OnDestroy/OnUpdate templates.
     if (anyNodeNeedsEntity(flow.nodes)) {
         switch (flow.event) {
             .OnUpdate => {
-                try w.writeAll("    // TODO(#42): real entity selection for OnUpdate flows.\n");
-                try w.writeAll("    const entity: EntityId = undefined;\n");
+                try bw.writeAll("    // TODO(#42): real entity selection for OnUpdate flows.\n");
+                try bw.writeAll("    const entity: EntityId = undefined;\n");
             },
             .OnCreate => |b| {
                 if (!std.mem.eql(u8, b.arg_entity, "entity")) {
-                    try w.print("    const entity = {s};\n", .{b.arg_entity});
+                    try bw.print("    const entity = {s};\n", .{b.arg_entity});
                 }
             },
             .OnDestroy => |b| {
                 if (!std.mem.eql(u8, b.arg_entity, "entity")) {
-                    try w.print("    const entity = {s};\n", .{b.arg_entity});
+                    try bw.print("    const entity = {s};\n", .{b.arg_entity});
                 }
             },
             .OnCall => {},
         }
     }
 
-    // Discard the fixed parameters up front. A flow need not reference
-    // `game` or its lifecycle `dt`/`entity` arg — Zig rejects an unused
-    // parameter, so a bare `_ = x;` keeps an unreferenced one from
-    // breaking the build. A later genuine use of the same name is
-    // still valid (`_ = x;` only satisfies the use requirement).
-    try w.writeAll("    _ = game;\n");
-    switch (flow.event) {
-        .OnUpdate => |b| try w.print("    _ = {s};\n", .{b.arg_dt}),
-        .OnCreate => |b| try w.print("    _ = {s};\n", .{b.arg_entity}),
-        .OnDestroy => |b| try w.print("    _ = {s};\n", .{b.arg_entity}),
-        .OnCall => {},
-    }
-
-    try emitBody(allocator, w, &ctx, flow_name);
+    try emitBody(allocator, bw, &ctx, flow_name);
 
     // Return statement for an OnCall entry with declared Outputs.
     if (outputs.len == 1) {
         const expr = (try ctx.resolveInput(allocator, outputs[0], "value")) orelse return error.DanglingPin;
         defer allocator.free(expr);
-        try w.print("    return {s};\n", .{expr});
+        try bw.print("    return {s};\n", .{expr});
     } else if (outputs.len > 1) {
-        try w.writeAll("    return .{\n");
+        try bw.writeAll("    return .{\n");
         for (outputs) |o| {
             const expr = (try ctx.resolveInput(allocator, o, "value")) orelse return error.DanglingPin;
             defer allocator.free(expr);
             const field = try sanitizeSymbol(allocator, o.kind.Output.name);
             defer allocator.free(field);
-            try w.print("        .{s} = {s},\n", .{ field, expr });
+            try bw.print("        .{s} = {s},\n", .{ field, expr });
         }
-        try w.writeAll("    };\n");
+        try bw.writeAll("    };\n");
     }
+
+    const body = try body_aw.toOwnedSlice();
+    defer allocator.free(body);
+
+    // A fixed parameter the body never mentions is an "unused function
+    // parameter" to Zig — discard exactly those, no more.
+    if (!mentionsIdent(body, "game")) try w.writeAll("    _ = game;\n");
+    switch (flow.event) {
+        .OnUpdate => |b| if (!mentionsIdent(body, b.arg_dt))
+            try w.print("    _ = {s};\n", .{b.arg_dt}),
+        .OnCreate => |b| if (!mentionsIdent(body, b.arg_entity))
+            try w.print("    _ = {s};\n", .{b.arg_entity}),
+        .OnDestroy => |b| if (!mentionsIdent(body, b.arg_entity))
+            try w.print("    _ = {s};\n", .{b.arg_entity}),
+        .OnCall => {},
+    }
+
+    try w.writeAll(body);
     try w.writeAll("}\n");
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
+}
+
+/// True when `ident` appears in `src` as a whole identifier token —
+/// not flanked by an identifier character on either side. Lets the
+/// entry-function renderer tell a referenced parameter from an unused
+/// one without a real parser.
+fn mentionsIdent(src: []const u8, ident: []const u8) bool {
+    if (ident.len == 0) return false;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, ident)) |pos| {
+        const before_ok = pos == 0 or !isIdentChar(src[pos - 1]);
+        const after = pos + ident.len;
+        const after_ok = after >= src.len or !isIdentChar(src[after]);
+        if (before_ok and after_ok) return true;
+        i = pos + 1;
+    }
+    return false;
 }
 
 /// Emit one subgraph as a `fn` (RFC §6): params → fn args, `Output`
@@ -525,8 +560,8 @@ fn renderSubgraphFunction(
         try w.writeAll("};\n");
     }
 
-    // Signature: `fn <symbol>(game: *Game, <param>: <type>, …) <ret> {`
-    try w.print("fn {s}(game: *Game", .{symbol});
+    // Signature: `fn <symbol>(game: anytype, <param>: <type>, …) <ret> {`
+    try w.print("fn {s}(game: anytype", .{symbol});
     try writeParamArgs(allocator, w, flow.params);
     try w.writeAll(") ");
     try writeReturnType(w, symbol, outputs);
@@ -861,21 +896,24 @@ fn writeFnHeader(
     outputs: []const *const flow_io.Node,
 ) !void {
     switch (flow.event) {
+        // An `OnUpdate` flow is a per-frame hook — emit `tick`, the
+        // engine script-runner's per-frame entry point, so the flow
+        // is actually dispatched. (`isGameScript` keys on `tick`.)
         .OnUpdate => |b| try w.print(
-            "pub fn onUpdate(game: *Game, {s}: f32",
+            "pub fn tick(game: anytype, {s}: f32",
             .{b.arg_dt},
         ),
         .OnCreate => |b| try w.print(
-            "pub fn onCreate(game: *Game, {s}: EntityId",
+            "pub fn onCreate(game: anytype, {s}: EntityId",
             .{b.arg_entity},
         ),
         .OnDestroy => |b| try w.print(
-            "pub fn onDestroy(game: *Game, {s}: EntityId",
+            "pub fn onDestroy(game: anytype, {s}: EntityId",
             .{b.arg_entity},
         ),
         // An OnCall flow used as the file entry point still needs a
         // callable surface — emit `pub fn onCall`.
-        .OnCall => try w.writeAll("pub fn onCall(game: *Game"),
+        .OnCall => try w.writeAll("pub fn onCall(game: anytype"),
     }
     try writeParamArgs(allocator, w, flow.params);
     try w.writeAll(") ");
@@ -1185,7 +1223,9 @@ pub fn sanitizeSymbol(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 /// symbol namespace alongside the subgraph `fn`s.
 fn entryFunctionName(event: flow_io.Event) []const u8 {
     return switch (event) {
-        .OnUpdate => "onUpdate",
+        // `OnUpdate` lowers to the engine's per-frame `tick` entry so
+        // the script-runner actually dispatches the flow each frame.
+        .OnUpdate => "tick",
         .OnCreate => "onCreate",
         .OnDestroy => "onDestroy",
         .OnCall => "onCall",
