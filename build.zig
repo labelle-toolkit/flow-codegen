@@ -12,6 +12,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── CLI executable ──────────────────────────────────────────────────
+    // `flow-codegen` — today just the `.flow.zon` → `.flow.jsonc`
+    // converter subcommand (flow-codegen#2). `main.zig` imports the
+    // schema modules directly from `src/`, so it needs no module dep.
+    const exe = b.addExecutable(.{
+        .name = "flow-codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |cli_args| run_cmd.addArgs(cli_args);
+    const run_step = b.step("run", "Run the flow-codegen CLI");
+    run_step.dependOn(&run_cmd.step);
+
     // ── Tests ───────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run flow_codegen tests");
 
