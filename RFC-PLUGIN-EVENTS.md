@@ -417,16 +417,34 @@ the engine work item, not blocking this RFC.
    express that explicitly (a `Subflow` call, or a derived event), not
    rely on a hidden race. This matches ECS systems today, which run in
    `SystemRegistry` order with no per-system priority. An explicit
-   `priority` is deliberately deferred: it is a non-breaking addition
-   later (a new optional field with a neutral default), and it becomes
-   genuinely necessary only alongside cancellable events (O4) — where
-   "who runs first" decides who consumes the event — so priority should
-   land *with* O4, not before it.
-4. **Cancellable / consumable events.** A raw `?*const fn(...) void`
-   slot cannot signal "handled". Should a registry event payload allow a
-   handler to mark the event consumed (stopping later listeners)? Out of
-   scope for v1; noting it because the `HookDispatcher` `void`-return
-   shape would have to change to support it.
+   `priority` is deliberately kept *off* the notification flavor —
+   those reactions are independent. Priority **is** introduced, but
+   scoped to the **consumable** event flavor (O4, resolved), where
+   ordering decides which handler consumes the event first.
+4. ~~**Cancellable / consumable events.**~~ **Resolved — two event
+   flavors.** An event declares one of:
+   - **notification** (the default — `collision_begin`, `sensor_enter`,
+     …): fan-out, every listener runs, `void` handlers, `MergeHooks`
+     dispatch unchanged, O3 holds (unspecified order). A notification
+     reports something that already happened — there is nothing to
+     consume.
+   - **consumable** (input-style — a future `ui.click`, `input.key`):
+     handlers run in an explicit **priority** order and return a
+     "handled" signal; the first handler to mark the event handled
+     **stops propagation** — later listeners are skipped.
+
+   The flavor is an additive decl on the flat event struct (O1),
+   defaulting to notification:
+   `pub const click = struct { x: f32, y: f32, pub const consumable = true; };`.
+   The consumable flavor needs a return-aware dispatch path — a
+   `bool`-returning handler and an early `break` — which `MergeHooks`
+   (`void`, no break) lacks; that is a `zig-utils` `HookDispatcher`
+   addition. **Scope:** the notification flavor is v1; the consumable
+   flavor (the dispatcher change + the `OnEvent` `priority` field) is a
+   defined follow-up phase, sequenced after the notification registry
+   ships. Prior art: browsers (`stopPropagation`), Unity (`Event.Use`),
+   and Unreal (input "consumed") all separate fan-out notifications from
+   consumable input this way.
 5. **Non-plugin event sources.** Could a *game script* (not a plugin)
    declare `pub const Events` and emit its own events for flows to
    listen to? The discovery is the same `@hasDecl` walk; the only
@@ -464,6 +482,12 @@ Ordered so each phase compiles and ships independently.
 6. **Cleanup** — convert in-tree flows to the `name` form; deprecate
    then remove `labelle-box2d`'s `pub var` callback slots (Migration
    phases 2–3); drop the legacy `renderEventEntry` path.
+7. **Consumable event flavor** (follow-up, O4) — add return-aware
+   dispatch to `zig-utils` `HookDispatcher` (a `bool`-returning handler
+   + early `break`); let a plugin event opt in via
+   `pub const consumable = true`; add the `OnEvent` `priority` field and
+   its registry sort. Sequenced after phases 1–6; the notification
+   registry does not depend on it.
 
 ## Rejected alternatives
 
