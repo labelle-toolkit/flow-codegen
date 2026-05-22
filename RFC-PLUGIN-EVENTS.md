@@ -115,44 +115,49 @@ export, exactly like components and systems.
 ### 1. Plugin `Events` declaration
 
 A plugin declares the events it emits in a `pub const Events` struct.
-Each declaration is itself a struct: a `Payload` type plus an optional
-doc string. The declaration name is the event's **registry name**.
+Each declaration **is** the event's payload struct — its fields are the
+event's data — and the declaration name is the event's **registry
+name**.
 
 ```zig
 // labelle-box2d/src/root.zig
 pub const Events = struct {
-    pub const collision_begin = struct {
-        /// Two entities started touching.
-        pub const Payload = struct { entity_a: u32, entity_b: u32 };
-    };
-    pub const collision_end = struct {
-        pub const Payload = struct { entity_a: u32, entity_b: u32 };
-    };
+    /// Two entities started touching.
+    pub const collision_begin = struct { entity_a: u32, entity_b: u32 };
+    pub const collision_end = struct { entity_a: u32, entity_b: u32 };
     pub const collision_hit = struct {
-        pub const Payload = struct {
-            entity_a: u32, entity_b: u32,
-            point_x: f32, point_y: f32,
-            normal_x: f32, normal_y: f32,
-            speed: f32,
-        };
+        entity_a: u32, entity_b: u32,
+        point_x: f32, point_y: f32,
+        normal_x: f32, normal_y: f32,
+        speed: f32,
     };
-    pub const sensor_enter = struct {
-        pub const Payload = struct { sensor_entity: u32, visitor_entity: u32 };
-    };
-    pub const sensor_exit = struct {
-        pub const Payload = struct { sensor_entity: u32, visitor_entity: u32 };
-    };
+    pub const sensor_enter = struct { sensor_entity: u32, visitor_entity: u32 };
+    pub const sensor_exit = struct { sensor_entity: u32, visitor_entity: u32 };
 };
 ```
 
-Rationale for the shape:
+Rationale for the shape (**resolves open question O1** — flat, no
+`Payload` wrapper):
 
-- **Payload is a struct, not a flat param list.** A single `Payload`
-  type is one named thing the registry, codegen, and the plugin all
-  reference. Its fields *are* the handler parameters — but as a type, it
-  survives a field rename as a coherent unit and can be passed by value
-  to a dispatcher (§4). The v1 `params: []Param` is recovered for free
-  by reflecting `@typeInfo(Payload).@"struct".fields`.
+- **The event declaration is its payload type.** This matches the
+  toolkit's three existing plugin conventions, which are all flat
+  `pub const X = …`: `Components` (`pub const RigidBody = PhysicsBody;`),
+  `Systems`, and `GizmoCategories`. `Events` is the fourth and stays
+  consistent — no nested `pub const Payload` wrapper.
+- **Flat does not forgo metadata.** A Zig struct holds fields *and*
+  decls, reported separately by `@typeInfo` (`.fields` vs `.decls`).
+  Documentation is a plain `///` doc comment on the declaration; a
+  future marker (the O2 primary-entity field) is an additive
+  `pub const primary_entity = "entity_a";` beside the payload fields —
+  no wrapper, no migration. Editor-facing metadata (display name,
+  category, tooltip — what Unity/Unreal attach to events, almost
+  entirely for editor tooling) is the same shape: additive decls, owned
+  by the labelle-gui flow editor (O6), not modelled by the registry now.
+- **The handler parameters are the payload struct's fields** —
+  `@typeInfo(EventType).@"struct".fields`. The v1 `params: []Param`
+  list is recovered for free this way, and the struct passes by value
+  to a dispatcher (§4) as one coherent unit that survives a field
+  rename.
 - **The declaration name is the event name.** `collision_begin`, not
   `on_collision_begin` — the `on_` prefix was a C-callback-slot
   convention; a registry name does not need it. It is a valid Zig
@@ -298,7 +303,7 @@ registry dispatch, the dispatcher *owns the call site*, so it can pass
 
 ```zig
 // generated for a `box2d.collision_begin` flow
-pub fn collision_begin(game: anytype, payload: box2d.Events.collision_begin.Payload) void {
+pub fn collision_begin(game: anytype, payload: box2d.Events.collision_begin) void {
     // payload.entity_a, payload.entity_b in scope
     // game in scope → GetComponent / SetField / Subflow now lowerable
 }
@@ -379,13 +384,18 @@ the engine work item, not blocking this RFC.
 
 ## Open questions
 
-1. **`Events` declaration shape.** §1 nests `Payload` under a named
-   struct (`pub const collision_begin = struct { pub const Payload =
-   ... }`). A flatter alternative is `pub const collision_begin =
-   struct { entity_a: u32, entity_b: u32 };` — the event *is* its
-   payload type. Flatter is terser but loses a home for per-event
-   metadata (doc string, the O2 primary-entity marker). Pick before
-   implementation.
+1. ~~**`Events` declaration shape.**~~ **Resolved — flat form (see
+   §1).** The event declaration *is* its payload struct
+   (`pub const collision_begin = struct { entity_a: u32, entity_b: u32 };`),
+   matching the flat `Components`/`Systems`/`GizmoCategories`
+   conventions. The "loses a home for metadata" concern does not hold: a
+   Zig struct carries fields *and* decls separately, so documentation is
+   a `///` doc comment and any future metadata (the O2 marker, editor
+   hints) is an additive `pub const` decl beside the payload fields — no
+   nested `Payload` wrapper needed. Prior art: Unreal and Unity both
+   attach event metadata, but almost entirely for editor tooling
+   (categories, tooltips, display names), which here is a labelle-gui
+   concern (O6), not a registry one.
 2. **Primary-entity convention.** Should an event payload be able to
    *mark* one field as "the entity" so an event flow gets an automatic
    `entity` binding like `OnCreate` does? Useful for single-entity
