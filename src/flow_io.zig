@@ -568,7 +568,9 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     try w.writeAll("{\n");
 
     if (flow.name.len != 0) {
-        try w.print("  \"name\": \"{f}\",\n", .{std.zig.fmtString(flow.name)});
+        try w.writeAll("  \"name\": ");
+        try writeJsonString(w, flow.name);
+        try w.writeAll(",\n");
     }
 
     try w.writeAll("  \"event\": ");
@@ -578,10 +580,10 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     if (flow.params.len != 0) {
         try w.writeAll("  \"params\": [\n");
         for (flow.params, 0..) |p, i| {
-            try w.print(
-                "    {{ \"name\": \"{f}\", \"type\": \"{f}\"",
-                .{ std.zig.fmtString(p.name), std.zig.fmtString(p.type) },
-            );
+            try w.writeAll("    { \"name\": ");
+            try writeJsonString(w, p.name);
+            try w.writeAll(", \"type\": ");
+            try writeJsonString(w, p.type);
             if (p.default) |d| {
                 try w.writeAll(", \"default\": ");
                 try writeParamLiteral(w, allocator, d.zig_text);
@@ -615,10 +617,11 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
 
     try w.writeAll("  \"edges\": [\n");
     for (sorted_edges, 0..) |e, i| {
-        try w.print(
-            "    {{ \"from\": {{ \"node\": {d}, \"pin\": \"{f}\" }}, \"to\": {{ \"node\": {d}, \"pin\": \"{f}\" }} }}",
-            .{ e.from.node, std.zig.fmtString(e.from.pin), e.to.node, std.zig.fmtString(e.to.pin) },
-        );
+        try w.print("    {{ \"from\": {{ \"node\": {d}, \"pin\": ", .{e.from.node});
+        try writeJsonString(w, e.from.pin);
+        try w.print(" }}, \"to\": {{ \"node\": {d}, \"pin\": ", .{e.to.node});
+        try writeJsonString(w, e.to.pin);
+        try w.writeAll(" } }");
         if (i + 1 < sorted_edges.len) try w.writeAll(",");
         try w.writeAll("\n");
     }
@@ -696,8 +699,14 @@ fn nodeTypeName(k: NodeKind) []const u8 {
 
 fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void {
     switch (k) {
-        .GetComponent => |b| try w.print(", \"component\": \"{f}\"", .{std.zig.fmtString(b.type)}),
-        .SetField => |b| try w.print(", \"target\": \"{f}\"", .{std.zig.fmtString(b.target)}),
+        .GetComponent => |b| {
+            try w.writeAll(", \"component\": ");
+            try writeJsonString(w, b.type);
+        },
+        .SetField => |b| {
+            try w.writeAll(", \"target\": ");
+            try writeJsonString(w, b.target);
+        },
         .BinOp => |b| try w.print(", \"op\": \"{s}\"", .{@tagName(b.op)}),
         // `value` is Zig expression text: a JSON-native scalar is
         // written bare so it round-trips through `literalValue`'s
@@ -710,20 +719,34 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
                 try writeJsonString(w, b.value);
             }
         },
-        .Identifier => |b| try w.print(", \"name\": \"{f}\"", .{std.zig.fmtString(b.name)}),
-        .Call => |b| try w.print(", \"callee\": \"{f}\"", .{std.zig.fmtString(b.callee)}),
-        .Param => |b| try w.print(", \"param\": \"{f}\"", .{std.zig.fmtString(b.param)}),
-        .Output => |b| try w.print(
-            ", \"name\": \"{f}\", \"value_type\": \"{f}\"",
-            .{ std.zig.fmtString(b.name), std.zig.fmtString(b.type) },
-        ),
+        .Identifier => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
+        .Call => |b| {
+            try w.writeAll(", \"callee\": ");
+            try writeJsonString(w, b.callee);
+        },
+        .Param => |b| {
+            try w.writeAll(", \"param\": ");
+            try writeJsonString(w, b.param);
+        },
+        .Output => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+            try w.writeAll(", \"value_type\": ");
+            try writeJsonString(w, b.type);
+        },
         .Subflow => |b| {
-            try w.print(", \"flow\": \"{f}\"", .{std.zig.fmtString(b.flow)});
+            try w.writeAll(", \"flow\": ");
+            try writeJsonString(w, b.flow);
             if (b.bindings.len != 0) {
                 try w.writeAll(", \"bindings\": {");
                 for (b.bindings, 0..) |bd, i| {
                     if (i > 0) try w.writeAll(",");
-                    try w.print(" \"{f}\": ", .{std.zig.fmtString(bd.param)});
+                    try w.writeAll(" ");
+                    try writeJsonString(w, bd.param);
+                    try w.writeAll(": ");
                     try writeParamLiteral(w, allocator, bd.value.zig_text);
                 }
                 try w.writeAll(" }");
@@ -734,18 +757,21 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
 
 fn writeEvent(w: anytype, ev: Event) !void {
     switch (ev) {
-        .OnUpdate => |b| try w.print(
-            "{{ \"type\": \"OnUpdate\", \"arg_dt\": \"{f}\" }}",
-            .{std.zig.fmtString(b.arg_dt)},
-        ),
-        .OnCreate => |b| try w.print(
-            "{{ \"type\": \"OnCreate\", \"arg_entity\": \"{f}\" }}",
-            .{std.zig.fmtString(b.arg_entity)},
-        ),
-        .OnDestroy => |b| try w.print(
-            "{{ \"type\": \"OnDestroy\", \"arg_entity\": \"{f}\" }}",
-            .{std.zig.fmtString(b.arg_entity)},
-        ),
+        .OnUpdate => |b| {
+            try w.writeAll("{ \"type\": \"OnUpdate\", \"arg_dt\": ");
+            try writeJsonString(w, b.arg_dt);
+            try w.writeAll(" }");
+        },
+        .OnCreate => |b| {
+            try w.writeAll("{ \"type\": \"OnCreate\", \"arg_entity\": ");
+            try writeJsonString(w, b.arg_entity);
+            try w.writeAll(" }");
+        },
+        .OnDestroy => |b| {
+            try w.writeAll("{ \"type\": \"OnDestroy\", \"arg_entity\": ");
+            try writeJsonString(w, b.arg_entity);
+            try w.writeAll(" }");
+        },
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
     }
 }
