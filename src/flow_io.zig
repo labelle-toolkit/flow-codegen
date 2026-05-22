@@ -258,11 +258,17 @@ pub fn renderFlowZon(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
     return aw.toOwnedSlice();
 }
 
-fn lessThanNode(_: void, a: Node, b: Node) bool {
+/// Canonical node ordering for deterministic on-disk output: by `id`.
+/// `flow-codegen`'s `.flow.jsonc` converter reuses this so a convert
+/// pass and a `renderFlowZon` re-save agree on node order.
+pub fn lessThanNode(_: void, a: Node, b: Node) bool {
     return a.id < b.id;
 }
 
-fn lessThanLink(_: void, a: Link, b: Link) bool {
+/// Canonical link ordering for deterministic on-disk output: by
+/// `(from.node, from.pin, to.node, to.pin)`. Shared with the
+/// `.flow.jsonc` converter — see `lessThanNode`.
+pub fn lessThanLink(_: void, a: Link, b: Link) bool {
     if (a.from.node != b.from.node) return a.from.node < b.from.node;
     const fp = std.mem.order(u8, a.from.pin, b.from.pin);
     if (fp != .eq) return fp == .lt;

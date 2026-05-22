@@ -1126,7 +1126,8 @@ pub const FlowConvertTests = struct {
 
         const lit = nodes.items[3].object;
         try expect.toBeTrue(std.mem.eql(u8, lit.get("type").?.string, "Literal"));
-        try expect.toBeTrue(std.mem.eql(u8, lit.get("value").?.string, "1.5"));
+        // `1.5` is a JSON-native number, not a quoted string (RFC §2).
+        try expect.equal(lit.get("value").?.float, @as(f64, 1.5));
 
         const ident = nodes.items[4].object;
         try expect.toBeTrue(std.mem.eql(u8, ident.get("type").?.string, "Identifier"));
@@ -1256,5 +1257,65 @@ pub const FlowConvertTests = struct {
         const still_there = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, zon_path, allocator, .limited(1 << 20));
         defer allocator.free(still_there);
         try expect.toBeTrue(still_there.len > 0);
+    }
+
+    test "Literal value is emitted as a JSON-native literal, not a string" {
+        const allocator = std.testing.allocator;
+        const zon =
+            \\.{
+            \\    .event = .{ .OnUpdate = .{ .arg_dt = "dt" } },
+            \\    .nodes = .{
+            \\        .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "42" } } },
+            \\        .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "1.0" } } },
+            \\        .{ .id = 3, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "true" } } },
+            \\        .{ .id = 4, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "false" } } },
+            \\        .{ .id = 5, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "null" } } },
+            \\        .{ .id = 6, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "-3.5e2" } } },
+            \\        .{ .id = 7, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "speed" } } },
+            \\        .{ .id = 8, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "007" } } },
+            \\    },
+            \\    .links = .{},
+            \\}
+            \\
+        ;
+        var parsed = try convertToValue(allocator, zon, "lit");
+        defer parsed.deinit();
+        const nodes = parsed.value.object.get("nodes").?.array;
+
+        // Integer / float literals: JSON numbers.
+        try expect.equal(nodes.items[0].object.get("value").?.integer, @as(i64, 42));
+        try expect.equal(nodes.items[1].object.get("value").?.float, @as(f64, 1.0));
+        try expect.equal(nodes.items[5].object.get("value").?.float, @as(f64, -350.0));
+        // Booleans / null: JSON keywords.
+        try expect.toBeTrue(nodes.items[2].object.get("value").?.bool);
+        try expect.toBeTrue(!nodes.items[3].object.get("value").?.bool);
+        try expect.equal(@as(std.meta.Tag(std.json.Value), nodes.items[4].object.get("value").?), .null);
+        // Non-JSON-number text (identifier, leading-zero int) stays a string.
+        try expect.toBeTrue(std.mem.eql(u8, nodes.items[6].object.get("value").?.string, "speed"));
+        try expect.toBeTrue(std.mem.eql(u8, nodes.items[7].object.get("value").?.string, "007"));
+    }
+
+    test "convertFile rejects a non-.flow.zon path before the hard cut" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+
+        // A file that is NOT a .flow.zon. If the converter accepted it,
+        // the hard cut would delete this unrelated file.
+        const stray_path = try std.fs.path.join(allocator, &.{ dir, "notes.txt" });
+        defer allocator.free(stray_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stray_path, .data = "keep me" });
+
+        try std.testing.expectError(
+            error.NotAFlowZonFile,
+            flow_convert.convertFile(std.testing.io, allocator, stray_path, true),
+        );
+
+        // The stray file is untouched — not deleted, not rewritten.
+        const still_there = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, stray_path, allocator, .limited(1 << 20));
+        defer allocator.free(still_there);
+        try expect.toBeTrue(std.mem.eql(u8, still_there, "keep me"));
     }
 };

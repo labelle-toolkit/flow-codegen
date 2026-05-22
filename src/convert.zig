@@ -107,17 +107,11 @@ pub fn flowToJsonc(
     return aw.toOwnedSlice();
 }
 
-fn lessThanNode(_: void, a: flow_io.Node, b: flow_io.Node) bool {
-    return a.id < b.id;
-}
-
-fn lessThanLink(_: void, a: flow_io.Link, b: flow_io.Link) bool {
-    if (a.from.node != b.from.node) return a.from.node < b.from.node;
-    const fp = std.mem.order(u8, a.from.pin, b.from.pin);
-    if (fp != .eq) return fp == .lt;
-    if (a.to.node != b.to.node) return a.to.node < b.to.node;
-    return std.mem.order(u8, a.to.pin, b.to.pin) == .lt;
-}
+// Node/edge ordering is the single canonical sort defined in
+// `flow_io` — reused here (not re-implemented) so the converter and
+// `flow_io.renderFlowZon` cannot drift apart.
+const lessThanNode = flow_io.lessThanNode;
+const lessThanLink = flow_io.lessThanLink;
 
 /// `event` tagged union → flat object with a `"type"` discriminator.
 /// e.g. `.{ .OnCreate = .{ .arg_entity = "entity" } }` becomes
@@ -163,7 +157,7 @@ fn writeNode(w: *std.Io.Writer, n: flow_io.Node) !void {
         },
         .Literal => |b| {
             try w.writeAll("\"Literal\", \"value\": ");
-            try writeJsonString(w, b.value);
+            try writeLiteralValue(w, b.value);
         },
         .Identifier => |b| {
             try w.writeAll("\"Identifier\", \"name\": ");
@@ -194,6 +188,69 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
+/// Emit a `Literal` node's `value` as a JSON-native literal when the
+/// verbatim Zig text denotes one — a number (`1.0`, `42`), a boolean
+/// (`true`/`false`), or `null` — matching RFC §2's example
+/// (`"value": 1.0`, unquoted). Anything else (a Zig string literal,
+/// an identifier-like expression) is emitted as a quoted JSON string
+/// so the source text round-trips intact.
+fn writeLiteralValue(w: *std.Io.Writer, s: []const u8) !void {
+    if (std.mem.eql(u8, s, "true") or
+        std.mem.eql(u8, s, "false") or
+        std.mem.eql(u8, s, "null"))
+    {
+        try w.writeAll(s);
+        return;
+    }
+    if (isJsonNumber(s)) {
+        try w.writeAll(s);
+        return;
+    }
+    try writeJsonString(w, s);
+}
+
+/// True when `s` is a valid JSON number per RFC 8259 §6, so it can be
+/// emitted unquoted. Rejects forms JSON disallows even though Zig
+/// accepts them (leading `+`, leading zeros, leading/trailing `.`,
+/// `_` digit separators, hex/octal/binary prefixes) — those fall back
+/// to a quoted string.
+fn isJsonNumber(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var i: usize = 0;
+
+    // Optional minus sign.
+    if (s[i] == '-') i += 1;
+    if (i == s.len) return false;
+
+    // Integer part: a single `0`, or a non-zero digit run.
+    if (s[i] == '0') {
+        i += 1;
+    } else if (s[i] >= '1' and s[i] <= '9') {
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+    } else {
+        return false;
+    }
+
+    // Optional fraction.
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const frac_start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        if (i == frac_start) return false; // `.` with no digits
+    }
+
+    // Optional exponent.
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        const exp_start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        if (i == exp_start) return false; // exponent with no digits
+    }
+
+    return i == s.len;
+}
+
 /// `.flow.zon` → `.flow.jsonc` path rewrite. Swaps the trailing
 /// extension; a path that does not end in `.flow.zon` is returned
 /// unchanged-but-suffixed so the caller still gets a `.flow.jsonc`
@@ -213,12 +270,22 @@ pub fn jsoncPathFromZon(allocator: std.mem.Allocator, zon_path: []const u8) ![]u
 /// owns the bytes). When `delete_source` is set, the original
 /// `.flow.zon` is removed after a successful write — the RFC's
 /// "hard cut" (convert + drop `.flow.zon`).
+///
+/// Rejects any input not ending in `.flow.zon` with
+/// `error.NotAFlowZonFile` *before* touching the filesystem. This
+/// guards the `delete_source` path: were a stray `foo.txt` accepted,
+/// the output `foo.txt.flow.jsonc` would differ from the input and
+/// the hard cut would delete the unrelated `foo.txt`.
 pub fn convertFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     zon_path: []const u8,
     delete_source: bool,
 ) ![]u8 {
+    if (!std.mem.endsWith(u8, zon_path, ".flow.zon")) {
+        return error.NotAFlowZonFile;
+    }
+
     var loaded = try flow_io.loadFromFile(io, allocator, zon_path);
     defer loaded.deinit();
 
