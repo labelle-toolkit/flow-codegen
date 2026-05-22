@@ -299,8 +299,11 @@ const GameHooks = engine.MergeHooks(AllHookPayloads, .{
 });
 ```
 
-Order is the assembler's flow-name sort (deterministic, reproducible —
-O3 below), but the order is an unspecified author contract.
+Order is the **scanner sort** (`labelle-assembler/src/script_scanner.zig:3-13`):
+numeric filename prefix first (`01_input.flow.jsonc` before
+`02_count.flow.jsonc`), unnumbered files alphabetical in the tail —
+the same explicit, author-controlled convention scripts already use.
+See O3 for the full resolution.
 
 ### 4. Dispatch: the engine already does it
 
@@ -582,28 +585,48 @@ receiver tuple. No new engine API required.
    events (a future `box2d.body_sleep`); meaningless for symmetric
    two-entity events (`collision_begin`). Possibly an optional
    `pub const primary_entity = "entity_a"` decl.
-3. ~~**Dispatch order across flows.**~~ **Resolved — no priority field;
-   "all listeners run, order deterministic-but-unspecified."**
-   `MergeHooks.emit` already `inline for`s every receiver and calls
-   every match (`dispatcher.zig:99-111`), so all listeners run. The
-   order is the order the assembler emits the receiver tuple — the
-   assembler must sort flow handler structs by flow registry name so
-   builds are reproducible. As an author-facing contract the order is
-   **unspecified — flows must not depend on it**: event reactions are
-   independent side effects; a flow that needs another flow first
-   should express that explicitly (a `Subflow` call, or a derived
-   event), not rely on a hidden race. This matches ECS systems today,
-   which run in `SystemRegistry` order with no per-system priority.
-   `priority` stays off the notification flavor; it returns in the
-   consumable flavor (O4) where ordering decides which handler
-   consumes the event first.
+3. ~~**Dispatch order across flows.**~~ **Resolved — scanner sort
+   (numeric filename prefix, then alphabetical); no `priority` field on
+   notification events.** `MergeHooks.emit` `inline for`s every
+   receiver (`dispatcher.zig:99-111`) so all listeners run; the order
+   they run in is the order the assembler emits the receiver tuple,
+   which is the **scanner sort**:
+
+   - Numeric prefix wins: `scripts/flows/01_input.flow.jsonc` runs
+     before `scripts/flows/02_hit_counter.flow.jsonc`, exactly as
+     `01_input.zig` does for scripts (`labelle-assembler/src/script_scanner.zig:3-13`).
+   - Unprefixed files sort after the numbered ones, alphabetically —
+     the same fallback the script scanner already uses.
+   - Duplicate prefixes are a hard build error
+     (`script_scanner.zig:453-458`).
+
+   This is **explicit, author-controlled ordering** — the same
+   convention scripts already use, not a new mechanism. The previous
+   wording ("unspecified author contract, don't depend on it") was
+   wrong: it assumed flows had no ordering convention because the
+   current `flow_scanner.zig:188` hard-codes `.sort_order = null`,
+   parking every flow in the unnumbered tail. That is a one-line fix
+   in phase 1 — `flow_scanner` calls the same `extractSortOrder` the
+   script scanner uses (stripping `.flow.jsonc` first instead of
+   `.zig`) — and flows inherit the script ordering convention with no
+   new machinery. Mirrors how the engine itself orders things
+   elsewhere (the assembler-emitted main loop dispatches scripts in
+   scanner order); consistency over precedent.
+
+   The scanner sort applies to **per-frame `tick`** order (flows live
+   in `AllScripts`) and to **notification event listener** order (the
+   `GameHooks` receiver tuple — see phase 4 — is appended in scanner
+   order, so `MergeHooks.emit` fires listeners in prefix order). The
+   consumable flavor (O4, phase 7) layers on top: an explicit `priority`
+   field overrides the scanner sort *only for consumable events*;
+   notification events stay on the scanner sort straight.
 4. ~~**Cancellable / consumable events.**~~ **Resolved — two event
    flavors.** An event declares one of:
    - **notification** (the default — `collision_begin`, `sensor_enter`,
      …): fan-out, every listener runs, `void` handlers, `MergeHooks`
-     dispatch unchanged, O3 holds (unspecified order). A notification
-     reports something that already happened — there is nothing to
-     consume.
+     dispatch unchanged, order is the scanner sort (O3 — numeric
+     filename prefix then alphabetical). A notification reports
+     something that already happened — there is nothing to consume.
    - **consumable** (input-style — a future `ui.click`, `input.key`):
      handlers run in an explicit **priority** order and return a
      "handled" signal; the first handler to mark the event handled
@@ -651,7 +674,13 @@ Ordered so each phase compiles and ships independently.
    `@hasDecl(plugin, "Events")` and emit a `PluginEvents` union next
    to `GameEvents`, merged into the same `AllHookPayloads`. Expose the
    resulting variant-name list and a comptime resolver for
-   flow-codegen.
+   flow-codegen. **Also** drop the hard-coded `.sort_order = null` in
+   `flow_scanner.zig:188` and route flow filenames through the same
+   `extractSortOrder` the script scanner uses (`script_scanner.zig:289`,
+   `:306`) — strips `.flow.jsonc` instead of `.zig`. Flows inherit the
+   script ordering convention (O3): `01_foo.flow.jsonc` before
+   `02_bar.flow.jsonc`; unprefixed alphabetical tail; duplicate
+   prefixes a build error.
 2. **`labelle-box2d`** — add `pub const Events` (§1); make
    `processContacts`/`processSensorEvents` dual-emit (`game.emit` +
    legacy slot). No removal yet (Migration phase 1).
@@ -667,8 +696,11 @@ Ordered so each phase compiles and ships independently.
    .{...} })`. Ship the legacy→name converter.
 4. **`labelle-assembler`** — collect flow handler structs and append
    them to the `GameHooks` receiver tuple
-   (`main_zig.zig:2714-2720`); initialize their `game_ptr` field the
-   same way the existing hooks loop does (`game.zig:419-429`).
+   (`main_zig.zig:2714-2720`) **in scanner-sorted order** (the same
+   sort phase 1 enables), so notification listeners fire in
+   numeric-prefix-then-alphabetical order (O3). Initialize their
+   `game_ptr` field the same way the existing hooks loop does
+   (`game.zig:419-429`).
 5. **`labelle-gui`** — `flow_io.zig` reads/writes the `name` form; the
    editor offers the discovered event-name dropdown.
 6. **Cleanup** — convert in-tree flows to the `name` form; deprecate
