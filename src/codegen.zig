@@ -88,6 +88,16 @@ pub const CodegenError = error{
     /// `entity` is available; entity-scoped nodes in a subgraph are
     /// rejected rather than emitted against an undefined binding.
     EntityUnavailableInSubgraph,
+    /// A flow's effective name sanitizes to the bare `_` (an empty or
+    /// all-non-identifier name). Zig reserves `_` as the discard
+    /// identifier and rejects it as a `fn` name, so such a subgraph
+    /// would emit `fn _(...)` and fail to compile.
+    InvalidFlowName,
+    /// A flow declares a `param` whose sanitized name collides with
+    /// another param or with a fixed `fn` parameter (`game`, or the
+    /// lifecycle `dt` / `entity` arg) — the emitted signature would
+    /// have duplicate parameter identifiers.
+    ParamNameCollision,
 };
 
 // =====================================================================
@@ -289,6 +299,12 @@ pub fn renderFlowFile(
     // would emit a `fn` colliding with the file's `pub fn`.
     try assertNoSymbolCollision(allocator, entryFunctionName(entry.event), subgraphs.items);
 
+    // Each flow's declared `params` must not collide (after
+    // sanitization) with each other or the fixed `fn` params —
+    // checked for the entry flow and every referenced subgraph.
+    try assertNoParamCollision(allocator, entry);
+    for (subgraphs.items) |sg| try assertNoParamCollision(allocator, sg);
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -362,6 +378,15 @@ fn renderEntryFunction(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
+    // An `OnCall` entry is a subgraph in its own right (RFC §3/§6) —
+    // it has no `entity` in scope, only declared `params`. Reject
+    // entity-scoped nodes (`GetComponent` / `SetField`) rather than
+    // emit reads of an undefined `entity`, exactly as a referenced
+    // subgraph does in `renderSubgraphFunction`. The lifecycle events
+    // do bind `entity` (see below), so this applies to `OnCall` only.
+    if (flow.event == .OnCall and anyNodeNeedsEntity(flow.nodes))
+        return error.EntityUnavailableInSubgraph;
+
     // An `OnCall` flow used as the file entry point is a subgraph in
     // its own right (RFC §3/§6): its `Output` nodes form the return
     // value, exactly as for a referenced subgraph. The lifecycle
@@ -390,7 +415,7 @@ fn renderEntryFunction(
         try w.writeAll("};\n");
     }
 
-    try writeFnHeader(w, flow, outputs);
+    try writeFnHeader(allocator, w, flow, outputs);
 
     // Entity binding for OnCreate/OnDestroy/OnUpdate templates.
     if (anyNodeNeedsEntity(flow.nodes)) {
@@ -454,6 +479,12 @@ fn renderSubgraphFunction(
     const symbol = try sanitizeSymbol(allocator, flow.name);
     defer allocator.free(symbol);
 
+    // An empty (or all-non-identifier) flow name sanitizes to the bare
+    // `_`, which Zig reserves as the discard identifier and rejects as
+    // a `fn` name. Such a subgraph passes registry and collision
+    // checks yet emits uncompilable `fn _(...)` — reject it up front.
+    if (std.mem.eql(u8, symbol, "_")) return error.InvalidFlowName;
+
     const outputs = try collectOutputs(allocator, flow);
     defer allocator.free(outputs);
 
@@ -477,9 +508,7 @@ fn renderSubgraphFunction(
 
     // Signature: `fn <symbol>(game: *Game, <param>: <type>, …) <ret> {`
     try w.print("fn {s}(game: *Game", .{symbol});
-    for (flow.params) |p| {
-        try w.print(", {s}: {s}", .{ p.name, p.type });
-    }
+    try writeParamArgs(allocator, w, flow.params);
     try w.writeAll(") ");
     try writeReturnType(w, symbol, outputs);
     try w.writeAll(" {\n");
@@ -780,7 +809,12 @@ fn topoSort(
 /// events, which always return `void`). When non-empty — an `OnCall`
 /// entry — the return type follows the subgraph rule (RFC §6): the
 /// single output's `type`, or the `<entry_fn>_Result` struct.
-fn writeFnHeader(w: anytype, flow: flow_io.Flow, outputs: []const *const flow_io.Node) !void {
+fn writeFnHeader(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    flow: flow_io.Flow,
+    outputs: []const *const flow_io.Node,
+) !void {
     switch (flow.event) {
         .OnUpdate => |b| try w.print(
             "pub fn onUpdate(game: *Game, {s}: f32",
@@ -798,12 +832,26 @@ fn writeFnHeader(w: anytype, flow: flow_io.Flow, outputs: []const *const flow_io
         // callable surface — emit `pub fn onCall`.
         .OnCall => try w.writeAll("pub fn onCall(game: *Game"),
     }
-    for (flow.params) |p| {
-        try w.print(", {s}: {s}", .{ p.name, p.type });
-    }
+    try writeParamArgs(allocator, w, flow.params);
     try w.writeAll(") ");
     try writeReturnType(w, entryFunctionName(flow.event), outputs);
     try w.writeAll(" {\n");
+}
+
+/// Emit a flow's declared `params` as `fn` arguments — `, <name>:
+/// <type>` each. Names are run through `sanitizeSymbol` to a valid
+/// Zig identifier (RFC §3); `Param` node reads (see `writeNodeBody`)
+/// apply the same sanitization so the emitted identifiers line up.
+fn writeParamArgs(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    params: []const flow_io.Param,
+) !void {
+    for (params) |p| {
+        const name = try sanitizeSymbol(allocator, p.name);
+        defer allocator.free(name);
+        try w.print(", {s}: {s}", .{ name, p.type });
+    }
 }
 
 fn writePreviewPulse(w: anytype, flow_name: []const u8, node_id: u32) !void {
@@ -862,12 +910,12 @@ fn writeNodeBody(
             .{ node.id, b.name },
         ),
         // A Param node yields a declared parameter's value (RFC §3).
-        // The parameter is in scope as a function argument of the same
-        // name.
-        .Param => |b| try w.print(
-            "    const n{d}_value = {s};\n",
-            .{ node.id, b.param },
-        ),
+        // The parameter is in scope as a function argument; sanitize
+        // the read to match the signature (see `writeParamArgs`).
+        .Param => |b| {
+            const name = try sanitizeSymbol(scratch, b.param);
+            try w.print("    const n{d}_value = {s};\n", .{ node.id, name });
+        },
         // An Output node carries no body — its `value` pin is read by
         // the function's `return` (see renderSubgraphFunction).
         .Output => {},
@@ -1144,6 +1192,56 @@ fn assertNoSymbolCollision(
             }
         } else {
             gop.value_ptr.* = .{ .subgraph = sg.name };
+        }
+    }
+}
+
+/// `seen.put` with an allocator-owned copy of `name` as the key,
+/// freeing the copy when the key already exists. Keys are freed by
+/// the caller's `keyIterator` loop on cleanup.
+fn putOwnedKey(
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMap(void),
+    name: []const u8,
+) std.mem.Allocator.Error!void {
+    const key = try allocator.dupe(u8, name);
+    const gop = try seen.getOrPut(key);
+    if (gop.found_existing) allocator.free(key);
+}
+
+/// Reject a flow whose declared `params`, after sanitization, collide
+/// with each other or with a fixed `fn` parameter — `game`, or the
+/// lifecycle arg (`OnUpdate` dt / `OnCreate`+`OnDestroy` entity). Such
+/// a flow parses cleanly yet emits a signature with duplicate
+/// parameter identifiers, which Zig rejects (`ParamNameCollision`).
+fn assertNoParamCollision(
+    allocator: std.mem.Allocator,
+    flow: flow_io.Flow,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+
+    // Fixed parameters always present in the emitted signature: every
+    // flow takes `game`, and a lifecycle event adds its dt/entity arg
+    // verbatim — exactly as `writeFnHeader` emits them.
+    try putOwnedKey(allocator, &seen, "game");
+    switch (flow.event) {
+        .OnUpdate => |b| try putOwnedKey(allocator, &seen, b.arg_dt),
+        .OnCreate => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
+        .OnDestroy => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
+        .OnCall => {},
+    }
+
+    for (flow.params) |p| {
+        const name = try sanitizeSymbol(allocator, p.name);
+        const gop = try seen.getOrPut(name);
+        if (gop.found_existing) {
+            allocator.free(name);
+            return error.ParamNameCollision;
         }
     }
 }
