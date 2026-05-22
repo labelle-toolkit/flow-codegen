@@ -209,7 +209,12 @@ fn walkRefs(
     // Fully explored already — skip (a DAG diamond is not a cycle).
     if (visited.contains(name)) return;
 
-    const flow = registry.get(name) orelse return; // unresolved: caught at emit time
+    // A `Subflow` naming a flow absent from the registry is rejected
+    // here, during the cycle walk, rather than deferred to
+    // `collectSubgraphs` — the specific `UnknownFlowRef` is a clearer
+    // diagnostic than a later, vaguer failure, and a cyclic graph
+    // whose closure includes a missing name is still caught.
+    const flow = registry.get(name) orelse return error.UnknownFlowRef;
     try stack.append(allocator, name);
     for (flow.nodes) |n| {
         if (n.kind == .Subflow) {
