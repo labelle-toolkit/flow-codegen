@@ -49,6 +49,21 @@ pub const Event = union(enum) {
     OnCreate: struct { arg_entity: []const u8 = "entity" },
     OnDestroy: struct { arg_entity: []const u8 = "entity" },
     OnCall,
+    /// Binds the flow to a plugin's callback variable. `module` is the
+    /// `@import` name of the plugin that owns it (e.g. `"box2d"`),
+    /// `callback` the exported `pub var` slot (e.g.
+    /// `"on_collision_begin"`), and `params` the callback's signature.
+    /// Codegen emits a handler matching `params` verbatim — so it is
+    /// assignable to the plugin's `?*const fn(...)` slot — and a `setup`
+    /// that installs it. An `OnEvent` handler runs from a plugin
+    /// callback: it gets no `game` and no `entity`.
+    OnEvent: struct {
+        module: []const u8,
+        callback: []const u8,
+        /// The callback's parameters — reuses `Param` (the `default`
+        /// field is unused; an event signature is fixed by the plugin).
+        params: []Param = &.{},
+    },
 };
 
 /// Binary operator for `NodeKind.BinOp`.
@@ -258,7 +273,7 @@ fn buildFlow(
         break :blk "";
     };
 
-    const event = try buildEvent(obj.get("event") orelse return error.MalformedFlow);
+    const event = try buildEvent(a, obj.get("event") orelse return error.MalformedFlow);
     const params = try buildParams(a, obj.get("params"));
     const nodes = try buildNodes(a, obj.get("nodes") orelse return error.MalformedFlow);
     // `links` was the pre-rename (RFC §2) name for `edges`. A file
@@ -276,7 +291,7 @@ fn buildFlow(
     };
 }
 
-fn buildEvent(v: std.json.Value) ParseError!Event {
+fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
     if (v != .object) return error.MalformedFlow;
     const t = (v.object.get("type") orelse return error.MalformedFlow);
     if (t != .string) return error.MalformedFlow;
@@ -289,6 +304,12 @@ fn buildEvent(v: std.json.Value) ParseError!Event {
         return .{ .OnDestroy = .{ .arg_entity = try strField(v.object, "arg_entity", "entity") } };
     } else if (std.mem.eql(u8, t.string, "OnCall")) {
         return .OnCall;
+    } else if (std.mem.eql(u8, t.string, "OnEvent")) {
+        return .{ .OnEvent = .{
+            .module = try reqStr(a, v.object, "module"),
+            .callback = try reqStr(a, v.object, "callback"),
+            .params = try buildParams(a, v.object.get("params")),
+        } };
     }
     return error.UnknownEventType;
 }
@@ -531,7 +552,11 @@ fn validate(flow: Flow) ParseError!void {
     for (flow.nodes, 0..) |n, i| {
         switch (n.kind) {
             .Param => |b| {
-                if (!hasParam(flow.params, b.param)) return error.UnknownParam;
+                // A `Param` node names a declared flow param, or — in
+                // an `OnEvent` flow — one of the event callback's args.
+                if (!hasParam(flow.params, b.param) and
+                    !eventHasParam(flow.event, b.param))
+                    return error.UnknownParam;
             },
             .Output => |b| {
                 for (flow.nodes[i + 1 ..]) |m| {
@@ -553,6 +578,16 @@ fn hasNode(nodes: []const Node, id: u32) bool {
 fn hasParam(params: []const Param, name: []const u8) bool {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return true;
     return false;
+}
+
+/// True when `event` is an `OnEvent` whose callback declares a
+/// parameter named `name` — the event params an `OnEvent` flow's
+/// `Param` nodes may read.
+fn eventHasParam(event: Event, name: []const u8) bool {
+    return switch (event) {
+        .OnEvent => |e| hasParam(e.params, name),
+        else => false,
+    };
 }
 
 // =====================================================================
@@ -777,6 +812,25 @@ fn writeEvent(w: anytype, ev: Event) !void {
             try w.writeAll(" }");
         },
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
+        .OnEvent => |b| {
+            try w.writeAll("{ \"type\": \"OnEvent\", \"module\": ");
+            try writeJsonString(w, b.module);
+            try w.writeAll(", \"callback\": ");
+            try writeJsonString(w, b.callback);
+            if (b.params.len != 0) {
+                try w.writeAll(", \"params\": [");
+                for (b.params, 0..) |p, i| {
+                    if (i > 0) try w.writeAll(",");
+                    try w.writeAll(" { \"name\": ");
+                    try writeJsonString(w, p.name);
+                    try w.writeAll(", \"type\": ");
+                    try writeJsonString(w, p.type);
+                    try w.writeAll(" }");
+                }
+                try w.writeAll(" ]");
+            }
+            try w.writeAll(" }");
+        },
     }
 }
 

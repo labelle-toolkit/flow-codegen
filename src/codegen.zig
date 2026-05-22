@@ -65,7 +65,9 @@ pub const CodegenError = error{
     UnknownPin,
     /// A `GetComponent` / `SetField` references a namespaced type.
     NamespacedComponentType,
-    /// Future-proofing for additional `NodeKind` variants.
+    /// A node kind is not supported in the flow's context — e.g. a
+    /// `Subflow` node inside an `OnEvent` flow, whose handler has no
+    /// `game` to thread into the subgraph call.
     UnsupportedNodeKind,
     /// A `Subflow` node references a flow name not in the registry.
     UnknownFlowRef,
@@ -381,6 +383,12 @@ fn renderEntryFunction(
     registry: *const FlowRegistry,
     flow_name: []const u8,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    // An `OnEvent` flow has a different shape from the lifecycle events
+    // — a plugin-callback handler plus a `setup` that installs it —
+    // so it has its own renderer.
+    if (flow.event == .OnEvent)
+        return renderEventEntry(allocator, w, flow, registry, flow_name);
+
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
@@ -449,10 +457,12 @@ fn renderEntryFunction(
                 }
             },
             .OnCall => {},
+            // `OnEvent` is dispatched above to `renderEventEntry`.
+            .OnEvent => {},
         }
     }
 
-    try emitBody(allocator, bw, &ctx, flow_name);
+    try emitBody(allocator, bw, &ctx, flow_name, true);
 
     // Return statement for an OnCall entry with declared Outputs.
     if (outputs.len == 1) {
@@ -485,9 +495,82 @@ fn renderEntryFunction(
         .OnDestroy => |b| if (!mentionsIdent(body, b.arg_entity))
             try w.print("    _ = {s};\n", .{b.arg_entity}),
         .OnCall => {},
+        .OnEvent => {},
     }
 
     try w.writeAll(body);
+    try w.writeAll("}\n");
+}
+
+/// Render an `OnEvent` flow: a flow bound to a plugin's callback
+/// variable. Emits two file-level decls — a `flowEvent` handler whose
+/// signature is the event's declared `params` verbatim (so `&flowEvent`
+/// is assignable to the plugin's `?*const fn(...)` slot) and a
+/// `pub fn setup` that installs it. The engine script-runner discovers
+/// a flow file by its `setup` (`isGameScript`) and calls it once.
+///
+/// An `OnEvent` handler is invoked straight from the plugin callback:
+/// it receives no `game` and no `entity`. Entity-scoped nodes
+/// (`GetComponent` / `SetField`) and `Subflow` nodes (their generated
+/// `fn`s take `game`) therefore cannot be lowered — both are rejected,
+/// as in a subgraph.
+fn renderEventEntry(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    flow: flow_io.Flow,
+    registry: *const FlowRegistry,
+    flow_name: []const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    var ctx = try GraphContext.init(allocator, flow, registry);
+    defer ctx.deinit();
+
+    const ev = flow.event.OnEvent;
+
+    // No `game`/`entity` in scope — reject entity-scoped nodes rather
+    // than emit reads of an undefined binding.
+    if (anyNodeNeedsEntity(flow.nodes)) return error.EntityUnavailableInSubgraph;
+    // Subgraph `fn`s take `game`, which an OnEvent handler lacks — a
+    // `Subflow` node cannot be lowered here.
+    for (flow.nodes) |n| {
+        if (n.kind == .Subflow) return error.UnsupportedNodeKind;
+    }
+
+    // Import the plugin module that owns the callback variable.
+    try w.print("const __event_src = @import(\"{f}\");\n\n", .{std.zig.fmtString(ev.module)});
+
+    // Handler — signature is the event params verbatim, so `&flowEvent`
+    // is assignable to the plugin's `?*const fn(...) void` slot.
+    try w.writeAll("fn flowEvent(");
+    for (ev.params, 0..) |p, i| {
+        if (i > 0) try w.writeAll(", ");
+        const name = try sanitizeSymbol(allocator, p.name);
+        defer allocator.free(name);
+        try w.print("{s}: {s}", .{ name, p.type });
+    }
+    try w.writeAll(") void {\n");
+
+    // Render the body to a buffer first, so an event param the body
+    // never reads can be discarded without a "pointless discard" of one
+    // it does (Zig 0.16 rejects both). `emit_preview = false`: the
+    // preview pulse reads `game`, which this handler has no access to.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body_aw.deinit();
+    try emitBody(allocator, &body_aw.writer, &ctx, flow_name, false);
+    const body = try body_aw.toOwnedSlice();
+    defer allocator.free(body);
+
+    for (ev.params) |p| {
+        const name = try sanitizeSymbol(allocator, p.name);
+        defer allocator.free(name);
+        if (!mentionsIdent(body, name)) try w.print("    _ = {s};\n", .{name});
+    }
+    try w.writeAll(body);
+    try w.writeAll("}\n\n");
+
+    // `setup` installs the handler into the plugin's callback slot.
+    try w.writeAll("pub fn setup(game: anytype) void {\n");
+    try w.writeAll("    _ = game;\n");
+    try w.print("    __event_src.{s} = &flowEvent;\n", .{ev.callback});
     try w.writeAll("}\n");
 }
 
@@ -567,7 +650,7 @@ fn renderSubgraphFunction(
     try writeReturnType(w, symbol, outputs);
     try w.writeAll(" {\n");
 
-    try emitBody(allocator, w, &ctx, flow.name);
+    try emitBody(allocator, w, &ctx, flow.name, true);
 
     // Return statement (RFC §6).
     if (outputs.len == 1) {
@@ -607,18 +690,21 @@ fn writeReturnType(
     }
 }
 
-/// Emit the topo-sorted node bodies for a flow into `w`.
+/// Emit the topo-sorted node bodies for a flow into `w`. `emit_preview`
+/// gates the per-node `emitNodeEntered` pulse — it reads `game`, so an
+/// `OnEvent` handler (which has no `game`) passes `false`.
 fn emitBody(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     ctx: *GraphContext,
     flow_name: []const u8,
+    emit_preview: bool,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     for (ctx.order) |id| {
         const node = ctx.index.byId(id) orelse unreachable;
-        try writePreviewPulse(w, flow_name, node.id);
+        if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
         try writeNodeBody(w, node, ctx, scratch.allocator());
         try discardUnconsumedResult(w, node, ctx);
         _ = scratch.reset(.retain_capacity);
@@ -914,6 +1000,9 @@ fn writeFnHeader(
         // An OnCall flow used as the file entry point still needs a
         // callable surface — emit `pub fn onCall`.
         .OnCall => try w.writeAll("pub fn onCall(game: anytype"),
+        // `OnEvent` flows are emitted by `renderEventEntry`, which
+        // never calls this header writer.
+        .OnEvent => unreachable,
     }
     try writeParamArgs(allocator, w, flow.params);
     try w.writeAll(") ");
@@ -1229,6 +1318,9 @@ fn entryFunctionName(event: flow_io.Event) []const u8 {
         .OnCreate => "onCreate",
         .OnDestroy => "onDestroy",
         .OnCall => "onCall",
+        // An `OnEvent` flow's public entry is its `setup` — the
+        // registrar the script-runner calls (see `renderEventEntry`).
+        .OnEvent => "setup",
     };
 }
 
@@ -1334,6 +1426,9 @@ fn assertNoParamCollision(
         .OnCreate => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
         .OnDestroy => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
         .OnCall => {},
+        // An `OnEvent` handler takes neither `game` nor a lifecycle
+        // arg — its parameters are the event's own (`renderEventEntry`).
+        .OnEvent => {},
     };
 
     for (flow.params) |p| {
