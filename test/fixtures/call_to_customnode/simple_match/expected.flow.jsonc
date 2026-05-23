@@ -1,0 +1,9 @@
+{
+  "name": "uses_call",
+  "event": { "type": "OnCall" },
+  "nodes": [
+    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [120, 40] }
+  ],
+  "edges": [
+  ]
+}

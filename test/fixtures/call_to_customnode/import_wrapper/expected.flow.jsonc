@@ -1,0 +1,9 @@
+{
+  "name": "uses_import",
+  "event": { "type": "OnCall" },
+  "nodes": [
+    { "id": 1, "type": "CustomNode", "name": "hits.current_total", "pos": [0, 0] }
+  ],
+  "edges": [
+  ]
+}

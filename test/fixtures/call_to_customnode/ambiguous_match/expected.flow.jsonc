@@ -1,0 +1,9 @@
+{
+  "name": "ambig",
+  "event": { "type": "OnCall" },
+  "nodes": [
+    { "id": 1, "type": "Call", "callee": "applyImpulse", "pos": [0, 0] }
+  ],
+  "edges": [
+  ]
+}

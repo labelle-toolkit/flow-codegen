@@ -1,0 +1,37 @@
+{
+  "generated_at": "2026-05-23T12:00",
+  "plugins": [
+    {
+      "name": "box2d",
+      "flow_nodes": [
+        {
+          "qualified": "box2d.apply_impulse",
+          "display_name": "Apply Impulse",
+          "category": "box2d",
+          "docs": "",
+          "kind": "command",
+          "pins": [],
+          "return_type": null
+        }
+      ],
+      "pin_styles": [],
+      "events": []
+    },
+    {
+      "name": "chipmunk",
+      "flow_nodes": [
+        {
+          "qualified": "chipmunk.apply_impulse",
+          "display_name": "Apply Impulse",
+          "category": "chipmunk",
+          "docs": "",
+          "kind": "command",
+          "pins": [],
+          "return_type": null
+        }
+      ],
+      "pin_styles": [],
+      "events": []
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "with_args",
+  "event": { "type": "OnCall" },
+  "nodes": [
+    { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
+    { "id": 2, "type": "Literal", "value": 3.14, "pos": [0, 40] },
+    { "id": 3, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [200, 20] }
+  ],
+  "edges": [
+    { "from": { "node": 1, "pin": "result" }, "to": { "node": 3, "pin": "arg0" } },
+    { "from": { "node": 2, "pin": "result" }, "to": { "node": 3, "pin": "arg1" } }
+  ]
+}

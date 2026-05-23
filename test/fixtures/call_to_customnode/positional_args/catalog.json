@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-05-23T12:00",
+  "plugins": [
+    {
+      "name": "box2d",
+      "flow_nodes": [
+        {
+          "qualified": "box2d.apply_impulse",
+          "display_name": "Apply Impulse",
+          "category": "box2d",
+          "docs": "",
+          "kind": "command",
+          "pins": [
+            { "name": "entity", "label": "Entity", "zig_type": "u32", "dir": "input", "default": null },
+            { "name": "ix", "label": "Ix", "zig_type": "f32", "dir": "input", "default": null }
+          ],
+          "return_type": null
+        }
+      ],
+      "pin_styles": [],
+      "events": []
+    }
+  ]
+}

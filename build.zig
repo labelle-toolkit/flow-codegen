@@ -48,4 +48,28 @@ pub fn build(b: *std.Build) void {
     // (`OnUpdate`/`OnCreate`/`OnDestroy`) and legacy `OnEvent` header
     // forms. Event-driven flows are now authored directly as in-graph
     // `Event` nodes; subgraph entry points keep the `OnCall` header.
+
+    // ── convert-calls (flow-codegen#18) ────────────────────────────────
+    // Second-pass converter: rewrite raw `Call` nodes as `CustomNode`
+    // references against a project's flow catalog sidecar. See
+    // `tools/convert_call_to_customnode.zig` for the CLI surface and
+    // `src/call_to_customnode.zig` for the resolver + rewriter.
+    const convert_calls_exe = b.addExecutable(.{
+        .name = "convert-calls",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/convert_call_to_customnode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "flow_codegen", .module = flow_codegen_module },
+            },
+        }),
+    });
+    const convert_calls_run = b.addRunArtifact(convert_calls_exe);
+    if (b.args) |args| convert_calls_run.addArgs(args);
+    const convert_calls_step = b.step(
+        "convert-calls",
+        "Rewrite raw Call nodes as CustomNode references (flow-codegen#18)",
+    );
+    convert_calls_step.dependOn(&convert_calls_run.step);
 }

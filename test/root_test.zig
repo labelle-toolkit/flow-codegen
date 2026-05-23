@@ -12,6 +12,11 @@ const flow_codegen_pkg = @import("flow_codegen");
 const flow_io = flow_codegen_pkg.flow_io;
 const flow_codegen = flow_codegen_pkg.codegen;
 
+/// Golden-file tests for the Call → CustomNode converter
+/// (flow-codegen#18). Lives in its own file under `test/` for
+/// readability; re-exported here so `zspec.runAll` picks it up.
+pub const CallToCustomNodeTests = @import("call_to_customnode_test.zig").CallToCustomNodeTests;
+
 test {
     zspec.runAll(@This());
 }

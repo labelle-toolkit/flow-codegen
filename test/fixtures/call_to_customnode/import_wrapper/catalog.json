@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-05-23T12:00",
+  "plugins": [
+    {
+      "name": "hits",
+      "flow_nodes": [
+        {
+          "qualified": "hits.current_total",
+          "display_name": "Current Total",
+          "category": "hits",
+          "docs": "",
+          "kind": "reporter",
+          "pins": [
+            { "name": "value", "label": "Value", "zig_type": "i32", "dir": "output", "default": null }
+          ],
+          "return_type": "i32"
+        }
+      ],
+      "pin_styles": [],
+      "events": []
+    }
+  ]
+}
