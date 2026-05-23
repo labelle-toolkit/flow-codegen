@@ -3016,3 +3016,189 @@ pub const CustomNodeTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n1_value;") != null);
     }
 };
+
+// =====================================================================
+// RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions
+// (flow-codegen#15 item 5)
+// =====================================================================
+
+pub const CoercionTests = struct {
+    fn buildRegistry(
+        allocator: std.mem.Allocator,
+        entries: []const flow_codegen.CoercionEntry,
+    ) !flow_codegen.CoercionRegistry {
+        var reg = flow_codegen.CoercionRegistry.init(allocator);
+        errdefer reg.deinit();
+        for (entries) |e| try reg.add(e);
+        return reg;
+    }
+
+    test "wireFitAccepts: type equality returns .exact" {
+        // Rule 1 — Zig type equality always fits. The registry doesn't
+        // need to contain anything for this path; it's the trivial
+        // case the wire-fit chain short-circuits on first.
+        const allocator = std.testing.allocator;
+        var reg = try buildRegistry(allocator, &.{});
+        defer reg.deinit();
+
+        const fit = reg.wireFitAccepts("u32", "u32");
+        try expect.equal(@as(std.meta.Tag(flow_codegen.WireFit), fit), .exact);
+    }
+
+    test "wireFitAccepts: registered (from, to) returns .coercion(qualified)" {
+        // Rule 3 — the editor's wire-fit chain falls through here when
+        // type equality (and numeric widening, checked editor-side
+        // against the actual Zig types) doesn't match. A registered
+        // `(BodyId, u32)` pair accepts the wire and surfaces the
+        // qualified decl name flow-codegen's edge wrap will use.
+        const allocator = std.testing.allocator;
+        var reg = try buildRegistry(allocator, &.{
+            .{
+                .qualified = "box2d__body_to_entity",
+                .from_zig_type = "BodyId",
+                .to_zig_type = "u32",
+            },
+        });
+        defer reg.deinit();
+
+        const fit = reg.wireFitAccepts("BodyId", "u32");
+        switch (fit) {
+            .coercion => |q| try expect.toBeTrue(std.mem.eql(u8, q, "box2d__body_to_entity")),
+            else => try expect.toBeTrue(false),
+        }
+    }
+
+    test "wireFitAccepts: unregistered pair returns .refused" {
+        // Rule 4 — no built-in match, no registered coercion. The
+        // editor surfaces this as `MalformedFlow` per RFC §2's "editor
+        // refuses; codegen rejects" contract.
+        const allocator = std.testing.allocator;
+        var reg = try buildRegistry(allocator, &.{
+            .{
+                .qualified = "box2d__body_to_entity",
+                .from_zig_type = "BodyId",
+                .to_zig_type = "u32",
+            },
+        });
+        defer reg.deinit();
+
+        const fit = reg.wireFitAccepts("BodyId", "f32"); // unregistered To
+        try expect.equal(@as(std.meta.Tag(flow_codegen.WireFit), fit), .refused);
+    }
+
+    test "wireFitAccepts: direction matters — (A, B) does not imply (B, A)" {
+        // Coercions are directional — `body_to_entity` accepts
+        // `BodyId → u32`, not `u32 → BodyId`. The editor's wire-fit
+        // lookup keys on the directed pair so reverse-direction wires
+        // refuse unless a separate inverse coercion is declared.
+        const allocator = std.testing.allocator;
+        var reg = try buildRegistry(allocator, &.{
+            .{
+                .qualified = "box2d__body_to_entity",
+                .from_zig_type = "BodyId",
+                .to_zig_type = "u32",
+            },
+        });
+        defer reg.deinit();
+
+        const forward = reg.wireFitAccepts("BodyId", "u32");
+        try expect.equal(@as(std.meta.Tag(flow_codegen.WireFit), forward), .coercion);
+
+        const reverse = reg.wireFitAccepts("u32", "BodyId");
+        try expect.equal(@as(std.meta.Tag(flow_codegen.WireFit), reverse), .refused);
+    }
+
+    test "CoercionRegistry: last-write-wins on duplicate (from, to)" {
+        // A later registration for the same (from, to) overwrites the
+        // earlier one — same shape `PluginPinStyles.dedupe` uses, so
+        // a downstream plugin overriding an upstream's coercion has
+        // predictable precedence.
+        const allocator = std.testing.allocator;
+        var reg = flow_codegen.CoercionRegistry.init(allocator);
+        defer reg.deinit();
+
+        try reg.add(.{
+            .qualified = "first__bridge",
+            .from_zig_type = "A",
+            .to_zig_type = "B",
+        });
+        try reg.add(.{
+            .qualified = "second__bridge",
+            .from_zig_type = "A",
+            .to_zig_type = "B",
+        });
+
+        const got = reg.get("A", "B").?;
+        try expect.toBeTrue(std.mem.eql(u8, got.qualified, "second__bridge"));
+    }
+
+    test "wrapEdgeWithCoercion: emits the canonical call-site shape" {
+        // Edge codegen contract: when the wire-fit returned
+        // `.coercion(qualified)`, codegen wraps the resolved source
+        // expression in `game_mod.PluginCoercions.<qualified>.convert(<expr>)`.
+        // This pins the exact string shape downstream assembler-emitted
+        // `PluginCoercions` aliases land against.
+        const allocator = std.testing.allocator;
+        const wrapped = try flow_codegen.wrapEdgeWithCoercion(
+            allocator,
+            "box2d__body_to_entity",
+            "n3_value",
+        );
+        defer allocator.free(wrapped);
+        try expect.toBeTrue(std.mem.eql(
+            u8,
+            wrapped,
+            "game_mod.PluginCoercions.box2d__body_to_entity.convert(n3_value)",
+        ));
+    }
+
+    test "Options: coercions field defaults to null" {
+        // Every pre-RFC-FLOW-VOCABULARY-§2 caller passes `Options`
+        // without the `coercions` field. The default must stay `null`
+        // so those call sites keep compiling — empty / null registry
+        // means "no coercions registered; wire-fit consults equality
+        // + numeric-widening only".
+        const opts: flow_codegen.Options = .{ .flow_name = "x" };
+        try expect.toBeTrue(opts.coercions == null);
+        try expect.toBeTrue(opts.custom_nodes == null);
+    }
+
+    test "Options: coercions threaded through renderFlowZig accepts a registry" {
+        // Integration smoke: pass a populated registry through the
+        // public entry point. The registry isn't consulted in any
+        // existing lowering yet (edge codegen wires it through a
+        // future flow_io annotation); the contract this test pins is
+        // that the option exists, accepts a registry, and doesn't
+        // perturb the no-CustomNode happy path.
+        const allocator = std.testing.allocator;
+        var reg = try buildRegistry(allocator, &.{
+            .{
+                .qualified = "box2d__body_to_entity",
+                .from_zig_type = "BodyId",
+                .to_zig_type = "u32",
+            },
+        });
+        defer reg.deinit();
+
+        const src =
+            \\{
+            \\  "name": "noop",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "noop", .coercions = &reg },
+        );
+        defer allocator.free(out);
+
+        // Sanity: the body of the entry fn was emitted.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: anytype)") != null);
+    }
+};
