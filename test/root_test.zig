@@ -41,20 +41,23 @@ pub const JsoncTests = struct {
 pub const FlowIoTests = struct {
     const minimal_on_update =
         \\{
-        \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-        \\  "nodes": [],
+        \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] } ],
         \\  "edges": []
         \\}
     ;
 
-    test "parses minimal flow with OnUpdate event" {
+    test "parses minimal flow with engine.tick Event node" {
         const allocator = std.testing.allocator;
         var loaded = try flow_io.parseFlow(allocator, minimal_on_update);
         defer loaded.deinit();
 
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnUpdate);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.event.OnUpdate.arg_dt, "dt"));
-        try expect.equal(loaded.flow.nodes.len, 0);
+        // Post-Phase 6 (RFC-FLOW-VOCABULARY): the trigger lives as an
+        // in-graph `Event` node; `buildFlow` synthesizes the `OnEvent`
+        // event for downstream consumers (assembler `flow_scanner`).
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.event.OnEvent.name.?, "engine.tick"));
+        // The minimal source has a single Event node, no other nodes.
+        try expect.equal(loaded.flow.nodes.len, 1);
         try expect.equal(loaded.flow.edges.len, 0);
     }
 
@@ -63,8 +66,8 @@ pub const FlowIoTests = struct {
         const src =
             \\{
             \\  // entry point
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": "1.5", "pos": [0, 0] }, /* a node */
             \\  ],
             \\  "edges": [],
@@ -72,15 +75,16 @@ pub const FlowIoTests = struct {
         ;
         var loaded = try flow_io.parseFlow(allocator, src);
         defer loaded.deinit();
-        try expect.equal(loaded.flow.nodes.len, 1);
+        // Two nodes — the Event-node trigger + the in-graph Literal.
+        try expect.equal(loaded.flow.nodes.len, 2);
     }
 
     test "parses each flat NodeKind variant" {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "GetComponent", "component": "Position", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetField", "target": "Position.x", "pos": [0, 0] },
             \\    { "id": 3, "type": "BinOp", "op": "mul", "pos": [0, 0] },
@@ -94,14 +98,18 @@ pub const FlowIoTests = struct {
         var loaded = try flow_io.parseFlow(allocator, src);
         defer loaded.deinit();
 
-        try expect.equal(loaded.flow.nodes.len, 6);
-        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .GetComponent);
-        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[0].kind.GetComponent.type, "Position"));
-        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[1].kind), .SetField);
-        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[2].kind), .BinOp);
-        try expect.equal(loaded.flow.nodes[2].kind.BinOp.op, .mul);
-        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[3].kind), .Literal);
-        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[5].kind), .Call);
+        // Seven nodes — the Event-node trigger + the six declared kinds.
+        try expect.equal(loaded.flow.nodes.len, 7);
+        // The migration inserts the Event node at index 0; the
+        // declared-kind nodes follow in their source order.
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .Event);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[1].kind), .GetComponent);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.GetComponent.type, "Position"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[2].kind), .SetField);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[3].kind), .BinOp);
+        try expect.equal(loaded.flow.nodes[3].kind.BinOp.op, .mul);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[4].kind), .Literal);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[6].kind), .Call);
     }
 
     test "parses top-level params and Param/Output/Subflow nodes" {
@@ -139,8 +147,8 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 7, "type": "Subflow", "flow": "combat", "bindings": { "damage": 25.0 }, "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -149,40 +157,48 @@ pub const FlowIoTests = struct {
         var loaded = try flow_io.parseFlow(allocator, src);
         defer loaded.deinit();
 
-        const sf = loaded.flow.nodes[0].kind.Subflow;
+        // nodes[0] is the Event trigger; nodes[1] is the Subflow.
+        const sf = loaded.flow.nodes[1].kind.Subflow;
         try expect.toBeTrue(std.mem.eql(u8, sf.flow, "combat"));
         try expect.equal(sf.bindings.len, 1);
         try expect.toBeTrue(std.mem.eql(u8, sf.bindings[0].param, "damage"));
         try expect.toBeTrue(std.mem.eql(u8, sf.bindings[0].value.zig_text, "25"));
     }
 
-    test "parses each lifecycle Event variant" {
+    test "parses each lifecycle Event variant via in-graph Event nodes" {
+        // Phase 6 (RFC-FLOW-VOCABULARY): the lifecycle event-driven
+        // trigger ships as an in-graph `Event` node referencing one of
+        // the engine-emitted names (`engine.entity_created`,
+        // `engine.entity_destroyed`, etc.). The parser synthesizes
+        // `Flow.event = .{ .OnEvent = .{ .name = ... } }`.
         const allocator = std.testing.allocator;
 
         const on_create =
-            \\{ "event": { "type": "OnCreate", "arg_entity": "self" }, "nodes": [], "edges": [] }
+            \\{ "nodes": [ { "id": 1, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] } ], "edges": [] }
         ;
         var l1 = try flow_io.parseFlow(allocator, on_create);
         defer l1.deinit();
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), l1.flow.event), .OnCreate);
-        try expect.toBeTrue(std.mem.eql(u8, l1.flow.event.OnCreate.arg_entity, "self"));
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l1.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, l1.flow.event.OnEvent.name.?, "engine.entity_created"));
 
         const on_destroy =
-            \\{ "event": { "type": "OnDestroy", "arg_entity": "victim" }, "nodes": [], "edges": [] }
+            \\{ "nodes": [ { "id": 1, "type": "Event", "name": "engine.entity_destroyed", "pos": [0, 0] } ], "edges": [] }
         ;
         var l2 = try flow_io.parseFlow(allocator, on_destroy);
         defer l2.deinit();
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnDestroy);
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name.?, "engine.entity_destroyed"));
     }
 
-    test "parses a new-form OnEvent with the name field" {
+    test "parses an Event-node-form flow with the name field" {
         const allocator = std.testing.allocator;
-        // RFC-PLUGIN-EVENTS §7: the new form names the event and lets
-        // the assembler's resolver derive the payload type.
+        // Post-Phase 6: the trigger is an in-graph `Event` node;
+        // `buildFlow` synthesizes the `OnEvent` event for downstream
+        // consumers (assembler `flow_scanner`).
         const src =
             \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [], "edges": []
+            \\  "nodes": [ { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] } ],
+            \\  "edges": []
             \\}
         ;
         var loaded = try flow_io.parseFlow(allocator, src);
@@ -192,13 +208,13 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "box2d.collision_begin"));
     }
 
-    test "round-trips a new-form OnEvent flow through renderFlowJsonc" {
+    test "round-trips an Event-node-form flow through renderFlowJsonc" {
         const allocator = std.testing.allocator;
         const src =
             \\{
             \\  "name": "on_collision",
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [], "edges": []
+            \\  "nodes": [ { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] } ],
+            \\  "edges": []
             \\}
         ;
         var l1 = try flow_io.parseFlow(allocator, src);
@@ -216,199 +232,22 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
     }
 
-    test "rejects an OnEvent whose payload carries a retired legacy `module` key" {
-        const allocator = std.testing.allocator;
-        // RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13): the v1 legacy
-        // `module` + `callback` + `params` form was removed. A
-        // `.flow.jsonc` carrying any retired key now fails to parse,
-        // even when `name` is also set.
-        const src =
-            \\{
-            \\  "event": {
-            \\    "type": "OnEvent", "name": "box2d.collision_begin",
-            \\    "module": "box2d"
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
+    // Phase 6 (RFC-FLOW-VOCABULARY) — the legacy `event: { "type":
+    // "OnEvent", ... }` header form was retired alongside the lifecycle
+    // headers; the only event source is now an in-graph `Event` node.
+    // The previously-here `rejects an OnEvent` tests (retired
+    // `module` / `callback` / `params` keys, bare `OnEvent` with no
+    // name, priority-on-header behaviour) are no longer reachable —
+    // every event-driven flow goes through the Event-node path which
+    // has its own schema (`name` only).
 
-    test "rejects an OnEvent with no name (legacy form removed)" {
-        const allocator = std.testing.allocator;
-        // Post phase 6: `name` is required. An `OnEvent` payload
-        // without it — including the bare `{}` shape — is unparseable.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent" },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
-
-    test "rejects an OnEvent that carries a retired `callback` key" {
-        const allocator = std.testing.allocator;
-        // Same removal: any retired legacy key surfaces as
-        // `MalformedFlow`, replacing the v1 partial-legacy check.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "callback": "on_collision_begin" },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
-
-    test "rejects an OnEvent that carries a retired `params` key" {
-        const allocator = std.testing.allocator;
-        // Same removal — the legacy callback-`params` array is also a
-        // retired key; a flow carrying it (alongside `name` or not) is
-        // rejected at parse time.
-        const src =
-            \\{
-            \\  "event": {
-            \\    "type": "OnEvent", "name": "box2d.collision_begin",
-            \\    "params": [{ "name": "entity_a", "type": "u32" }]
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
-
-    test "parses an OnEvent with a priority field" {
-        const allocator = std.testing.allocator;
-        // RFC-PLUGIN-EVENTS O4 / phase 7 (labelle-core#16): the
-        // optional `priority` hint sorts consumable-event listeners.
-        // It rides on the new-form `OnEvent` and is purely passthrough
-        // through `flow_io` — the assembler reads it to sort handler
-        // structs, codegen does not consume it.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 100 },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var loaded = try flow_io.parseFlow(allocator, src);
-        defer loaded.deinit();
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
-        const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "ui.click"));
-        try expect.toBeTrue(ev.priority != null);
-        try expect.equal(ev.priority.?, @as(i32, 100));
-    }
-
-    test "parses an OnEvent without priority (defaults to null)" {
-        const allocator = std.testing.allocator;
-        // Absence of the on-disk `priority` key keeps `priority = null`
-        // — the "no hint" bucket the assembler treats as lowest
-        // precedence for consumable events and ignores entirely for
-        // notification events.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click" },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var loaded = try flow_io.parseFlow(allocator, src);
-        defer loaded.deinit();
-        try expect.toBeTrue(loaded.flow.event.OnEvent.priority == null);
-    }
-
-    test "parses a negative priority on an OnEvent" {
-        const allocator = std.testing.allocator;
-        // Negative priorities are valid — sorts below the no-hint
-        // bucket for consumable events (a "background" listener).
-        // i32 storage is signed precisely to keep this case viable.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": -10 },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var loaded = try flow_io.parseFlow(allocator, src);
-        defer loaded.deinit();
-        try expect.equal(loaded.flow.event.OnEvent.priority.?, @as(i32, -10));
-    }
-
-    test "rejects a non-integer priority on an OnEvent" {
-        const allocator = std.testing.allocator;
-        // `priority` is strictly `i32`. A string / float / bool fails
-        // parse — matches the strict-type contract every other
-        // structured field in the loader follows.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": "high" },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
-
-    test "rejects a priority outside the i32 range" {
-        const allocator = std.testing.allocator;
-        // 64-bit values that don't fit `i32` are rejected rather than
-        // silently wrapping — the assembler-side sort uses `i32`
-        // comparisons and a wrap would put a "10 billion" priority
-        // somewhere unexpected in the order.
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 10000000000 },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
-    }
-
-    test "round-trips an OnEvent priority through renderFlowJsonc" {
-        const allocator = std.testing.allocator;
-        // The on-disk key order ("name" then "priority") is what
-        // `writeEvent` emits — pinning it here keeps editor re-saves
-        // diff-clean (RFC open question 3 — stable re-save).
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 100 },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var l1 = try flow_io.parseFlow(allocator, src);
-        defer l1.deinit();
-        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
-        defer allocator.free(rendered);
-
-        // Verify the rendered JSONC carries the priority key — guards
-        // against a future writer rewrite silently dropping it.
-        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"priority\": 100") != null);
-
-        var l2 = try flow_io.parseFlow(allocator, rendered);
-        defer l2.deinit();
-        try expect.equal(l2.flow.event.OnEvent.priority.?, @as(i32, 100));
-
-        // Idempotent re-render.
-        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
-        defer allocator.free(rendered2);
-        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
-    }
-
-    test "omits the priority key on round-trip when unset" {
-        const allocator = std.testing.allocator;
-        // A flow with no `priority` must NOT regain one on round-trip
-        // (a default-rendered `0` would change semantics for consumable
-        // events, where 0 is a meaningful priority bucket distinct from
-        // null).
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "ui.click" },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var l1 = try flow_io.parseFlow(allocator, src);
-        defer l1.deinit();
-        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
-        defer allocator.free(rendered);
-        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "priority") == null);
-    }
+    // Phase 6 (RFC-FLOW-VOCABULARY) — the `priority` field was only
+    // settable on the legacy `event:` header (RFC-PLUGIN-EVENTS O4 /
+    // phase 7). With the header retired, priority can no longer be
+    // set from `.flow.jsonc`; the field remains on `Event.OnEvent` for
+    // assembler compatibility but reads `null` for every parsed flow.
+    // The on-disk priority tests have been removed; if priority gains
+    // a graph-form expression later, new tests cover that schema.
 
     test "parses and round-trips an Emit node" {
         const allocator = std.testing.allocator;
@@ -459,8 +298,7 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Nonsense", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Nonsense", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -484,8 +322,8 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "name": "a", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "name": "b", "pos": [0, 0] }
             \\  ],
@@ -499,8 +337,7 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Identifier", "name": "a", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 50, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Identifier", "name": "a", "pos": [0, 0 ] } ],
             \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 99, "pin": "y" } } ]
             \\}
         ;
@@ -511,8 +348,7 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 0, "type": "Identifier", "name": "a", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 0, "type": "Identifier", "name": "a", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -586,8 +422,8 @@ pub const FlowIoTests = struct {
         const src =
             \\{
             \\  "name": "move",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "GetComponent", "component": "Position", "pos": [120, 80] },
             \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [280, 80] }
             \\  ],
@@ -606,7 +442,8 @@ pub const FlowIoTests = struct {
         defer l2.deinit();
 
         try expect.toBeTrue(std.mem.eql(u8, l2.flow.name, "move"));
-        try expect.equal(l2.flow.nodes.len, 2);
+        // 3 nodes — Event trigger + GetComponent + BinOp.
+        try expect.equal(l2.flow.nodes.len, 3);
         try expect.equal(l2.flow.edges.len, 1);
 
         // Idempotent re-render (RFC open question 3 — stable re-save).
@@ -660,8 +497,7 @@ pub const FlowIoTests = struct {
 
         var l1 = try flow_io.parseFlow(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Literal", "value": "1", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Literal", "value": "1", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         );
@@ -672,7 +508,8 @@ pub const FlowIoTests = struct {
         var l2 = try flow_io.loadFromFile(std.testing.io, allocator, path);
         defer l2.deinit();
 
-        try expect.equal(l2.flow.nodes.len, 1);
+        // Two nodes — Event trigger + Literal.
+        try expect.equal(l2.flow.nodes.len, 2);
         // loadFromFile derives the effective name from the basename.
         try expect.toBeTrue(std.mem.eql(u8, l2.flow.name, "demo"));
     }
@@ -693,25 +530,15 @@ pub const FlowCodegenTests = struct {
         return flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = name });
     }
 
-    test "renders OnUpdate event as the engine per-frame `tick` entry" {
-        const allocator = std.testing.allocator;
-        const out = try render(allocator,
-            \\{ "event": { "type": "OnUpdate", "arg_dt": "delta" }, "nodes": [], "edges": [] }
-        , "demo");
-        defer allocator.free(out);
-        // `OnUpdate` lowers to `tick` — the script-runner's per-frame
-        // entry point — so the flow is actually dispatched each frame.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn tick(game: anytype, delta: f32) void") != null);
-    }
-
-    test "renders OnCreate event signature" {
-        const allocator = std.testing.allocator;
-        const out = try render(allocator,
-            \\{ "event": { "type": "OnCreate", "arg_entity": "self" }, "nodes": [], "edges": [] }
-        , "spawn");
-        defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCreate(game: anytype, self: EntityId) void") != null);
-    }
+    // Phase 6 (RFC-FLOW-VOCABULARY): the lifecycle entry-fn shapes
+    // (`pub fn tick(game, dt)` / `pub fn onCreate(game, entity)` /
+    // `pub fn onDestroy(game, entity)`) are gone. Flows formerly using
+    // them now declare an in-graph `Event` node referencing the
+    // engine-emitted name (`engine.tick`, `engine.entity_created`,
+    // …); codegen emits a `FlowEventHandler` with a payload-typed
+    // method — the entity rides `payload.entity`. The legacy
+    // shape-assertion tests were removed; the FlowEventHandler shape
+    // is covered by the `new-form OnEvent codegen` tests below.
 
     test "entry function declares top-level params so Param nodes resolve" {
         const allocator = std.testing.allocator;
@@ -743,8 +570,7 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Literal", "value": "1.5", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Literal", "value": "1.5", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         , "lit");
@@ -756,8 +582,8 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": "1", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": "2", "pos": [0, 0] },
             \\    { "id": 3, "type": "BinOp", "op": "sub", "pos": [0, 0] }
@@ -776,8 +602,7 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 2, "type": "BinOp", "op": "mul", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 2, "type": "BinOp", "op": "mul", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         , "binop");
@@ -787,15 +612,22 @@ pub const FlowCodegenTests = struct {
 
     test "renders GetComponent node with component @import" {
         const allocator = std.testing.allocator;
+        // Post-Phase 6: Event-node-form flows have no in-scope `entity`
+        // identifier — the entity pin is mandatory (RFC §9). We wire it
+        // from an `Identifier` node naming `payload.entity` to mirror
+        // the new-form lowering.
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [ { "id": 3, "type": "GetComponent", "component": "Position", "pos": [0, 0] } ],
-            \\  "edges": []
+            \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Identifier", "name": "payload.entity", "pos": [0, 0] },
+            \\    { "id": 3, "type": "GetComponent", "component": "Position", "pos": [0, 0 ] }
+            \\  ],
+            \\  "edges": [ { "from": { "node": 4, "pin": "value" }, "to": { "node": 3, "pin": "entity" } } ]
             \\}
         , "get");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game.getComponent(entity, Position) orelse return;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game.getComponent(n4_value, Position) orelse return;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const Position = @import(\"../../components/Position.zig\").Position;") != null);
     }
 
@@ -803,16 +635,20 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
+            \\    { "id": 6, "type": "Identifier", "name": "payload.entity", "pos": [0, 0] },
             \\    { "id": 4, "type": "Literal", "value": "42", "pos": [0, 0] },
             \\    { "id": 5, "type": "SetField", "target": "Position.x", "pos": [0, 0] }
             \\  ],
-            \\  "edges": [ { "from": { "node": 4, "pin": "value" }, "to": { "node": 5, "pin": "value" } } ]
+            \\  "edges": [
+            \\    { "from": { "node": 6, "pin": "value" }, "to": { "node": 5, "pin": "entity" } },
+            \\    { "from": { "node": 4, "pin": "value" }, "to": { "node": 5, "pin": "value" } }
+            \\  ]
             \\}
         , "setf");
         defer allocator.free(out);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, entity, n4_value);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, n6_value, n4_value);") != null);
     }
 
     test "lifecycle GetComponent with a wired entity pin uses the wired expression" {
@@ -825,8 +661,8 @@ pub const FlowCodegenTests = struct {
         // accessor without coupling this test to the resolver.
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "self" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "name": "self", "pos": [0, 0] },
             \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] }
             \\  ],
@@ -859,8 +695,8 @@ pub const FlowCodegenTests = struct {
         // entity argument moves from bare `entity` to the wired pin.
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "name": "other", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": "42", "pos": [0, 0] },
             \\    { "id": 3, "type": "SetField", "target": "Position.x", "pos": [0, 0] }
@@ -875,29 +711,13 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "game.setField(Position, .x, n1_value, n2_value);") != null);
     }
 
-    test "lifecycle flow mixes wired and unwired entity-scoped nodes" {
-        const allocator = std.testing.allocator;
-        // One `GetComponent` wires its entity pin; another reads bare
-        // `entity` from the lifecycle param. The lifecycle binding
-        // stays in place — `anyNeedsBareEntity` triggers it — and the
-        // wired node still gets the wired expression.
-        const out = try render(allocator,
-            \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Identifier", "name": "other", "pos": [0, 0] },
-            \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] },
-            \\    { "id": 3, "type": "GetComponent", "component": "Health", "pos": [0, 0] }
-            \\  ],
-            \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "entity" } } ]
-            \\}
-        , "mixed_get");
-        defer allocator.free(out);
-        // Node 2 reads the wired expression; node 3 falls back to
-        // the in-scope lifecycle `entity`.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(n1_value, Position)") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.getComponent(entity, Health)") != null);
-    }
+    // Phase 6 (RFC-FLOW-VOCABULARY): the formerly-here "mixed wired /
+    // unwired entity-scoped nodes" test relied on the lifecycle
+    // entry-fn `entity` binding (`anyNeedsBareEntity`). With the
+    // lifecycle entry path gone, every entity-scoped node in an
+    // Event-node-form flow MUST wire its entity pin (RFC §9); the
+    // unwired case is `DanglingPin`. The "all-wired" subcase is
+    // covered by the `renders GetComponent / SetField` tests above.
 
     test "OnCall entry with a wired entity-pin GetComponent is allowed" {
         const allocator = std.testing.allocator;
@@ -943,8 +763,8 @@ pub const FlowCodegenTests = struct {
         // init (`labelle-engine/src/game.zig:419-429`).
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [], "edges": []
+            \\  "nodes": [ { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] } ],
+            \\  "edges": []
             \\}
         , "new_form_hit");
         defer allocator.free(out);
@@ -985,8 +805,8 @@ pub const FlowCodegenTests = struct {
         // wired `payload.entity_a` flows into the `getComponent` call.
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "name": "payload.entity_a", "pos": [0, 0] },
             \\    { "id": 2, "type": "GetComponent", "component": "Position", "pos": [0, 0] }
             \\  ],
@@ -1007,8 +827,10 @@ pub const FlowCodegenTests = struct {
         // paths already raise.
         var loaded = try flow_io.parseFlow(allocator,
             \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [ { "id": 1, "type": "GetComponent", "component": "Position", "pos": [0, 0] } ],
+            \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
+            \\    { "id": 1, "type": "GetComponent", "component": "Position", "pos": [0, 0] }
+            \\  ],
             \\  "edges": []
             \\}
         );
@@ -1028,8 +850,8 @@ pub const FlowCodegenTests = struct {
         // assembler#174 / RFC §7).
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": "42", "pos": [0, 0] },
             \\    { "id": 2, "type": "Emit", "event": "my_game.fired", "pos": [0, 0] }
             \\  ],
@@ -1064,8 +886,7 @@ pub const FlowCodegenTests = struct {
         // keeps diagnostics sourced against the single generated line.
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [ { "id": 1, "type": "Emit", "event": "my_game.bare", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] }, { "id": 1, "type": "Emit", "event": "my_game.bare", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         , "emit_bare");
@@ -1077,13 +898,15 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Identifier", "name": "payload.entity", "pos": [0, 0] },
             \\    { "id": 1, "type": "SetField", "target": "Position.x", "pos": [0, 0] },
             \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [0, 0] },
             \\    { "id": 3, "type": "Literal", "value": "5", "pos": [0, 0] }
             \\  ],
             \\  "edges": [
+            \\    { "from": { "node": 4, "pin": "value" }, "to": { "node": 1, "pin": "entity" } },
             \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 2, "pin": "a" } },
             \\    { "from": { "node": 2, "pin": "result" }, "to": { "node": 1, "pin": "value" } }
             \\  ]
@@ -1092,7 +915,7 @@ pub const FlowCodegenTests = struct {
         defer allocator.free(out);
         const lit = std.mem.indexOf(u8, out, "const n3_value = 5;").?;
         const bin = std.mem.indexOf(u8, out, "const n2_result = n3_value + 0;").?;
-        const set = std.mem.indexOf(u8, out, "game.setField(Position, .x, entity, n2_result);").?;
+        const set = std.mem.indexOf(u8, out, "game.setField(Position, .x, n4_value, n2_result);").?;
         try expect.toBeTrue(lit < bin);
         try expect.toBeTrue(bin < set);
     }
@@ -1101,8 +924,8 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         var loaded = try flow_io.parseFlow(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "BinOp", "op": "add", "pos": [0, 0] },
             \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [0, 0] }
             \\  ],
@@ -1123,8 +946,7 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         var loaded = try flow_io.parseFlow(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [ { "id": 1, "type": "SetField", "target": "Position.x", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] }, { "id": 1, "type": "SetField", "target": "Position.x", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         );
@@ -1139,8 +961,8 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         var loaded = try flow_io.parseFlow(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": "1", "pos": [0, 0] },
             \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [0, 0] }
             \\  ],
@@ -1158,8 +980,8 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 10, "type": "Literal", "value": "1", "pos": [0, 0] },
             \\    { "id": 20, "type": "Identifier", "name": "x", "pos": [0, 0] }
             \\  ],
@@ -1175,8 +997,7 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const result = render(allocator,
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [ { "id": 1, "type": "GetComponent", "component": "foo.bar.Baz", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] }, { "id": 1, "type": "GetComponent", "component": "foo.bar.Baz", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         , "ns");
@@ -1190,13 +1011,16 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Identifier", "name": "payload.entity", "pos": [0, 0] },
             \\    { "id": 1, "type": "GetComponent", "component": "Position", "pos": [0, 0] },
             \\    { "id": 2, "type": "BinOp", "op": "add", "pos": [0, 0] },
             \\    { "id": 3, "type": "SetField", "target": "Position.x", "pos": [0, 0] }
             \\  ],
             \\  "edges": [
+            \\    { "from": { "node": 4, "pin": "value" }, "to": { "node": 1, "pin": "entity" } },
+            \\    { "from": { "node": 4, "pin": "value" }, "to": { "node": 3, "pin": "entity" } },
             \\    { "from": { "node": 1, "pin": "x" }, "to": { "node": 2, "pin": "a" } },
             \\    { "from": { "node": 2, "pin": "result" }, "to": { "node": 3, "pin": "value" } }
             \\  ]
@@ -1278,8 +1102,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "enemy_tick",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 7, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "damage": 25.0 }, "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1313,8 +1137,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_default",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "combat_subgraph", "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1340,8 +1164,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_wired",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": "99", "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "damage": 1.0 }, "pos": [0, 0] }
             \\  ],
@@ -1371,8 +1195,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_void",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "void_sub", "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1399,8 +1223,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_badbind",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "nonsense": 1.0 }, "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1427,8 +1251,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_unknown",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "ghost", "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1489,8 +1313,7 @@ pub const SubflowTests = struct {
         const flow_self =
             \\{
             \\  "name": "loopy",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "loopy", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "loopy", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -1530,8 +1353,8 @@ pub const SubflowTests = struct {
         const top =
             \\{
             \\  "name": "top",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "left", "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "right", "pos": [0, 0] }
             \\  ],
@@ -1575,8 +1398,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "enemy_tick",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 7, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "damage": 25.0 }, "pos": [0, 0] }
             \\  ],
             \\  "edges": []
@@ -1625,8 +1448,7 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_multi",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "multi", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "multi", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -1661,8 +1483,7 @@ pub const SubflowTests = struct {
         ;
         const entry_src =
             \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "b", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "b", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -1704,8 +1525,7 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_wrapper",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "wrapper", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "wrapper", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -1744,8 +1564,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "tick_typo",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Literal", "value": 3.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "combat_subgraph", "pos": [0, 0] }
             \\  ],
@@ -1793,8 +1613,8 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_both",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
             \\    { "id": 1, "type": "Subflow", "flow": "a-b", "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "a_b", "pos": [0, 0] }
             \\  ],
@@ -1837,8 +1657,7 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_needs_entity",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "needs_entity", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "needs_entity", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -2053,8 +1872,7 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_odd",
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "odd_names", "pos": [0, 0] } ],
+            \\  "nodes": [ { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] }, { "id": 1, "type": "Subflow", "flow": "odd_names", "pos": [0, 0 ] } ],
             \\  "edges": []
             \\}
         ;
@@ -2168,12 +1986,12 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         );
     }
 
-    test "allows a subgraph param named after a lifecycle arg" {
+    test "allows a subgraph param named `dt` (no implicit lifecycle arg reservation)" {
         const allocator = std.testing.allocator;
-        // A reusable flow declared with `OnUpdate` but referenced as a
-        // subgraph emits `fn (game, <params>)` — no `dt` arg — so a
-        // param named `dt` is NOT a collision (regression: the
-        // collision check must not reserve a subgraph's lifecycle arg).
+        // Post-Phase 6 (RFC-FLOW-VOCABULARY) the lifecycle dt/entity
+        // args are gone; an `OnCall` subgraph emits `fn (game,
+        // <params>)`, so a param named `dt` is a regular param — no
+        // implicit reservation, no collision.
         var sub_params = [_]flow_io.Param{
             .{ .name = "dt", .type = "f32", .default = .{ .zig_text = "0.016" } },
         };
@@ -2186,7 +2004,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         };
         const sub = FlowFactory.build(.{
             .name = "tick_helper",
-            .event = flow_io.Event{ .OnUpdate = .{} },
+            .event = flow_io.Event{ .OnCall = {} },
             .params = &sub_params,
             .nodes = &sub_nodes,
             .edges = &sub_edges,
@@ -2196,7 +2014,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         };
         const entry = FlowFactory.build(.{
             .name = "uses_tick_helper",
-            .event = flow_io.Event{ .OnUpdate = .{} },
+            .event = flow_io.Event{ .OnCall = {} },
             .nodes = &entry_nodes,
         });
 
@@ -3151,248 +2969,12 @@ pub const CustomNodeTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value + n2_value;") != null);
     }
 
-    // =====================================================================
-    // RFC-FLOW-VOCABULARY §3 Migration — v1 → v2 converter
-    // (flow-codegen#15 item 4)
-    // =====================================================================
-
-    test "convertLegacyV1ToV2 rewrites a v1 OnEvent header into an Event node" {
-        // RFC-FLOW-VOCABULARY §3 Migration — a legacy `event: { type:
-        // OnEvent, name: ... }` header rewrites into an in-graph
-        // `Event` node carrying the same dotted name. Existing nodes
-        // shift by +200 on the x axis to leave canvas room.
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [100, 50] }
-            \\  ],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        var converted = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
-        defer converted.deinit();
-
-        try expect.equal(outcome, flow_io.ConvertOutcome.converted);
-
-        // Two nodes: synthesized Event + the existing Literal.
-        try expect.equal(converted.flow.nodes.len, @as(usize, 2));
-
-        // Locate the Event + Literal nodes (the synthesized Event got
-        // id 2 — `nextUnusedNodeId` picks the smallest free positive id;
-        // id 1 is taken by the Literal).
-        var event_node: ?flow_io.Node = null;
-        var literal_node: ?flow_io.Node = null;
-        for (converted.flow.nodes) |n| switch (n.kind) {
-            .Event => event_node = n,
-            .Literal => literal_node = n,
-            else => {},
-        };
-        try expect.toBeTrue(event_node != null);
-        try expect.toBeTrue(literal_node != null);
-
-        try expect.toBeTrue(std.mem.eql(u8, event_node.?.kind.Event.name, "box2d.collision_begin"));
-        // Synthesized Event sits at [0, 0]; existing node shifted by [+200, 0].
-        try expect.equal(event_node.?.pos[0], @as(f32, 0));
-        try expect.equal(event_node.?.pos[1], @as(f32, 0));
-        try expect.equal(literal_node.?.pos[0], @as(f32, 300));
-        try expect.equal(literal_node.?.pos[1], @as(f32, 50));
-
-        // The converted flow's resolved trigger is still `OnEvent` —
-        // `buildFlow` synthesizes it from the first Event node by
-        // document order (matches the codegen path).
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), converted.flow.event), .OnEvent);
-        try expect.toBeTrue(std.mem.eql(u8, converted.flow.event.OnEvent.name.?, "box2d.collision_begin"));
-    }
-
-    test "convertLegacyV1ToV2 is a no-op on an already-v2 file" {
-        // A flow that already carries an in-graph `Event` node is
-        // already on the v2 form — the converter returns it unchanged
-        // and reports `already_v2`. A subsequent render is byte-identical.
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "name": "v2_flow",
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Event", "name": "x.y", "pos": [0, 0] },
-            \\    { "id": 2, "type": "Literal", "value": 1, "pos": [200, 0] }
-            \\  ],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        var loaded = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
-        defer loaded.deinit();
-        try expect.equal(outcome, flow_io.ConvertOutcome.already_v2);
-
-        // Same number of nodes — no synthesized Event was added.
-        try expect.equal(loaded.flow.nodes.len, @as(usize, 2));
-
-        // Round-trip through the renderer produces byte-identical
-        // output on a second pass — proves canonical-form idempotence.
-        const first = try flow_io.renderFlowJsonc(allocator, loaded);
-        defer allocator.free(first);
-        var reparsed = try flow_io.parseFlow(allocator, first);
-        defer reparsed.deinit();
-        const second = try flow_io.renderFlowJsonc(allocator, reparsed);
-        defer allocator.free(second);
-        try expect.toBeTrue(std.mem.eql(u8, first, second));
-    }
-
-    test "convertLegacyV1ToV2 rejects a file with both header AND Event node" {
-        // The both-set case is caught by `buildFlow` before the
-        // converter sees it — surfaces as the canonical
-        // `ConflictingEventSource` rather than a converter-specific
-        // diagnostic.
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "x.y" },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Event", "name": "x.y", "pos": [0, 0] }
-            \\  ],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        try std.testing.expectError(
-            error.ConflictingEventSource,
-            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
-        );
-    }
-
-    test "convertLegacyV1ToV2 rejects a lifecycle OnCreate header" {
-        // Lifecycle events aren't yet Event-node-compatible (the engine
-        // doesn't expose them as `pub const Events`); the converter
-        // refuses to rewrite them and leaves the file unchanged.
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
-            \\  "nodes": [],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        try std.testing.expectError(
-            error.NonOnEventLegacyHeader,
-            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
-        );
-    }
-
-    test "convertLegacyV1ToV2 rejects a lifecycle OnUpdate header" {
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
-            \\  "nodes": [],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        try std.testing.expectError(
-            error.NonOnEventLegacyHeader,
-            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
-        );
-    }
-
-    test "convertLegacyV1ToV2 rejects an OnCall subgraph header" {
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnCall" },
-            \\  "nodes": [],
-            \\  "edges": []
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        try std.testing.expectError(
-            error.NonOnEventLegacyHeader,
-            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
-        );
-    }
-
-    test "convertLegacyV1ToV2 preserves edges intact" {
-        // A v1 flow with edges between existing nodes must keep those
-        // edges unchanged across the rewrite — only positions shift.
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "a.b" },
-            \\  "nodes": [
-            \\    { "id": 5, "type": "Literal", "value": 1, "pos": [0, 0] },
-            \\    { "id": 6, "type": "Literal", "value": 2, "pos": [100, 0] },
-            \\    { "id": 7, "type": "BinOp", "op": "add", "pos": [200, 0] }
-            \\  ],
-            \\  "edges": [
-            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 7, "pin": "a" } },
-            \\    { "from": { "node": 6, "pin": "value" }, "to": { "node": 7, "pin": "b" } }
-            \\  ]
-            \\}
-        ;
-        var outcome: flow_io.ConvertOutcome = undefined;
-        var converted = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
-        defer converted.deinit();
-        try expect.equal(outcome, flow_io.ConvertOutcome.converted);
-        try expect.equal(converted.flow.edges.len, @as(usize, 2));
-        // Edges reference the same node ids — synthesized Event node
-        // picked the smallest free id, leaving 5/6/7 untouched.
-        try expect.equal(converted.flow.edges[0].from.node, @as(u32, 5));
-        try expect.equal(converted.flow.edges[0].to.node, @as(u32, 7));
-        try expect.equal(converted.flow.edges[1].from.node, @as(u32, 6));
-        try expect.equal(converted.flow.edges[1].to.node, @as(u32, 7));
-    }
-
-    test "convertLegacyV1ToV2 + saveFlow + parseFlow round trip via tmpDir" {
-        // End-to-end: a v1 file on disk converts, the on-disk bytes
-        // reparse cleanly via the standard `parseFlow` path, and a
-        // second `convertLegacyFile` call is the canonical no-op.
-        const allocator = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-        defer allocator.free(dir);
-        const path = try std.fs.path.join(allocator, &.{ dir, "legacy.flow.jsonc" });
-        defer allocator.free(path);
-
-        // Write v1 source.
-        const v1_src =
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Literal", "value": 7, "pos": [50, 50] }
-            \\  ],
-            \\  "edges": []
-            \\}
-        ;
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = v1_src });
-
-        var first_outcome: flow_io.ConvertOutcome = undefined;
-        try flow_io.convertLegacyFile(std.testing.io, allocator, path, &first_outcome);
-        try expect.equal(first_outcome, flow_io.ConvertOutcome.converted);
-
-        // The on-disk file is now a v2 flow — load + verify.
-        var loaded_v2 = try flow_io.loadFromFile(std.testing.io, allocator, path);
-        defer loaded_v2.deinit();
-        var saw_event_node = false;
-        for (loaded_v2.flow.nodes) |n| if (n.kind == .Event) {
-            saw_event_node = true;
-            try expect.toBeTrue(std.mem.eql(u8, n.kind.Event.name, "box2d.collision_begin"));
-        };
-        try expect.toBeTrue(saw_event_node);
-
-        // Second pass — already_v2, byte-identical output.
-        const bytes_before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
-        defer allocator.free(bytes_before);
-        var second_outcome: flow_io.ConvertOutcome = undefined;
-        try flow_io.convertLegacyFile(std.testing.io, allocator, path, &second_outcome);
-        try expect.equal(second_outcome, flow_io.ConvertOutcome.already_v2);
-        const bytes_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
-        defer allocator.free(bytes_after);
-        try expect.toBeTrue(std.mem.eql(u8, bytes_before, bytes_after));
-    }
+    // RFC-FLOW-VOCABULARY §3 Migration — the v1 → v2 converter tests
+    // (`convertLegacyV1ToV2`, `convertLegacyFile`) and the
+    // `NonOnEventLegacyHeader` error were retired in Phase 6 alongside
+    // the legacy `event:` header itself. Event-driven flows are
+    // authored directly as in-graph `Event` nodes; no rewrite path
+    // exists or is needed.
 
     test "value-returning CustomNode with no consumer emits a discard" {
         // RFC §6 — the reporter shape binds `n<id>_value`. If no

@@ -41,38 +41,36 @@
 const std = @import("std");
 const jsonc = @import("jsonc.zig");
 
-/// Event entry point for a flow. `OnCall` (RFC §3) is the entry point
-/// for a *subgraph* — a flow invoked by a `Subflow` node rather than a
-/// lifecycle hook.
+/// Event entry point for a flow. Per RFC-FLOW-VOCABULARY §3 (Phase 6),
+/// event-driven flows declare their trigger as an in-graph `Event` node;
+/// the loader synthesizes `Flow.event = .{ .OnEvent = ... }` from the
+/// node's name so downstream consumers (assembler `flow_scanner`,
+/// codegen's `FlowEventHandler` path) keep working unchanged. The
+/// legacy file-level `event:` header is retained for one case only:
+/// `OnCall` (RFC §3) — the entry point for a *subgraph* invoked by a
+/// `Subflow` node rather than dispatched by an event.
 pub const Event = union(enum) {
-    OnUpdate: struct { arg_dt: []const u8 = "dt" },
-    OnCreate: struct { arg_entity: []const u8 = "entity" },
-    OnDestroy: struct { arg_entity: []const u8 = "entity" },
+    /// Subgraph entry point (RFC §3). Set via the file-level
+    /// `event: { "type": "OnCall" }` header.
     OnCall,
-    /// Subscribes the flow to a plugin- or game-declared event by its
-    /// dotted name (e.g. `"box2d.collision_begin"`).
+    /// Synthesized from an in-graph `Event` node (RFC-FLOW-VOCABULARY §3).
+    /// `name` is the dotted event name (`"box2d.collision_begin"`,
+    /// `"engine.tick"`). Resolution is the assembler's comptime
+    /// `name → variant-type` pass over the merged
+    /// `PluginEvents`/`GameEvents` union (RFC-PLUGIN-EVENTS §2, §7);
+    /// codegen reflects the payload type out of the union and emits a
+    /// hook-handler-struct method (`renderNewFormEventEntry`).
     ///
-    /// Resolution is the assembler's comptime `name → variant-type`
-    /// pass over the merged `PluginEvents`/`GameEvents` union
-    /// (RFC-PLUGIN-EVENTS §2, §7); codegen reflects the payload type
-    /// out of the union and emits a hook-handler-struct method
-    /// (`renderNewFormEventEntry`).
-    ///
-    /// The v1 `module` + `callback` + `params` legacy form was removed
-    /// in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13). A `.flow.jsonc`
-    /// with `"module"` / `"callback"` keys now fails to parse —
-    /// `buildEvent` rejects an `OnEvent` whose `name` is absent.
+    /// The legacy file-level `event: { "type": "OnEvent", ... }` header
+    /// was retired in Phase 6 (RFC-FLOW-VOCABULARY) alongside the
+    /// lifecycle headers (`OnUpdate`/`OnCreate`/`OnDestroy`); every
+    /// event-driven flow now uses the Event-node-in-graph form.
     OnEvent: struct {
-        /// Plugin-qualified event name
-        /// (`"box2d.collision_begin"`). Nullable so the field can be
-        /// the synthetic backing for an in-graph `Event` node
-        /// (RFC-FLOW-VOCABULARY §3 — events as first-class graph nodes)
-        /// without breaking consumers (assembler `flow_scanner`) that
-        /// check `ev.OnEvent.name != null`. In the new-form path the
-        /// loader populates this field from the Event node's `name`;
-        /// the legacy header path sets it directly. Either way codegen
-        /// reads `flow.event.OnEvent.name.?` once an `OnEvent` event is
-        /// resolved.
+        /// Plugin-qualified event name (`"box2d.collision_begin"`).
+        /// Populated by the loader from the in-graph `Event` node's
+        /// `name` field. Nullable in the type for parser-side
+        /// construction reasons; non-null whenever the flow has been
+        /// validated (the empty-name case is rejected upstream).
         name: ?[]const u8 = null,
         /// Optional dispatch-priority hint for **consumable** events
         /// (RFC-PLUGIN-EVENTS O4, phase 7 — labelle-core#16). Meaningful
@@ -85,13 +83,8 @@ pub const Event = union(enum) {
         /// to the return-aware path automatically for consumable
         /// variants and breaks on the first `true`-returning handler.
         /// For notification events the assembler ignores the field — the
-        /// scanner sort holds (O3). `null` on the wire (the field omitted
-        /// from `.flow.jsonc`) means "no hint"; for a consumable event
-        /// that is the lowest-precedence bucket. Pure passthrough at
-        /// this layer: `validate` accepts the field on any `OnEvent` and
-        /// `renderEventEntry` does not consume it (the handler-struct
-        /// shape is the same — the assembler reads the priority off the
-        /// `flow_scanner` entry, not off the generated Zig).
+        /// scanner sort holds (O3). `null` means "no hint"; for a
+        /// consumable event that is the lowest-precedence bucket.
         priority: ?i32 = null,
     },
 };
@@ -419,12 +412,12 @@ fn buildFlow(
     if (obj.get("edges") == null and obj.get("links") != null) return error.MalformedFlow;
     const edges = try buildEdges(a, obj.get("edges"));
 
-    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3, the
-    // trigger comes from either the file-level `event:` header (legacy
-    // / lifecycle path) or one-or-more in-graph `Event` nodes (the
-    // multi-trigger form, RFC §3 — "A flow with multiple Event nodes
-    // is a multi-trigger flow"). Declaring both a header AND any Event
-    // node, or declaring neither, is `ConflictingEventSource`.
+    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3 (Phase 6),
+    // event-driven flows declare their trigger as one or more in-graph
+    // `Event` nodes; the only file-level `event:` header still allowed
+    // is `event: { "type": "OnCall" }` for subgraphs. Declaring both an
+    // `OnCall` header AND any Event node, or declaring neither source,
+    // is `ConflictingEventSource`.
     //
     // The `Flow.event` field carries a single `Event` for back-compat
     // with downstream consumers (`flow_scanner`). For the multi-trigger
@@ -464,61 +457,23 @@ fn buildFlow(
 }
 
 fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
+    _ = a;
     if (v != .object) return error.MalformedFlow;
     const t = (v.object.get("type") orelse return error.MalformedFlow);
     if (t != .string) return error.MalformedFlow;
 
-    if (std.mem.eql(u8, t.string, "OnUpdate")) {
-        return .{ .OnUpdate = .{ .arg_dt = try strField(v.object, "arg_dt", "dt") } };
-    } else if (std.mem.eql(u8, t.string, "OnCreate")) {
-        return .{ .OnCreate = .{ .arg_entity = try strField(v.object, "arg_entity", "entity") } };
-    } else if (std.mem.eql(u8, t.string, "OnDestroy")) {
-        return .{ .OnDestroy = .{ .arg_entity = try strField(v.object, "arg_entity", "entity") } };
-    } else if (std.mem.eql(u8, t.string, "OnCall")) {
+    // Phase 6 (RFC-FLOW-VOCABULARY): the only file-level `event:` header
+    // still accepted is `OnCall` (subgraph entry point). Every
+    // event-driven flow — including the formerly lifecycle-headered
+    // `OnUpdate`/`OnCreate`/`OnDestroy` and the legacy
+    // `OnEvent` — must declare its trigger as an in-graph `Event` node
+    // referencing a name from the assembler-emitted `<project>/.labelle/
+    // flow_catalog.json` (e.g. `engine.tick`, `engine.entity_created`,
+    // `engine.entity_destroyed`, `box2d.collision_begin`).
+    if (std.mem.eql(u8, t.string, "OnCall")) {
         return .OnCall;
-    } else if (std.mem.eql(u8, t.string, "OnEvent")) {
-        // The v1 legacy form (`module` + `callback` + `params`) was
-        // removed in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13). An
-        // `OnEvent` with `name` absent — or with any of the retired
-        // legacy keys present — is a malformed flow.
-        if (v.object.get("module") != null or
-            v.object.get("callback") != null or
-            v.object.get("params") != null)
-            return error.MalformedFlow;
-        const name_v = v.object.get("name") orelse return error.MalformedFlow;
-        if (name_v != .string) return error.MalformedFlow;
-
-        // Optional `priority` — RFC-PLUGIN-EVENTS O4 / phase 7
-        // (labelle-core#16). The assembler honors it only when the
-        // resolved event is consumable; a present-but-non-integer value
-        // rejects as `MalformedFlow`, matching every other strict-type
-        // field in this loader.
-        const priority_opt: ?i32 = blk: {
-            const v_pri = v.object.get("priority") orelse break :blk null;
-            if (v_pri != .integer) return error.MalformedFlow;
-            // Clamp would silently lose data; cast rejects out-of-range
-            // explicitly so an outlandish 64-bit value surfaces as a
-            // malformed flow rather than wrapping at the i32 boundary.
-            break :blk std.math.cast(i32, v_pri.integer) orelse return error.MalformedFlow;
-        };
-
-        return .{ .OnEvent = .{
-            .name = try a.dupe(u8, name_v.string),
-            .priority = priority_opt,
-        } };
     }
     return error.UnknownEventType;
-}
-
-/// An optional string field: `default` when the key is absent, the
-/// string when present. A present-but-non-string value is a malformed
-/// file (rejected) rather than silently defaulted — otherwise the
-/// on-disk event arg would diverge from the generated `pub fn`
-/// signature.
-fn strField(obj: std.json.ObjectMap, key: []const u8, default: []const u8) ParseError![]const u8 {
-    const v = obj.get(key) orelse return default;
-    if (v != .string) return error.MalformedFlow;
-    return v.string;
 }
 
 fn buildVariables(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Variable {
@@ -1174,39 +1129,13 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
 
 fn writeEvent(w: anytype, ev: Event) !void {
     switch (ev) {
-        .OnUpdate => |b| {
-            try w.writeAll("{ \"type\": \"OnUpdate\", \"arg_dt\": ");
-            try writeJsonString(w, b.arg_dt);
-            try w.writeAll(" }");
-        },
-        .OnCreate => |b| {
-            try w.writeAll("{ \"type\": \"OnCreate\", \"arg_entity\": ");
-            try writeJsonString(w, b.arg_entity);
-            try w.writeAll(" }");
-        },
-        .OnDestroy => |b| {
-            try w.writeAll("{ \"type\": \"OnDestroy\", \"arg_entity\": ");
-            try writeJsonString(w, b.arg_entity);
-            try w.writeAll(" }");
-        },
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
-        .OnEvent => |b| {
-            try w.writeAll("{ \"type\": \"OnEvent\", \"name\": ");
-            // `name` is `?[]const u8` (post-RFC-FLOW-VOCABULARY §3 — see
-            // `Event.OnEvent.name` docs). `writeEvent` is only reached
-            // for the header form (the synthetic-from-Event-node case
-            // skips this writer entirely in `renderFlowJsonc`), so the
-            // field is always set here; the unwrap is the contract.
-            try writeJsonString(w, b.name.?);
-            // `priority` (RFC-PLUGIN-EVENTS O4 / phase 7) is emitted
-            // right after `name` so the on-disk key order stays in sync
-            // with the in-source struct field order; `null` is omitted
-            // (the parser treats absence as "no hint" — see `buildEvent`).
-            if (b.priority) |p| {
-                try w.print(", \"priority\": {d}", .{p});
-            }
-            try w.writeAll(" }");
-        },
+        // `OnEvent` is only ever synthesized from an in-graph `Event`
+        // node post-Phase 6 — the in-graph form is the on-disk source
+        // of truth and `renderFlowJsonc` omits the `event:` header for
+        // any flow that carries an Event node (see the `has_event_node`
+        // guard there). This arm is therefore unreachable at runtime.
+        .OnEvent => unreachable,
     }
 }
 
@@ -1227,158 +1156,6 @@ pub fn saveFlow(io: std.Io, allocator: std.mem.Allocator, path: []const u8, load
     const text = try renderFlowJsonc(allocator, loaded);
     defer allocator.free(text);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
-}
-
-// =====================================================================
-// Legacy v1 → v2 conversion (RFC-FLOW-VOCABULARY §3 Migration —
-// flow-codegen#15 item 4)
-// =====================================================================
-
-/// Result of a `convertLegacyV1ToV2` call — what the converter did.
-pub const ConvertOutcome = enum {
-    /// Input was a v1 file (`event: { OnEvent, ... }` header, no Event
-    /// node) — the loader synthesized the Event node and rewrote the
-    /// file. The returned `LoadedFlow` is the v2 form.
-    converted,
-    /// Input was already a v2 file (carries an in-graph Event node).
-    /// The loader returns the parsed flow unchanged — re-saving it is
-    /// idempotent (byte-identical bytes when re-rendered through
-    /// `renderFlowJsonc`).
-    already_v2,
-};
-
-/// Errors specific to legacy-flow conversion. `convertLegacyV1ToV2`
-/// returns these alongside the usual `ParseError` set.
-pub const ConvertError = error{
-    /// The flow's legacy `event:` header is not an `OnEvent` variant —
-    /// the Event-node form only models `OnEvent` triggers. Lifecycle
-    /// events (`OnCreate` / `OnUpdate` / `OnDestroy`) and `OnCall`
-    /// subgraphs remain on the header form; the engine doesn't yet
-    /// expose them as `pub const Events`, so an Event-node-form
-    /// rewrite would name a trigger the assembler cannot resolve.
-    NonOnEventLegacyHeader,
-};
-
-/// Convert a v1 `.flow.jsonc` (legacy `event:` header) to a v2
-/// `.flow.jsonc` (in-graph `Event` node). Idempotent on already-v2
-/// files. Lifecycle events (`OnCreate` / `OnUpdate` / `OnDestroy`) and
-/// `OnCall` subgraphs are not Event-node-compatible — they surface
-/// `NonOnEventLegacyHeader`. The caller frees the returned
-/// `LoadedFlow` via `deinit()` as usual.
-///
-/// Operation:
-/// 1. Parse `raw` via `parseFlow` — this already rejects
-///    `ConflictingEventSource` (both header AND Event node) and the
-///    no-source case.
-/// 2. If the parsed flow already carries an `Event` node in `nodes`,
-///    return it unchanged (`already_v2`).
-/// 3. Otherwise the flow has a header-form event. If it's not
-///    `OnEvent`, surface `NonOnEventLegacyHeader`.
-/// 4. Synthesize an `Event` node at `[0, 0]` carrying the dotted
-///    `name`; shift every existing node's position by `[+200, 0]` to
-///    leave room; copy edges unchanged.
-///
-/// The returned `LoadedFlow`'s arena owns every synthesized slice and
-/// the duplicated existing-node payloads. Call `saveFlow` to write
-/// the converted file back to disk.
-pub fn convertLegacyV1ToV2(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    outcome_out: *ConvertOutcome,
-) (ParseError || ConvertError || std.mem.Allocator.Error || std.Io.Writer.Error)!LoadedFlow {
-    var loaded = try parseFlow(allocator, raw);
-    errdefer loaded.deinit();
-
-    // Already v2 — at least one in-graph Event node.
-    var has_event_node = false;
-    for (loaded.flow.nodes) |n| if (n.kind == .Event) {
-        has_event_node = true;
-        break;
-    };
-    if (has_event_node) {
-        outcome_out.* = .already_v2;
-        return loaded;
-    }
-
-    // The header form must be `OnEvent` to lower to an Event node;
-    // lifecycle triggers stay on the header form per the RFC migration
-    // section.
-    if (loaded.flow.event != .OnEvent) {
-        return error.NonOnEventLegacyHeader;
-    }
-    // An `OnEvent` header with a null name is malformed (the loader
-    // already rejects it in `buildEvent`), so the unwrap is safe.
-    const ev_name = loaded.flow.event.OnEvent.name.?;
-
-    // Rewrite into a v2 form: synthesize an Event node at [0, 0],
-    // shift existing nodes by [+200, 0], drop the header. Everything
-    // is reallocated on the loaded arena so the returned LoadedFlow
-    // owns it.
-    const a = loaded.arena.allocator();
-    const new_nodes = try a.alloc(Node, loaded.flow.nodes.len + 1);
-    new_nodes[0] = .{
-        .id = nextUnusedNodeId(loaded.flow.nodes),
-        .pos = .{ 0, 0 },
-        .kind = .{ .Event = .{ .name = try a.dupe(u8, ev_name) } },
-    };
-    for (loaded.flow.nodes, 0..) |n, i| {
-        new_nodes[i + 1] = .{
-            .id = n.id,
-            .pos = .{ n.pos[0] + 200, n.pos[1] },
-            .kind = n.kind,
-        };
-    }
-    loaded.flow.nodes = new_nodes;
-
-    // Re-validate the rewritten flow — catches a structurally
-    // surprising input we hadn't anticipated (e.g. a duplicate id
-    // collision with the synthesized Event node, though
-    // `nextUnusedNodeId` guards against that).
-    try validate(loaded.flow);
-
-    outcome_out.* = .converted;
-    return loaded;
-}
-
-/// First node id not already used in `nodes` — picks the smallest
-/// positive value (1, 2, …) that's free. The synthesized Event node
-/// reserves an id that won't collide with the existing graph.
-fn nextUnusedNodeId(nodes: []const Node) u32 {
-    var candidate: u32 = 1;
-    while (true) : (candidate += 1) {
-        var used = false;
-        for (nodes) |n| if (n.id == candidate) {
-            used = true;
-            break;
-        };
-        if (!used) return candidate;
-    }
-}
-
-/// Read a `.flow.jsonc` from disk, convert it via
-/// `convertLegacyV1ToV2`, and write it back to the same path on
-/// success. `outcome_out` distinguishes a rewritten file from an
-/// idempotent no-op so callers can log the result. A
-/// `NonOnEventLegacyHeader` flow is left on disk unchanged (the
-/// caller logs and continues).
-pub fn convertLegacyFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    outcome_out: *ConvertOutcome,
-) !void {
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
-    defer allocator.free(raw);
-
-    var loaded = try convertLegacyV1ToV2(allocator, raw, outcome_out);
-    defer loaded.deinit();
-
-    // Always save: on `.converted` we write the new form; on
-    // `.already_v2` we write canonical re-formatted bytes (idempotent
-    // — byte-identical on the second run). The single-write code path
-    // keeps tests simpler and matches the "canonical re-save" semantics
-    // already in `saveFlow`.
-    try saveFlow(io, allocator, path, loaded);
 }
 
 /// Strip the trailing `.flow.jsonc` double extension from a path's

@@ -369,17 +369,17 @@ pub fn renderFlowFile(
     // Distinct effective names that sanitize to the same identifier
     // would emit colliding `fn` definitions — reject up front (RFC §6
     // assumes symbols don't collide; `sanitizeSymbol` is lossy). The
-    // entry `pub fn` name (`onUpdate`/`onCreate`/`onDestroy`/`onCall`)
-    // is checked too: a subgraph whose name sanitizes to one of those
-    // would emit a `fn` colliding with the file's `pub fn`.
+    // entry `pub fn` name (`onCall` / `setup`) is checked too: a
+    // subgraph whose name sanitizes to one of those would emit a `fn`
+    // colliding with the file's `pub fn`.
     try assertNoSymbolCollision(allocator, entryFunctionName(entry.event), subgraphs.items);
 
     // Each flow's declared `params` must not collide (after
     // sanitization) with each other or the fixed `fn` params —
     // checked for the entry flow and every referenced subgraph. The
     // entry reserves its lifecycle arg; a subgraph does not.
-    try assertNoParamCollision(allocator, entry, .entry);
-    for (subgraphs.items) |sg| try assertNoParamCollision(allocator, sg, .subgraph);
+    try assertNoParamCollision(allocator, entry);
+    for (subgraphs.items) |sg| try assertNoParamCollision(allocator, sg);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -483,22 +483,20 @@ fn renderEntryFunction(
     // its `entity` input pin (RFC-PLUGIN-EVENTS §9); an unwired one
     // would emit a read of an undefined `entity`. The check is
     // per-node so a flow can mix wired and unwired entity-scoped
-    // nodes freely — the v1 blanket rejection is gone. Lifecycle
-    // events do bind `entity` (see below), so this applies to
-    // `OnCall` only.
-    if (flow.event == .OnCall) try assertEntityAvailable(flow);
+    // nodes freely.
+    //
+    // Post-Phase 6 (RFC-FLOW-VOCABULARY): the lifecycle event-header
+    // path is gone — every flow that previously bound a lifecycle
+    // `entity` identifier now reads `payload.entity` through a wired
+    // `Identifier` node, so `OnCall` is the only entry-function path
+    // through here.
+    try assertEntityAvailable(flow);
 
     // An `OnCall` flow used as the file entry point is a subgraph in
     // its own right (RFC §3/§6): its `Output` nodes form the return
-    // value, exactly as for a referenced subgraph. The lifecycle
-    // events (`OnUpdate`/`OnCreate`/`OnDestroy`) are fixed-signature
-    // engine callbacks and always return `void`; any `Output` nodes
-    // there carry no return (kept as-is).
+    // value, exactly as for a referenced subgraph.
     const entry_fn = entryFunctionName(flow.event);
-    const outputs = if (flow.event == .OnCall)
-        try collectOutputs(allocator, flow)
-    else
-        try allocator.alloc(*const flow_io.Node, 0);
+    const outputs = try collectOutputs(allocator, flow);
     defer allocator.free(outputs);
 
     // Distinct Output names sanitizing to one identifier would emit a
@@ -518,41 +516,13 @@ fn renderEntryFunction(
 
     try writeFnHeader(allocator, w, flow, outputs);
 
-    // Render the body into a buffer first, so we can see which fixed
-    // parameters it actually references. Zig rejects *both* an unused
-    // parameter and a pointless `_ = x;` discard of a used one — so a
-    // parameter is discarded only when the body never mentions it.
+    // Render the body into a buffer first, so we can see whether `game`
+    // is actually referenced. Zig rejects *both* an unused parameter
+    // and a pointless `_ = x;` discard of a used one — so it is
+    // discarded only when the body never mentions it.
     var body_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer body_aw.deinit();
     const bw = &body_aw.writer;
-
-    // Entity binding for OnCreate/OnDestroy/OnUpdate templates. A
-    // lifecycle flow binds the in-scope `entity` identifier only when
-    // some entity-scoped node would read it bare — i.e. has no wire
-    // on its `entity` input pin (RFC-PLUGIN-EVENTS §9). A flow whose
-    // every `GetComponent`/`SetField` wires its entity pin explicitly
-    // would otherwise emit an unused binding.
-    if (anyNeedsBareEntity(flow)) {
-        switch (flow.event) {
-            .OnUpdate => {
-                try bw.writeAll("    // TODO(#42): real entity selection for OnUpdate flows.\n");
-                try bw.writeAll("    const entity: EntityId = undefined;\n");
-            },
-            .OnCreate => |b| {
-                if (!std.mem.eql(u8, b.arg_entity, "entity")) {
-                    try bw.print("    const entity = {s};\n", .{b.arg_entity});
-                }
-            },
-            .OnDestroy => |b| {
-                if (!std.mem.eql(u8, b.arg_entity, "entity")) {
-                    try bw.print("    const entity = {s};\n", .{b.arg_entity});
-                }
-            },
-            .OnCall => {},
-            // `OnEvent` is dispatched above to `renderEventEntry`.
-            .OnEvent => {},
-        }
-    }
 
     try emitBody(allocator, bw, &ctx, flow_name, true);
 
@@ -576,19 +546,9 @@ fn renderEntryFunction(
     const body = try body_aw.toOwnedSlice();
     defer allocator.free(body);
 
-    // A fixed parameter the body never mentions is an "unused function
-    // parameter" to Zig — discard exactly those, no more.
+    // `game` is the only fixed parameter of an `OnCall` entry — discard
+    // it when unreferenced.
     if (!mentionsIdent(body, "game")) try w.writeAll("    _ = game;\n");
-    switch (flow.event) {
-        .OnUpdate => |b| if (!mentionsIdent(body, b.arg_dt))
-            try w.print("    _ = {s};\n", .{b.arg_dt}),
-        .OnCreate => |b| if (!mentionsIdent(body, b.arg_entity))
-            try w.print("    _ = {s};\n", .{b.arg_entity}),
-        .OnDestroy => |b| if (!mentionsIdent(body, b.arg_entity))
-            try w.print("    _ = {s};\n", .{b.arg_entity}),
-        .OnCall => {},
-        .OnEvent => {},
-    }
 
     try w.writeAll(body);
     try w.writeAll("}\n");
@@ -1310,21 +1270,6 @@ fn writeFnHeader(
     outputs: []const *const flow_io.Node,
 ) !void {
     switch (flow.event) {
-        // An `OnUpdate` flow is a per-frame hook — emit `tick`, the
-        // engine script-runner's per-frame entry point, so the flow
-        // is actually dispatched. (`isGameScript` keys on `tick`.)
-        .OnUpdate => |b| try w.print(
-            "pub fn tick(game: anytype, {s}: f32",
-            .{b.arg_dt},
-        ),
-        .OnCreate => |b| try w.print(
-            "pub fn onCreate(game: anytype, {s}: EntityId",
-            .{b.arg_entity},
-        ),
-        .OnDestroy => |b| try w.print(
-            "pub fn onDestroy(game: anytype, {s}: EntityId",
-            .{b.arg_entity},
-        ),
         // An OnCall flow used as the file entry point still needs a
         // callable surface — emit `pub fn onCall`.
         .OnCall => try w.writeAll("pub fn onCall(game: anytype"),
@@ -1911,11 +1856,6 @@ pub fn sanitizeSymbol(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 /// symbol namespace alongside the subgraph `fn`s.
 fn entryFunctionName(event: flow_io.Event) []const u8 {
     return switch (event) {
-        // `OnUpdate` lowers to the engine's per-frame `tick` entry so
-        // the script-runner actually dispatches the flow each frame.
-        .OnUpdate => "tick",
-        .OnCreate => "onCreate",
-        .OnDestroy => "onDestroy",
         .OnCall => "onCall",
         // An `OnEvent` flow's public entry is its `setup` — the
         // registrar the script-runner calls (see `renderEventEntry`).
@@ -1985,28 +1925,17 @@ fn putOwnedKey(
     if (gop.found_existing) allocator.free(key);
 }
 
-/// How a flow is lowered — it decides which fixed `fn` parameters
-/// occupy the signature alongside the declared `params`.
-const FlowRole = enum {
-    /// File entry point — `writeFnHeader` emits `game` plus the
-    /// lifecycle dt/entity arg.
-    entry,
-    /// Flow referenced by a `Subflow` node — `renderSubgraphFunction`
-    /// emits only `game` and the declared `params`, regardless of the
-    /// flow's `event`.
-    subgraph,
-};
-
 /// Reject a flow whose declared `params`, after sanitization, collide
-/// with each other or with a fixed `fn` parameter. Such a flow parses
-/// cleanly yet emits a signature with duplicate parameter identifiers,
-/// which Zig rejects (`ParamNameCollision`). The fixed parameters
-/// depend on `role`: every flow takes `game`; an `entry` flow also
-/// takes the lifecycle dt/entity arg, whereas a `subgraph` does not.
+/// with each other or with the fixed `game` parameter. Such a flow
+/// parses cleanly yet emits a signature with duplicate parameter
+/// identifiers, which Zig rejects (`ParamNameCollision`). Post Phase 6
+/// (RFC-FLOW-VOCABULARY) the only fixed parameter on every emitted
+/// signature is `game` — the lifecycle dt/entity args are gone, and an
+/// `OnEvent` handler's payload pins are derived names that don't
+/// collide with declared params.
 fn assertNoParamCollision(
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
-    role: FlowRole,
 ) (CodegenError || std.mem.Allocator.Error)!void {
     var seen = std.StringHashMap(void).init(allocator);
     defer {
@@ -2015,20 +1944,7 @@ fn assertNoParamCollision(
         seen.deinit();
     }
 
-    // Every emitted signature takes `game`. Only an `entry` flow also
-    // takes the lifecycle dt/entity arg (`writeFnHeader`); a subgraph
-    // takes `game` + declared params alone (`renderSubgraphFunction`),
-    // so its `event` arg must not be reserved here.
     try putOwnedKey(allocator, &seen, "game");
-    if (role == .entry) switch (flow.event) {
-        .OnUpdate => |b| try putOwnedKey(allocator, &seen, b.arg_dt),
-        .OnCreate => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
-        .OnDestroy => |b| try putOwnedKey(allocator, &seen, b.arg_entity),
-        .OnCall => {},
-        // An `OnEvent` handler takes neither `game` nor a lifecycle
-        // arg — its parameters are the event's own (`renderEventEntry`).
-        .OnEvent => {},
-    };
 
     for (flow.params) |p| {
         const name = try sanitizeSymbol(allocator, p.name);
@@ -2054,18 +1970,6 @@ fn entityScopedAndUnwired(flow: flow_io.Flow, node: flow_io.Node) bool {
         if (e.to.node == node.id and std.mem.eql(u8, e.to.pin, "entity")) return false;
     }
     return true;
-}
-
-/// True when at least one entity-scoped node in `flow` would emit a
-/// read of the bare `entity` identifier — i.e. has no wire on its
-/// `entity` input pin. The lifecycle entry path uses this to decide
-/// whether to bind `entity` in the function body. A flow whose every
-/// `GetComponent`/`SetField` wires its entity pin needs no binding.
-fn anyNeedsBareEntity(flow: flow_io.Flow) bool {
-    for (flow.nodes) |n| {
-        if (entityScopedAndUnwired(flow, n)) return true;
-    }
-    return false;
 }
 
 /// Reject an entity-scoped node missing both an entity-pin wire and an
