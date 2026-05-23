@@ -13,6 +13,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
+    # Cap job runtime so a hung Zig fetch (or any other blocker) cannot
+    # burn the full default GitHub Actions allocation; `zig build` +
+    # `zig build test` for this repo completes well under a minute
+    # locally, so 10 is a generous ceiling.
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
