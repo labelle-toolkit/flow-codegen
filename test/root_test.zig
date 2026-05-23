@@ -2493,6 +2493,53 @@ pub const FlowVocabularyTests = struct {
         try expect.equal(ast.errors.len, @as(usize, 0));
     }
 
+    test "numeric widening: Literal feeding ChangeVariable i32 codegens + parses cleanly (O1)" {
+        // RFC-FLOW-VOCABULARY §2 / O1 resolved — auto-accepted widenings
+        // are emitted as bare expressions and rely on Zig's implicit
+        // coercion. A comptime-int `Literal` feeding an `i32` variable's
+        // `ChangeVariable` produces `hits += <comptime_int>` which Zig
+        // accepts without a cast. The test pins the codegen + AST-parse
+        // round trip so a future strictening of Zig's coercion (or a
+        // misguided `@as` wrapper) doesn't slip past CI.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "Literal", "value": "5", "pos": [40, 100] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "by" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "hit_counter" });
+        defer allocator.free(out);
+
+        // The wired Literal's value `n2_value` flows directly into the
+        // ChangeVariable's `by` slot — no `@as` / `@intCast` wrapper.
+        // Zig coerces the comptime-int (or u8, etc.) to i32 implicitly
+        // per the O1 rule, so the generated source compiles as-is.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "hits += n2_value;") != null);
+
+        // Sanity: the generated file parses as valid Zig.
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
     test "GetVariable + SetVariable codegen lowering" {
         const allocator = std.testing.allocator;
         const src =
