@@ -49,29 +49,23 @@ pub const Event = union(enum) {
     OnCreate: struct { arg_entity: []const u8 = "entity" },
     OnDestroy: struct { arg_entity: []const u8 = "entity" },
     OnCall,
-    /// Subscribes the flow to a plugin- or game-declared event.
+    /// Subscribes the flow to a plugin- or game-declared event by its
+    /// dotted name (e.g. `"box2d.collision_begin"`).
     ///
-    /// Two forms (RFC-PLUGIN-EVENTS §7):
+    /// Resolution is the assembler's comptime `name → variant-type`
+    /// pass over the merged `PluginEvents`/`GameEvents` union
+    /// (RFC-PLUGIN-EVENTS §2, §7); codegen reflects the payload type
+    /// out of the union and emits a hook-handler-struct method
+    /// (`renderNewFormEventEntry`).
     ///
-    /// 1. **New form (`name` set, `module`/`callback` null).** Names the
-    ///    event by its dotted name (e.g. `"box2d.collision_begin"`) and
-    ///    leaves payload signature resolution to the assembler's
-    ///    comptime name resolver (phase 1). Codegen of the new form is
-    ///    deferred until that resolver lands — see `renderEventEntry`.
-    /// 2. **Legacy form (`module` + `callback` set, `name` null).** v1
-    ///    behaviour: binds the flow to a plugin's `pub var ?*const fn`
-    ///    slot. `params` spells the callback's signature verbatim;
-    ///    codegen emits a handler matching it and a `setup()` that
-    ///    installs it. A v1 `OnEvent` handler gets no `game` and no
-    ///    `entity`.
-    ///
-    /// Exactly one of (`name`) or (`module` + `callback`) is set —
-    /// `buildEvent` rejects both-set and neither-set as `MalformedFlow`.
+    /// The v1 `module` + `callback` + `params` legacy form was removed
+    /// in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13). A `.flow.jsonc`
+    /// with `"module"` / `"callback"` keys now fails to parse —
+    /// `buildEvent` rejects an `OnEvent` whose `name` is absent.
     OnEvent: struct {
-        /// New-form: plugin-qualified event name
-        /// (`"box2d.collision_begin"`). When set, `module`/`callback`
-        /// must be null.
-        name: ?[]const u8 = null,
+        /// Plugin-qualified event name
+        /// (`"box2d.collision_begin"`).
+        name: []const u8,
         /// Optional dispatch-priority hint for **consumable** events
         /// (RFC-PLUGIN-EVENTS O4, phase 7 — labelle-core#16). Meaningful
         /// only when the resolved event is consumable (the payload
@@ -91,15 +85,6 @@ pub const Event = union(enum) {
         /// shape is the same — the assembler reads the priority off the
         /// `flow_scanner` entry, not off the generated Zig).
         priority: ?i32 = null,
-        /// Legacy: `@import` name of the plugin (e.g. `"box2d"`).
-        module: ?[]const u8 = null,
-        /// Legacy: the exported `pub var` slot
-        /// (`"on_collision_begin"`).
-        callback: ?[]const u8 = null,
-        /// Legacy: the callback's parameters — reuses `Param` (the
-        /// `default` field is unused; an event signature is fixed by
-        /// the plugin). Empty for the new form.
-        params: []Param = &.{},
     },
 };
 
@@ -350,18 +335,22 @@ fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
     } else if (std.mem.eql(u8, t.string, "OnCall")) {
         return .OnCall;
     } else if (std.mem.eql(u8, t.string, "OnEvent")) {
-        // Two forms (RFC-PLUGIN-EVENTS §7): `name` for the new
-        // resolver-backed form, `module` + `callback` for the legacy v1
-        // form. Both set or neither set is a malformed file.
-        const name_opt = try optStr(a, v.object, "name");
-        const module_opt = try optStr(a, v.object, "module");
-        const callback_opt = try optStr(a, v.object, "callback");
-        const params = try buildParams(a, v.object.get("params"));
+        // The v1 legacy form (`module` + `callback` + `params`) was
+        // removed in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13). An
+        // `OnEvent` with `name` absent — or with any of the retired
+        // legacy keys present — is a malformed flow.
+        if (v.object.get("module") != null or
+            v.object.get("callback") != null or
+            v.object.get("params") != null)
+            return error.MalformedFlow;
+        const name_v = v.object.get("name") orelse return error.MalformedFlow;
+        if (name_v != .string) return error.MalformedFlow;
+
         // Optional `priority` — RFC-PLUGIN-EVENTS O4 / phase 7
-        // (labelle-core#16). Accepted on either form; the assembler
-        // honors it only when the resolved event is consumable.
-        // A present-but-non-integer value rejects as `MalformedFlow`,
-        // matching every other strict-type field in this loader.
+        // (labelle-core#16). The assembler honors it only when the
+        // resolved event is consumable; a present-but-non-integer value
+        // rejects as `MalformedFlow`, matching every other strict-type
+        // field in this loader.
         const priority_opt: ?i32 = blk: {
             const v_pri = v.object.get("priority") orelse break :blk null;
             if (v_pri != .integer) return error.MalformedFlow;
@@ -371,38 +360,12 @@ fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
             break :blk std.math.cast(i32, v_pri.integer) orelse return error.MalformedFlow;
         };
 
-        const has_new = name_opt != null;
-        const has_legacy = module_opt != null and callback_opt != null;
-        const has_legacy_partial = (module_opt != null) != (callback_opt != null);
-
-        // `module` without `callback` (or vice versa) is structurally
-        // incomplete — neither form is satisfied.
-        if (has_legacy_partial) return error.MalformedFlow;
-        // Mixed forms: `name` plus a legacy field is ambiguous.
-        if (has_new and (module_opt != null or callback_opt != null))
-            return error.MalformedFlow;
-        // Neither form was supplied.
-        if (!has_new and !has_legacy) return error.MalformedFlow;
-
         return .{ .OnEvent = .{
-            .name = name_opt,
+            .name = try a.dupe(u8, name_v.string),
             .priority = priority_opt,
-            .module = module_opt,
-            .callback = callback_opt,
-            .params = params,
         } };
     }
     return error.UnknownEventType;
-}
-
-/// An optional string field: `null` when the key is absent, the dup'd
-/// string when present. A present-but-non-string value is a malformed
-/// file (rejected) rather than silently dropped. Unlike `strField`, a
-/// missing key returns `null`; unlike `reqStr`, it does not error.
-fn optStr(a: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const v = o.get(key) orelse return null;
-    if (v != .string) return error.MalformedFlow;
-    return try a.dupe(u8, v.string);
 }
 
 /// An optional string field: `default` when the key is absent, the
@@ -649,10 +612,12 @@ fn validate(flow: Flow) ParseError!void {
     for (flow.nodes, 0..) |n, i| {
         switch (n.kind) {
             .Param => |b| {
-                // A `Param` node names a declared flow param, or — in
-                // an `OnEvent` flow — one of the event callback's args.
-                if (!hasParam(flow.params, b.param) and
-                    !eventHasParam(flow.event, b.param))
+                // A `Param` node names a declared flow param. (Post
+                // RFC-PLUGIN-EVENTS phase 6 the legacy
+                // `OnEvent.params` callback-arg path is gone; new-form
+                // `OnEvent` flows read payload fields through wired
+                // pins, not `Param` nodes.)
+                if (!hasParam(flow.params, b.param))
                     return error.UnknownParam;
             },
             .Output => |b| {
@@ -675,16 +640,6 @@ fn hasNode(nodes: []const Node, id: u32) bool {
 fn hasParam(params: []const Param, name: []const u8) bool {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return true;
     return false;
-}
-
-/// True when `event` is an `OnEvent` whose callback declares a
-/// parameter named `name` — the event params an `OnEvent` flow's
-/// `Param` nodes may read.
-fn eventHasParam(event: Event, name: []const u8) bool {
-    return switch (event) {
-        .OnEvent => |e| hasParam(e.params, name),
-        else => false,
-    };
 }
 
 // =====================================================================
@@ -914,41 +869,14 @@ fn writeEvent(w: anytype, ev: Event) !void {
         },
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
         .OnEvent => |b| {
-            try w.writeAll("{ \"type\": \"OnEvent\"");
-            // New form: `name` is set, legacy fields are null. Legacy
-            // form: `module` + `callback` (and optionally `params`).
-            // `buildEvent` enforces exactly one form, so we render
-            // whichever is set without re-validating.
-            if (b.name) |n| {
-                try w.writeAll(", \"name\": ");
-                try writeJsonString(w, n);
-            }
+            try w.writeAll("{ \"type\": \"OnEvent\", \"name\": ");
+            try writeJsonString(w, b.name);
             // `priority` (RFC-PLUGIN-EVENTS O4 / phase 7) is emitted
             // right after `name` so the on-disk key order stays in sync
             // with the in-source struct field order; `null` is omitted
             // (the parser treats absence as "no hint" — see `buildEvent`).
             if (b.priority) |p| {
                 try w.print(", \"priority\": {d}", .{p});
-            }
-            if (b.module) |m| {
-                try w.writeAll(", \"module\": ");
-                try writeJsonString(w, m);
-            }
-            if (b.callback) |c| {
-                try w.writeAll(", \"callback\": ");
-                try writeJsonString(w, c);
-            }
-            if (b.params.len != 0) {
-                try w.writeAll(", \"params\": [");
-                for (b.params, 0..) |p, i| {
-                    if (i > 0) try w.writeAll(",");
-                    try w.writeAll(" { \"name\": ");
-                    try writeJsonString(w, p.name);
-                    try w.writeAll(", \"type\": ");
-                    try writeJsonString(w, p.type);
-                    try w.writeAll(" }");
-                }
-                try w.writeAll(" ]");
             }
             try w.writeAll(" }");
         },
@@ -960,157 +888,6 @@ pub fn saveFlow(io: std.Io, allocator: std.mem.Allocator, path: []const u8, load
     const text = try renderFlowJsonc(allocator, loaded);
     defer allocator.free(text);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
-}
-
-/// Convert a legacy `OnEvent` flow (`module` + `callback` + `params`)
-/// to the new-form `name`-resolved shape (RFC-PLUGIN-EVENTS §7,
-/// Migration §"Flow side"). Used to migrate in-tree flows once the
-/// resolver phase 1 ships; the GUI flow editor can run the same pass.
-///
-/// **Name mapping.** The dotted event name is built as
-/// `<module>.<event>` where `<event>` is the callback name with its
-/// `on_` prefix stripped — `on_collision_begin` → `collision_begin`,
-/// matching the RFC §1 rationale that the merged-union variant drops
-/// the C-callback `on_` prefix. The qualified-tag form
-/// (`<plugin>__<event>`) is mechanical from there (`.` → `__`) and
-/// resolved at codegen against `@FieldType(PluginEvents, ...)`.
-///
-/// **Validation.** flow-codegen runs without a `PluginEvents` handle —
-/// validation against the discovered plugin event set is the codegen
-/// step's job, surfacing as a Zig compile error if the rewritten
-/// `name` doesn't match a variant. The converter rejects only the
-/// structural-error cases:
-///
-///   - the input flow's event is not `OnEvent` (`error.NotOnEvent`)
-///   - the `OnEvent` is already in the new form
-///     (`error.OnEventAlreadyNew`) — no conversion needed
-///   - the `callback` is empty after stripping the `on_` prefix
-///     (`error.MalformedCallback`) — `"on_"` itself maps to nothing
-///
-/// **Ownership.** The returned `LoadedFlow` owns its own arena; the
-/// input is **not** consumed (caller still owns + frees it).
-pub const ConvertError = error{
-    NotOnEvent,
-    OnEventAlreadyNew,
-    MalformedCallback,
-};
-
-pub fn legacy_onevent_to_name(
-    allocator: std.mem.Allocator,
-    input: LoadedFlow,
-) (ConvertError || std.mem.Allocator.Error)!LoadedFlow {
-    if (input.flow.event != .OnEvent) return error.NotOnEvent;
-    const ev = input.flow.event.OnEvent;
-    if (ev.name != null) return error.OnEventAlreadyNew;
-
-    // `buildEvent` guarantees `module` + `callback` set on the legacy
-    // form. The converter has both available as required input — a
-    // partial-legacy shape would have failed `buildEvent` already.
-    const module = ev.module orelse return error.MalformedCallback;
-    const callback = ev.callback orelse return error.MalformedCallback;
-
-    // `on_collision_begin` → `collision_begin` (RFC §1 — the merged-
-    // union variant name drops the C-callback `on_` prefix). Plugins
-    // that didn't follow the convention pass through verbatim — a
-    // callback named e.g. `physics_started` keeps that name and any
-    // mismatch surfaces at codegen against `PluginEvents`.
-    const event_stem = if (std.mem.startsWith(u8, callback, "on_"))
-        callback[3..]
-    else
-        callback;
-    if (event_stem.len == 0) return error.MalformedCallback;
-
-    // Build the new arena. Cloning everything keeps the input
-    // `LoadedFlow` untouched so the caller can free it on its own
-    // schedule.
-    const arena = try allocator.create(std.heap.ArenaAllocator);
-    errdefer allocator.destroy(arena);
-    arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    const dotted_name = try std.fmt.allocPrint(a, "{s}.{s}", .{ module, event_stem });
-
-    // Deep-copy nodes/edges/params into the new arena so the resulting
-    // `LoadedFlow` has no lifetime ties back to the input.
-    const new_name = if (input.flow.name.len > 0) try a.dupe(u8, input.flow.name) else "";
-    const new_params = try cloneParams(a, input.flow.params);
-    const new_nodes = try cloneNodes(a, input.flow.nodes);
-    const new_edges = try cloneEdges(a, input.flow.edges);
-
-    const new_flow: Flow = .{
-        .name = new_name,
-        .event = .{ .OnEvent = .{
-            .name = dotted_name,
-            .module = null,
-            .callback = null,
-            .params = &.{},
-        } },
-        .params = new_params,
-        .nodes = new_nodes,
-        .edges = new_edges,
-    };
-
-    return .{ .arena = arena, .flow = new_flow };
-}
-
-fn cloneParams(a: std.mem.Allocator, src: []const Param) ![]Param {
-    const out = try a.alloc(Param, src.len);
-    for (src, 0..) |p, i| {
-        out[i] = .{
-            .name = try a.dupe(u8, p.name),
-            .type = try a.dupe(u8, p.type),
-            .default = if (p.default) |d| .{ .zig_text = try a.dupe(u8, d.zig_text) } else null,
-        };
-    }
-    return out;
-}
-
-fn cloneNodes(a: std.mem.Allocator, src: []const Node) ![]Node {
-    const out = try a.alloc(Node, src.len);
-    for (src, 0..) |n, i| {
-        out[i] = .{
-            .id = n.id,
-            .pos = n.pos,
-            .kind = try cloneNodeKind(a, n.kind),
-        };
-    }
-    return out;
-}
-
-fn cloneNodeKind(a: std.mem.Allocator, k: NodeKind) !NodeKind {
-    return switch (k) {
-        .GetComponent => |b| .{ .GetComponent = .{ .type = try a.dupe(u8, b.type) } },
-        .SetField => |b| .{ .SetField = .{ .target = try a.dupe(u8, b.target) } },
-        .BinOp => |b| .{ .BinOp = .{ .op = b.op } },
-        .Literal => |b| .{ .Literal = .{ .value = try a.dupe(u8, b.value) } },
-        .Identifier => |b| .{ .Identifier = .{ .name = try a.dupe(u8, b.name) } },
-        .Call => |b| .{ .Call = .{ .callee = try a.dupe(u8, b.callee) } },
-        .Param => |b| .{ .Param = .{ .param = try a.dupe(u8, b.param) } },
-        .Output => |b| .{ .Output = .{ .name = try a.dupe(u8, b.name), .type = try a.dupe(u8, b.type) } },
-        .Subflow => |b| blk: {
-            const bindings = try a.alloc(Binding, b.bindings.len);
-            for (b.bindings, 0..) |bd, i| {
-                bindings[i] = .{
-                    .param = try a.dupe(u8, bd.param),
-                    .value = .{ .zig_text = try a.dupe(u8, bd.value.zig_text) },
-                };
-            }
-            break :blk .{ .Subflow = .{ .flow = try a.dupe(u8, b.flow), .bindings = bindings } };
-        },
-        .Emit => |b| .{ .Emit = .{ .event = try a.dupe(u8, b.event) } },
-    };
-}
-
-fn cloneEdges(a: std.mem.Allocator, src: []const Edge) ![]Edge {
-    const out = try a.alloc(Edge, src.len);
-    for (src, 0..) |e, i| {
-        out[i] = .{
-            .from = .{ .node = e.from.node, .pin = try a.dupe(u8, e.from.pin) },
-            .to = .{ .node = e.to.node, .pin = try a.dupe(u8, e.to.pin) },
-        };
-    }
-    return out;
 }
 
 /// Strip the trailing `.flow.jsonc` double extension from a path's

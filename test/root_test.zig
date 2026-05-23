@@ -175,66 +175,10 @@ pub const FlowIoTests = struct {
         try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnDestroy);
     }
 
-    test "parses an OnEvent event with callback params" {
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "event": {
-            \\    "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin",
-            \\    "params": [
-            \\      { "name": "entity_a", "type": "u32" },
-            \\      { "name": "entity_b", "type": "u32" }
-            \\    ]
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var loaded = try flow_io.parseFlow(allocator, src);
-        defer loaded.deinit();
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
-        const ev = loaded.flow.event.OnEvent;
-        // Legacy form: `module`+`callback` set, `name` null.
-        try expect.toBeTrue(ev.name == null);
-        try expect.toBeTrue(std.mem.eql(u8, ev.module.?, "box2d"));
-        try expect.toBeTrue(std.mem.eql(u8, ev.callback.?, "on_collision_begin"));
-        try expect.equal(ev.params.len, @as(usize, 2));
-        try expect.toBeTrue(std.mem.eql(u8, ev.params[0].name, "entity_a"));
-        try expect.toBeTrue(std.mem.eql(u8, ev.params[1].type, "u32"));
-    }
-
-    test "round-trips an OnEvent flow through renderFlowJsonc" {
-        const allocator = std.testing.allocator;
-        const src =
-            \\{
-            \\  "name": "on_hit",
-            \\  "event": {
-            \\    "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin",
-            \\    "params": [ { "name": "a", "type": "u32" }, { "name": "b", "type": "u32" } ]
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        ;
-        var l1 = try flow_io.parseFlow(allocator, src);
-        defer l1.deinit();
-        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
-        defer allocator.free(rendered);
-
-        var l2 = try flow_io.parseFlow(allocator, rendered);
-        defer l2.deinit();
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
-        try expect.equal(l2.flow.event.OnEvent.params.len, @as(usize, 2));
-
-        // Idempotent re-render (RFC open question 3 — stable re-save).
-        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
-        defer allocator.free(rendered2);
-        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
-    }
-
     test "parses a new-form OnEvent with the name field" {
         const allocator = std.testing.allocator;
         // RFC-PLUGIN-EVENTS §7: the new form names the event and lets
-        // the assembler's resolver derive the payload type. `module` /
-        // `callback` / `params` are absent.
+        // the assembler's resolver derive the payload type.
         const src =
             \\{
             \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
@@ -245,11 +189,7 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
         const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(ev.name != null);
-        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "box2d.collision_begin"));
-        try expect.toBeTrue(ev.module == null);
-        try expect.toBeTrue(ev.callback == null);
-        try expect.equal(ev.params.len, @as(usize, 0));
+        try expect.toBeTrue(std.mem.eql(u8, ev.name, "box2d.collision_begin"));
     }
 
     test "round-trips a new-form OnEvent flow through renderFlowJsonc" {
@@ -269,26 +209,24 @@ pub const FlowIoTests = struct {
         var l2 = try flow_io.parseFlow(allocator, rendered);
         defer l2.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
-        try expect.toBeTrue(l2.flow.event.OnEvent.name != null);
-        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name.?, "box2d.collision_begin"));
-        // Legacy fields stay null on the round-tripped form.
-        try expect.toBeTrue(l2.flow.event.OnEvent.module == null);
-        try expect.toBeTrue(l2.flow.event.OnEvent.callback == null);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name, "box2d.collision_begin"));
 
         const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
         defer allocator.free(rendered2);
         try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
     }
 
-    test "rejects an OnEvent with both name and legacy fields set" {
+    test "rejects an OnEvent whose payload carries a retired legacy `module` key" {
         const allocator = std.testing.allocator;
-        // Exactly one form (`name` xor `module`+`callback`) is allowed.
-        // Mixing them is a malformed flow.
+        // RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13): the v1 legacy
+        // `module` + `callback` + `params` form was removed. A
+        // `.flow.jsonc` carrying any retired key now fails to parse,
+        // even when `name` is also set.
         const src =
             \\{
             \\  "event": {
             \\    "type": "OnEvent", "name": "box2d.collision_begin",
-            \\    "module": "box2d", "callback": "on_collision_begin"
+            \\    "module": "box2d"
             \\  },
             \\  "nodes": [], "edges": []
             \\}
@@ -296,10 +234,10 @@ pub const FlowIoTests = struct {
         try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
     }
 
-    test "rejects an OnEvent with neither name nor legacy fields set" {
+    test "rejects an OnEvent with no name (legacy form removed)" {
         const allocator = std.testing.allocator;
-        // An empty `OnEvent` event payload — no resolver name, no
-        // legacy callback — is unparseable.
+        // Post phase 6: `name` is required. An `OnEvent` payload
+        // without it — including the bare `{}` shape — is unparseable.
         const src =
             \\{
             \\  "event": { "type": "OnEvent" },
@@ -309,13 +247,30 @@ pub const FlowIoTests = struct {
         try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
     }
 
-    test "rejects an OnEvent with a partial legacy form (module only)" {
+    test "rejects an OnEvent that carries a retired `callback` key" {
         const allocator = std.testing.allocator;
-        // `module` without `callback` (or vice versa) is structurally
-        // incomplete — neither form is satisfied.
+        // Same removal: any retired legacy key surfaces as
+        // `MalformedFlow`, replacing the v1 partial-legacy check.
         const src =
             \\{
-            \\  "event": { "type": "OnEvent", "module": "box2d" },
+            \\  "event": { "type": "OnEvent", "callback": "on_collision_begin" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects an OnEvent that carries a retired `params` key" {
+        const allocator = std.testing.allocator;
+        // Same removal — the legacy callback-`params` array is also a
+        // retired key; a flow carrying it (alongside `name` or not) is
+        // rejected at parse time.
+        const src =
+            \\{
+            \\  "event": {
+            \\    "type": "OnEvent", "name": "box2d.collision_begin",
+            \\    "params": [{ "name": "entity_a", "type": "u32" }]
+            \\  },
             \\  "nodes": [], "edges": []
             \\}
         ;
@@ -339,7 +294,7 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
         const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(ev.name != null);
+        try expect.toBeTrue(std.mem.eql(u8, ev.name, "ui.click"));
         try expect.toBeTrue(ev.priority != null);
         try expect.equal(ev.priority.?, @as(i32, 100));
     }
@@ -722,122 +677,9 @@ pub const FlowIoTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, l2.flow.name, "demo"));
     }
 
-    test "legacy_onevent_to_name rewrites module + callback to a dotted name" {
-        const allocator = std.testing.allocator;
-        // RFC-PLUGIN-EVENTS §7 Migration "Flow side" — the converter
-        // walks a legacy `OnEvent` (`module` + `callback`) and produces
-        // the new `name`-resolved shape. Callback name's `on_` prefix
-        // is stripped (RFC §1 — merged-union variant names drop the
-        // C-callback prefix), `params` clears, `module`/`callback`
-        // null out. Output round-trips through `renderFlowJsonc`.
-        var legacy = try flow_io.parseFlow(allocator,
-            \\{
-            \\  "name": "hit_counter",
-            \\  "event": {
-            \\    "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin",
-            \\    "params": [
-            \\      { "name": "entity_a", "type": "u32" },
-            \\      { "name": "entity_b", "type": "u32" }
-            \\    ]
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        );
-        defer legacy.deinit();
-
-        var converted = try flow_io.legacy_onevent_to_name(allocator, legacy);
-        defer converted.deinit();
-
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), converted.flow.event), .OnEvent);
-        const ev = converted.flow.event.OnEvent;
-        try expect.toBeTrue(ev.name != null);
-        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "box2d.collision_begin"));
-        try expect.toBeTrue(ev.module == null);
-        try expect.toBeTrue(ev.callback == null);
-        try expect.equal(ev.params.len, @as(usize, 0));
-        // Effective name carries over unchanged.
-        try expect.toBeTrue(std.mem.eql(u8, converted.flow.name, "hit_counter"));
-
-        // Round-trip the rewritten flow through `renderFlowJsonc`. The
-        // re-parsed flow lands on the new form too — the writer emits
-        // the `name`-only `OnEvent`, the parser accepts it.
-        const rendered = try flow_io.renderFlowJsonc(allocator, converted);
-        defer allocator.free(rendered);
-        var reloaded = try flow_io.parseFlow(allocator, rendered);
-        defer reloaded.deinit();
-        try expect.toBeTrue(reloaded.flow.event.OnEvent.name != null);
-        try expect.toBeTrue(std.mem.eql(u8, reloaded.flow.event.OnEvent.name.?, "box2d.collision_begin"));
-        try expect.toBeTrue(reloaded.flow.event.OnEvent.module == null);
-    }
-
-    test "legacy_onevent_to_name passes through a callback with no on_ prefix" {
-        const allocator = std.testing.allocator;
-        // A plugin that didn't follow the `on_` callback convention
-        // (e.g. `physics_started`) keeps its callback name verbatim —
-        // mismatches against the `PluginEvents` set fall out at
-        // codegen, not in the converter (which has no resolver handle).
-        var legacy = try flow_io.parseFlow(allocator,
-            \\{
-            \\  "event": { "type": "OnEvent", "module": "physics", "callback": "physics_started" },
-            \\  "nodes": [], "edges": []
-            \\}
-        );
-        defer legacy.deinit();
-        var converted = try flow_io.legacy_onevent_to_name(allocator, legacy);
-        defer converted.deinit();
-        try expect.toBeTrue(std.mem.eql(u8, converted.flow.event.OnEvent.name.?, "physics.physics_started"));
-    }
-
-    test "legacy_onevent_to_name rejects a non-OnEvent flow" {
-        const allocator = std.testing.allocator;
-        var lifecycle = try flow_io.parseFlow(allocator,
-            \\{ "event": { "type": "OnCreate", "arg_entity": "entity" }, "nodes": [], "edges": [] }
-        );
-        defer lifecycle.deinit();
-        try std.testing.expectError(
-            error.NotOnEvent,
-            flow_io.legacy_onevent_to_name(allocator, lifecycle),
-        );
-    }
-
-    test "legacy_onevent_to_name rejects an already-new-form OnEvent flow" {
-        const allocator = std.testing.allocator;
-        var already_new = try flow_io.parseFlow(allocator,
-            \\{
-            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
-            \\  "nodes": [], "edges": []
-            \\}
-        );
-        defer already_new.deinit();
-        try std.testing.expectError(
-            error.OnEventAlreadyNew,
-            flow_io.legacy_onevent_to_name(allocator, already_new),
-        );
-    }
-
-    test "legacy_onevent_to_name preserves nodes and edges" {
-        const allocator = std.testing.allocator;
-        // The graph survives the rewrite — node ids, kinds, params,
-        // edges all carry over unchanged. The new form keeps the same
-        // body the legacy form had, just with a different event
-        // dispatch shape around it.
-        var legacy = try flow_io.parseFlow(allocator,
-            \\{
-            \\  "event": { "type": "OnEvent", "module": "box2d", "callback": "on_collision_end" },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Literal", "value": "1", "pos": [0, 0] },
-            \\    { "id": 2, "type": "Call", "callee": "doStuff", "pos": [0, 0] }
-            \\  ],
-            \\  "edges": [ { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } } ]
-            \\}
-        );
-        defer legacy.deinit();
-        var converted = try flow_io.legacy_onevent_to_name(allocator, legacy);
-        defer converted.deinit();
-        try expect.equal(converted.flow.nodes.len, @as(usize, 2));
-        try expect.equal(converted.flow.edges.len, @as(usize, 1));
-        try expect.toBeTrue(std.mem.eql(u8, converted.flow.event.OnEvent.name.?, "box2d.collision_end"));
-    }
+    // The `legacy_onevent_to_name` converter and its tests were
+    // retired in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13) — the
+    // legacy `module`+`callback`+`params` form no longer parses.
 };
 
 // =====================================================================
@@ -1371,81 +1213,14 @@ pub const FlowCodegenTests = struct {
         try expect.equal(ast.errors.len, @as(usize, 0));
     }
 
-    test "renders an OnEvent flow as a callback handler and setup registrar" {
-        const allocator = std.testing.allocator;
-        const out = try render(allocator,
-            \\{
-            \\  "event": {
-            \\    "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin",
-            \\    "params": [
-            \\      { "name": "entity_a", "type": "u32" },
-            \\      { "name": "entity_b", "type": "u32" }
-            \\    ]
-            \\  },
-            \\  "nodes": [], "edges": []
-            \\}
-        , "on_hit");
-        defer allocator.free(out);
-        // The handler's signature matches the plugin callback verbatim,
-        // so `&flowEvent` is assignable to its `?*const fn(...)` slot.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn flowEvent(entity_a: u32, entity_b: u32) void") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const __event_src = @import(\"box2d\");") != null);
-        // `setup` is the registrar the script-runner discovers + calls.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn setup(game: anytype) void") != null);
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "__event_src.on_collision_begin = &flowEvent;") != null);
-        // An event param the body never reads is discarded.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = entity_a;") != null);
-    }
-
-    test "OnEvent flow output passes std.zig.Ast.parse" {
-        const allocator = std.testing.allocator;
-        // The bouncing-ball demo shape: read a total, add one, store it.
-        const out = try render(allocator,
-            \\{
-            \\  "event": {
-            \\    "type": "OnEvent", "module": "box2d", "callback": "on_collision_begin",
-            \\    "params": [ { "name": "a", "type": "u32" }, { "name": "b", "type": "u32" } ]
-            \\  },
-            \\  "nodes": [
-            \\    { "id": 1, "type": "Call", "callee": "currentTotal", "pos": [0, 0] },
-            \\    { "id": 2, "type": "Literal", "value": "1", "pos": [0, 0] },
-            \\    { "id": 3, "type": "BinOp", "op": "add", "pos": [0, 0] },
-            \\    { "id": 4, "type": "Call", "callee": "setTotal", "pos": [0, 0] }
-            \\  ],
-            \\  "edges": [
-            \\    { "from": { "node": 1, "pin": "result" }, "to": { "node": 3, "pin": "a" } },
-            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
-            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "arg0" } }
-            \\  ]
-            \\}
-        , "hit_counter");
-        defer allocator.free(out);
-        const z = try allocator.allocSentinel(u8, out.len, 0);
-        defer allocator.free(z);
-        @memcpy(z[0..out.len], out);
-        var ast = try std.zig.Ast.parse(allocator, z, .zig);
-        defer ast.deinit(allocator);
-        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
-        try expect.equal(ast.errors.len, @as(usize, 0));
-    }
-
-    test "rejects an entity-scoped node in an OnEvent flow" {
-        const allocator = std.testing.allocator;
-        // An OnEvent handler runs from a plugin callback — no `game`,
-        // no `entity` — so a `GetComponent` node cannot be lowered.
-        var loaded = try flow_io.parseFlow(allocator,
-            \\{
-            \\  "event": { "type": "OnEvent", "module": "box2d", "callback": "on_x" },
-            \\  "nodes": [ { "id": 1, "type": "GetComponent", "component": "Position", "pos": [0, 0] } ],
-            \\  "edges": []
-            \\}
-        );
-        defer loaded.deinit();
-        try std.testing.expectError(
-            error.EntityUnavailableInSubgraph,
-            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "bad" }),
-        );
-    }
+    // The legacy `OnEvent` (`module` + `callback` + `params`) codegen
+    // path and its tests — the file-level `flowEvent` callback + `pub
+    // fn setup` registrar, the entity-scoped-node blanket rejection
+    // (`error.EntityUnavailableInSubgraph`), and the `Subflow`
+    // rejection (`error.UnsupportedNodeKind`) — were retired in
+    // RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13). The new-form
+    // hook-handler-struct codegen + its tests cover the surviving
+    // path.
 };
 
 // =====================================================================

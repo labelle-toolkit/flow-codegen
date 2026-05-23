@@ -65,10 +65,6 @@ pub const CodegenError = error{
     UnknownPin,
     /// A `GetComponent` / `SetField` references a namespaced type.
     NamespacedComponentType,
-    /// A node kind is not supported in the flow's context — e.g. a
-    /// `Subflow` node inside an `OnEvent` flow, whose handler has no
-    /// `game` to thread into the subgraph call.
-    UnsupportedNodeKind,
     /// A `Subflow` node references a flow name not in the registry.
     UnknownFlowRef,
     /// A `Subflow` reference graph contains a cycle (RFC §4).
@@ -84,12 +80,6 @@ pub const CodegenError = error{
     /// effective names unique, but `sanitizeSymbol` is lossy, so a
     /// collision would emit two `fn` definitions with the same name.
     SymbolCollision,
-    /// A subgraph (an `OnCall` flow lowered to a `fn` — RFC §6) uses a
-    /// `GetComponent` / `SetField` node, which needs an `entity` in
-    /// scope. Subgraphs receive only declared `params` (RFC §3), so no
-    /// `entity` is available; entity-scoped nodes in a subgraph are
-    /// rejected rather than emitted against an undefined binding.
-    EntityUnavailableInSubgraph,
     /// A flow's effective name sanitizes to the bare `_` (an empty or
     /// all-non-identifier name). Zig reserves `_` as the discard
     /// identifier and rejects it as a `fn` name, so such a subgraph
@@ -511,34 +501,23 @@ fn renderEntryFunction(
 
 /// Render an `OnEvent` flow.
 ///
-/// Two forms (RFC-PLUGIN-EVENTS §7):
+/// The handler is a hook-handler-struct method (`FlowEventHandler`)
+/// named after the event's qualified tag (`box2d.collision_begin` →
+/// `box2d__collision_begin`). The method takes `(self: *@This(),
+/// payload: <PayloadType>)`; the payload type comes from
+/// `@FieldType(game.PluginEvents, "<qualified_tag>")` against the
+/// assembler's resolver (RFC-PLUGIN-EVENTS phase 1). `game` is reachable
+/// through `self.game_ptr` (the field-injection convention every
+/// shipped engine hook handler already follows —
+/// `labelle-engine/src/game.zig:419-429`), so entity-scoped nodes
+/// (`GetComponent` / `SetField`) and `Subflow` nodes work in a
+/// new-form flow the same way they do in a lifecycle flow. The entity
+/// input pin (RFC §9) is mandatory — there is no lifecycle `entity` to
+/// fall back on.
 ///
-/// 1. **New form** (`name` set). The handler is a hook-handler-struct
-///    method (`FlowEventHandler`) named after the event's qualified
-///    tag (`box2d.collision_begin` → `box2d__collision_begin`). The
-///    method takes `(self: *@This(), payload: <PayloadType>)`; the
-///    payload type comes from `@FieldType(game.PluginEvents,
-///    "<qualified_tag>")` against the assembler's resolver (phase 1).
-///    `game` is reachable through `self.game_ptr` (the
-///    field-injection convention every shipped engine hook handler
-///    already follows — `labelle-engine/src/game.zig:419-429`), so
-///    entity-scoped nodes (`GetComponent` / `SetField`) and
-///    `Subflow` nodes work in a new-form flow the same way they do
-///    in a lifecycle flow. The entity input pin (RFC §9) is
-///    mandatory — there is no lifecycle `entity` to fall back on.
-///
-/// 2. **Legacy form** (`module` + `callback` set). v1 behaviour
-///    verbatim. Emits two file-level decls — a `flowEvent` handler
-///    whose signature is the event's declared `params` verbatim (so
-///    `&flowEvent` is assignable to the plugin's `?*const fn(...)`
-///    slot) and a `pub fn setup` that installs it. The engine
-///    script-runner discovers a flow file by its `setup`
-///    (`isGameScript`) and calls it once. An `OnEvent` legacy handler
-///    is invoked straight from the plugin callback: it receives no
-///    `game` and no `entity`. Entity-scoped nodes (`GetComponent` /
-///    `SetField`) and `Subflow` nodes (their generated `fn`s take
-///    `game`) therefore cannot be lowered — both are rejected, as in
-///    a subgraph. Removed in phase 6.
+/// The v1 legacy form (`module` + `callback` + `params`) was removed
+/// in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13); a `.flow.jsonc` with
+/// the retired keys now fails to parse in `flow_io.buildEvent`.
 fn renderEventEntry(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -549,68 +528,7 @@ fn renderEventEntry(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
-    const ev = flow.event.OnEvent;
-
-    // New-form (RFC-PLUGIN-EVENTS §7) — `name` set, legacy fields null.
-    // `buildEvent` enforces exactly one form, so we can dispatch on
-    // `name != null` without re-checking the legacy fields.
-    if (ev.name) |dotted_name| {
-        return renderNewFormEventEntry(allocator, w, flow, &ctx, flow_name, dotted_name);
-    }
-
-    // Legacy form: `buildEvent` guarantees `module`+`callback` are set.
-    const module = ev.module.?;
-    const callback = ev.callback.?;
-
-    // No `game`/`entity` in scope — reject entity-scoped nodes rather
-    // than emit reads of an undefined binding. The entity-pin escape
-    // hatch added in RFC-PLUGIN-EVENTS §9 applies to lifecycle and
-    // subgraph paths only; the legacy `OnEvent` form keeps the
-    // blanket rejection until the new-form codegen lands.
-    if (anyNodeNeedsEntity(flow.nodes)) return error.EntityUnavailableInSubgraph;
-    // Subgraph `fn`s take `game`, which an OnEvent handler lacks — a
-    // `Subflow` node cannot be lowered here.
-    for (flow.nodes) |n| {
-        if (n.kind == .Subflow) return error.UnsupportedNodeKind;
-    }
-
-    // Import the plugin module that owns the callback variable.
-    try w.print("const __event_src = @import(\"{f}\");\n\n", .{std.zig.fmtString(module)});
-
-    // Handler — signature is the event params verbatim, so `&flowEvent`
-    // is assignable to the plugin's `?*const fn(...) void` slot.
-    try w.writeAll("fn flowEvent(");
-    for (ev.params, 0..) |p, i| {
-        if (i > 0) try w.writeAll(", ");
-        const name = try sanitizeSymbol(allocator, p.name);
-        defer allocator.free(name);
-        try w.print("{s}: {s}", .{ name, p.type });
-    }
-    try w.writeAll(") void {\n");
-
-    // Render the body to a buffer first, so an event param the body
-    // never reads can be discarded without a "pointless discard" of one
-    // it does (Zig 0.16 rejects both). `emit_preview = false`: the
-    // preview pulse reads `game`, which this handler has no access to.
-    var body_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer body_aw.deinit();
-    try emitBody(allocator, &body_aw.writer, &ctx, flow_name, false);
-    const body = try body_aw.toOwnedSlice();
-    defer allocator.free(body);
-
-    for (ev.params) |p| {
-        const name = try sanitizeSymbol(allocator, p.name);
-        defer allocator.free(name);
-        if (!mentionsIdent(body, name)) try w.print("    _ = {s};\n", .{name});
-    }
-    try w.writeAll(body);
-    try w.writeAll("}\n\n");
-
-    // `setup` installs the handler into the plugin's callback slot.
-    try w.writeAll("pub fn setup(game: anytype) void {\n");
-    try w.writeAll("    _ = game;\n");
-    try w.print("    __event_src.{s} = &flowEvent;\n", .{callback});
-    try w.writeAll("}\n");
+    return renderNewFormEventEntry(allocator, w, flow, &ctx, flow_name, flow.event.OnEvent.name);
 }
 
 /// Map a dotted event name (`box2d.collision_begin`) to the qualified
@@ -808,8 +726,7 @@ fn renderSubgraphFunction(
     // A subgraph has no `entity` in scope — only declared params. An
     // entity-scoped node (`GetComponent` / `SetField`) must wire its
     // `entity` input pin (RFC-PLUGIN-EVENTS §9); an unwired one is
-    // `DanglingPin` against the offending node, replacing the v1
-    // blanket `EntityUnavailableInSubgraph`. A wired one is fine —
+    // `DanglingPin` against the offending node. A wired one is fine —
     // the wired expression is what `writeNodeBody` emits as the
     // entity argument.
     try assertEntityAvailable(flow);
@@ -1491,8 +1408,9 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // fields — the assembler's resolver is the source of truth
         // (RFC-PLUGIN-EVENTS §8). The structural validator here
         // accepts any non-empty name; an unwired-or-unknown field is
-        // caught at codegen against the resolver. The resolver is
-        // pending (phase 1), so codegen errors `UnsupportedNodeKind`.
+        // caught at codegen against the generated `.{ .field = ... }`
+        // literal (Zig's compiler reports the unknown/missing field
+        // against the resolved `PluginEvents` variant type).
         .Emit => pin.len != 0,
     };
 }
@@ -1742,21 +1660,6 @@ fn assertNoParamCollision(
     }
 }
 
-/// True when some entity-scoped node (`GetComponent` / `SetField`) is
-/// present at all — independent of whether it has an entity-pin wire.
-/// Used by the lifecycle entry path to decide whether to bind the
-/// in-scope `entity` identifier (a node with a wired entity pin would
-/// not read the binding, but a sibling node without one would).
-fn anyNodeNeedsEntity(nodes: []const flow_io.Node) bool {
-    for (nodes) |n| {
-        switch (n.kind) {
-            .GetComponent, .SetField => return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
 /// True when `node` is entity-scoped and has no incoming edge on its
 /// optional `entity` input pin (RFC-PLUGIN-EVENTS §9). In a context
 /// where no `entity` identifier is in scope (an `OnCall` entry or a
@@ -1790,9 +1693,8 @@ fn anyNeedsBareEntity(flow: flow_io.Flow) bool {
 /// `OnCall` entry path and `renderSubgraphFunction` — both contexts
 /// where `entity` is not a function parameter. Returns `DanglingPin`
 /// against the first offending node so the diagnostic points at a
-/// specific `.flow.jsonc` location, replacing the v1 blanket
-/// `EntityUnavailableInSubgraph` with a per-node check that lets a
-/// flow mix wired and unwired entity-scoped nodes freely.
+/// specific `.flow.jsonc` location, per the RFC §9 per-node check that
+/// lets a flow mix wired and unwired entity-scoped nodes freely.
 fn assertEntityAvailable(flow: flow_io.Flow) CodegenError!void {
     for (flow.nodes) |n| {
         if (entityScopedAndUnwired(flow, n)) return error.DanglingPin;
