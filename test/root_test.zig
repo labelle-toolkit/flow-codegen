@@ -322,6 +322,139 @@ pub const FlowIoTests = struct {
         try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
     }
 
+    test "parses an OnEvent with a priority field" {
+        const allocator = std.testing.allocator;
+        // RFC-PLUGIN-EVENTS O4 / phase 7 (labelle-core#16): the
+        // optional `priority` hint sorts consumable-event listeners.
+        // It rides on the new-form `OnEvent` and is purely passthrough
+        // through `flow_io` — the assembler reads it to sort handler
+        // structs, codegen does not consume it.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 100 },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
+        const ev = loaded.flow.event.OnEvent;
+        try expect.toBeTrue(ev.name != null);
+        try expect.toBeTrue(ev.priority != null);
+        try expect.equal(ev.priority.?, @as(i32, 100));
+    }
+
+    test "parses an OnEvent without priority (defaults to null)" {
+        const allocator = std.testing.allocator;
+        // Absence of the on-disk `priority` key keeps `priority = null`
+        // — the "no hint" bucket the assembler treats as lowest
+        // precedence for consumable events and ignores entirely for
+        // notification events.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(loaded.flow.event.OnEvent.priority == null);
+    }
+
+    test "parses a negative priority on an OnEvent" {
+        const allocator = std.testing.allocator;
+        // Negative priorities are valid — sorts below the no-hint
+        // bucket for consumable events (a "background" listener).
+        // i32 storage is signed precisely to keep this case viable.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": -10 },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.flow.event.OnEvent.priority.?, @as(i32, -10));
+    }
+
+    test "rejects a non-integer priority on an OnEvent" {
+        const allocator = std.testing.allocator;
+        // `priority` is strictly `i32`. A string / float / bool fails
+        // parse — matches the strict-type contract every other
+        // structured field in the loader follows.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": "high" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects a priority outside the i32 range" {
+        const allocator = std.testing.allocator;
+        // 64-bit values that don't fit `i32` are rejected rather than
+        // silently wrapping — the assembler-side sort uses `i32`
+        // comparisons and a wrap would put a "10 billion" priority
+        // somewhere unexpected in the order.
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 10000000000 },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "round-trips an OnEvent priority through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        // The on-disk key order ("name" then "priority") is what
+        // `writeEvent` emits — pinning it here keeps editor re-saves
+        // diff-clean (RFC open question 3 — stable re-save).
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click", "priority": 100 },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        // Verify the rendered JSONC carries the priority key — guards
+        // against a future writer rewrite silently dropping it.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"priority\": 100") != null);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(l2.flow.event.OnEvent.priority.?, @as(i32, 100));
+
+        // Idempotent re-render.
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "omits the priority key on round-trip when unset" {
+        const allocator = std.testing.allocator;
+        // A flow with no `priority` must NOT regain one on round-trip
+        // (a default-rendered `0` would change semantics for consumable
+        // events, where 0 is a meaningful priority bucket distinct from
+        // null).
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "ui.click" },
+            \\  "nodes": [], "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "priority") == null);
+    }
+
     test "parses and round-trips an Emit node" {
         const allocator = std.testing.allocator;
         // RFC-PLUGIN-EVENTS §8: an `Emit` node fires a custom event by

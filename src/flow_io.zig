@@ -72,6 +72,25 @@ pub const Event = union(enum) {
         /// (`"box2d.collision_begin"`). When set, `module`/`callback`
         /// must be null.
         name: ?[]const u8 = null,
+        /// Optional dispatch-priority hint for **consumable** events
+        /// (RFC-PLUGIN-EVENTS O4, phase 7 — labelle-core#16). Meaningful
+        /// only when the resolved event is consumable (the payload
+        /// declares `pub const consumable = true;`); the assembler sorts
+        /// flow handlers whose `priority` is set ahead of the
+        /// scanner-sorted tail, priority-descending, so the
+        /// highest-priority listener fires first. The runtime
+        /// `MergeHooks.emit` (`labelle-core/src/dispatcher.zig`) switches
+        /// to the return-aware path automatically for consumable
+        /// variants and breaks on the first `true`-returning handler.
+        /// For notification events the assembler ignores the field — the
+        /// scanner sort holds (O3). `null` on the wire (the field omitted
+        /// from `.flow.jsonc`) means "no hint"; for a consumable event
+        /// that is the lowest-precedence bucket. Pure passthrough at
+        /// this layer: `validate` accepts the field on any `OnEvent` and
+        /// `renderEventEntry` does not consume it (the handler-struct
+        /// shape is the same — the assembler reads the priority off the
+        /// `flow_scanner` entry, not off the generated Zig).
+        priority: ?i32 = null,
         /// Legacy: `@import` name of the plugin (e.g. `"box2d"`).
         module: ?[]const u8 = null,
         /// Legacy: the exported `pub var` slot
@@ -338,6 +357,19 @@ fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
         const module_opt = try optStr(a, v.object, "module");
         const callback_opt = try optStr(a, v.object, "callback");
         const params = try buildParams(a, v.object.get("params"));
+        // Optional `priority` — RFC-PLUGIN-EVENTS O4 / phase 7
+        // (labelle-core#16). Accepted on either form; the assembler
+        // honors it only when the resolved event is consumable.
+        // A present-but-non-integer value rejects as `MalformedFlow`,
+        // matching every other strict-type field in this loader.
+        const priority_opt: ?i32 = blk: {
+            const v_pri = v.object.get("priority") orelse break :blk null;
+            if (v_pri != .integer) return error.MalformedFlow;
+            // Clamp would silently lose data; cast rejects out-of-range
+            // explicitly so an outlandish 64-bit value surfaces as a
+            // malformed flow rather than wrapping at the i32 boundary.
+            break :blk std.math.cast(i32, v_pri.integer) orelse return error.MalformedFlow;
+        };
 
         const has_new = name_opt != null;
         const has_legacy = module_opt != null and callback_opt != null;
@@ -354,6 +386,7 @@ fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
 
         return .{ .OnEvent = .{
             .name = name_opt,
+            .priority = priority_opt,
             .module = module_opt,
             .callback = callback_opt,
             .params = params,
@@ -889,6 +922,13 @@ fn writeEvent(w: anytype, ev: Event) !void {
             if (b.name) |n| {
                 try w.writeAll(", \"name\": ");
                 try writeJsonString(w, n);
+            }
+            // `priority` (RFC-PLUGIN-EVENTS O4 / phase 7) is emitted
+            // right after `name` so the on-disk key order stays in sync
+            // with the in-source struct field order; `null` is omitted
+            // (the parser treats absence as "no hint" — see `buildEvent`).
+            if (b.priority) |p| {
+                try w.print(", \"priority\": {d}", .{p});
             }
             if (b.module) |m| {
                 try w.writeAll(", \"module\": ");
