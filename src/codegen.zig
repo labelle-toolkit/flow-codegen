@@ -514,11 +514,19 @@ fn renderEntryFunction(
 /// Two forms (RFC-PLUGIN-EVENTS §7):
 ///
 /// 1. **New form** (`name` set). The handler is a hook-handler-struct
-///    method whose payload type comes from the assembler's comptime
-///    name resolver (phase 1). The resolver is not yet available, so
-///    codegen of the new form is **deferred** — `error.UnsupportedNodeKind`
-///    until the follow-up lands. The parser accepts the new form so
-///    flow files can be authored ahead of the resolver.
+///    method (`FlowEventHandler`) named after the event's qualified
+///    tag (`box2d.collision_begin` → `box2d__collision_begin`). The
+///    method takes `(self: *@This(), payload: <PayloadType>)`; the
+///    payload type comes from `@FieldType(game.PluginEvents,
+///    "<qualified_tag>")` against the assembler's resolver (phase 1).
+///    `game` is reachable through `self.game_ptr` (the
+///    field-injection convention every shipped engine hook handler
+///    already follows — `labelle-engine/src/game.zig:419-429`), so
+///    entity-scoped nodes (`GetComponent` / `SetField`) and
+///    `Subflow` nodes work in a new-form flow the same way they do
+///    in a lifecycle flow. The entity input pin (RFC §9) is
+///    mandatory — there is no lifecycle `entity` to fall back on.
+///
 /// 2. **Legacy form** (`module` + `callback` set). v1 behaviour
 ///    verbatim. Emits two file-level decls — a `flowEvent` handler
 ///    whose signature is the event's declared `params` verbatim (so
@@ -543,11 +551,12 @@ fn renderEventEntry(
 
     const ev = flow.event.OnEvent;
 
-    // New-form codegen needs the assembler's comptime name resolver
-    // (RFC-PLUGIN-EVENTS §7, phase 1 — labelle-assembler#174). Until
-    // it lands, reject loudly — the parser accepts the form so flows
-    // can be authored ahead of the resolver.
-    if (ev.name != null) return error.UnsupportedNodeKind;
+    // New-form (RFC-PLUGIN-EVENTS §7) — `name` set, legacy fields null.
+    // `buildEvent` enforces exactly one form, so we can dispatch on
+    // `name != null` without re-checking the legacy fields.
+    if (ev.name) |dotted_name| {
+        return renderNewFormEventEntry(allocator, w, flow, &ctx, flow_name, dotted_name);
+    }
 
     // Legacy form: `buildEvent` guarantees `module`+`callback` are set.
     const module = ev.module.?;
@@ -602,6 +611,165 @@ fn renderEventEntry(
     try w.writeAll("    _ = game;\n");
     try w.print("    __event_src.{s} = &flowEvent;\n", .{callback});
     try w.writeAll("}\n");
+}
+
+/// Map a dotted event name (`box2d.collision_begin`) to the qualified
+/// variant tag (`box2d__collision_begin`) the assembler emits in its
+/// `PluginEvents` union (labelle-assembler#174 — RFC-PLUGIN-EVENTS phase
+/// 1). The mapping is mechanical (replace `.` with `__`) and matches
+/// the codegen at `labelle-assembler/src/main_zig.zig:525` —
+/// `_entry.name ++ "__" ++ _d.name`. A name with no `.` is treated as a
+/// game event (declared in `events/*.zig`) and round-trips verbatim,
+/// matching the way `GameEvents` variant names are emitted bare.
+///
+/// Caller owns the returned bytes.
+fn qualifiedTagFromDotted(allocator: std.mem.Allocator, dotted: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, dotted.len + countByte(dotted, '.'));
+    var i: usize = 0;
+    for (dotted) |c| {
+        if (c == '.') {
+            out[i] = '_';
+            out[i + 1] = '_';
+            i += 2;
+        } else {
+            out[i] = c;
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Count occurrences of `c` in `s` — the shared length helper between
+/// `qualifiedTagFromDotted` (allocating) and the inline `Emit` lowering
+/// (allocating on a per-node scratch arena). Hoisted so both call sites
+/// agree on the output-length formula `s.len + countByte(s, '.')`.
+fn countByte(s: []const u8, c: u8) usize {
+    var n: usize = 0;
+    for (s) |b| if (b == c) {
+        n += 1;
+    };
+    return n;
+}
+
+/// Render the new-form `OnEvent` flow (RFC-PLUGIN-EVENTS §7, phase 3).
+///
+/// Emits a `pub const FlowEventHandler = struct { game_ptr: *anyopaque =
+/// undefined, pub fn <qualified_tag>(self: *@This(), payload: ...) void
+/// { ... } };` whose payload type is reflected from
+/// `@FieldType(game_mod.PluginEvents, "<qualified_tag>")`. The
+/// assembler discovers this struct in scanner-sorted order and appends
+/// `*FlowEventHandler` to the `GameHooks` receiver tuple (phase 4 —
+/// labelle-assembler#175, not in scope here). The engine's existing
+/// `setHooks` loop (`labelle-engine/src/game.zig:419-429`) injects the
+/// `*AssembledGame` pointer into `self.game_ptr` at init.
+///
+/// The handler body is the same topo-sorted lowering lifecycle handlers
+/// use — `game` is reachable through the downcast and entity-scoped
+/// nodes resolve their `entity` input pin (RFC §9, the entity-pin
+/// scaffold from `8e7fb7b`). No lifecycle `entity` fallback: every
+/// entity-scoped node must wire its `entity` pin explicitly, since a
+/// new-form OnEvent flow has no "the entity" — entity ids ride the
+/// payload.
+fn renderNewFormEventEntry(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    flow: flow_io.Flow,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    dotted_name: []const u8,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    const qualified = try qualifiedTagFromDotted(allocator, dotted_name);
+    defer allocator.free(qualified);
+
+    // Entity-scoped nodes inside a new-form flow MUST wire the entity
+    // pin (RFC §9 — "the entity pin is mandatory; no lifecycle `entity`
+    // fallback"). A new-form flow has `game` reachable through
+    // `game_ptr` but no in-scope `entity` identifier, so an unwired
+    // entity pin is the same `DanglingPin` case `assertEntityAvailable`
+    // already raises for `OnCall` entries and `Subflow` subgraphs.
+    try assertEntityAvailable(flow);
+
+    // Header — flow files compile in isolation, so the import of
+    // `PluginEvents` rides through the same `game_mod` (`@import("game")`)
+    // shim the existing `Game`/`EntityId` decls do. The shim re-export
+    // is the phase-3 assembler-side change paired with this codegen.
+    try w.writeAll("const PluginEvents = game_mod.PluginEvents;\n\n");
+
+    // Reflect the payload type through `@FieldType(...)`. The compiler
+    // catches an unknown tag here — a flow naming `frobnitz.foo` when
+    // no plugin declares it surfaces as a build-time error against the
+    // `PluginEvents` field set, not a missing-key in a sidecar.
+    try w.print(
+        "const __EvPayload = @FieldType(PluginEvents, \"{s}\");\n\n",
+        .{qualified},
+    );
+
+    // The handler struct. `game_ptr: *anyopaque = undefined` is the
+    // field the engine's `setHooks` loop (`game.zig:419-429`) recognizes
+    // and writes `@ptrCast(self)` into at init. The struct is named
+    // `FlowEventHandler` (not the qualified tag) so phase 4's
+    // receiver-tuple wiring can reach it through a stable symbol
+    // independent of the event name.
+    try w.writeAll("pub const FlowEventHandler = struct {\n");
+    try w.writeAll("    game_ptr: *anyopaque = undefined,\n\n");
+
+    // The dispatch method — its name IS the qualified tag, which is
+    // also the `PluginEvents` variant name and the decl name
+    // `HookDispatcher.emit` looks up on each receiver
+    // (`labelle-core/src/dispatcher.zig:99-111`). Same shape as every
+    // shipped game/plugin hook handler.
+    try w.print(
+        "    pub fn {s}(self: *@This(), payload: __EvPayload) void {{\n",
+        .{qualified},
+    );
+
+    // The `*Game` downcast — `@import("game").Game` is the engine's
+    // default `GameWith(void)` type. The runtime pointer is actually
+    // the project's `*AssembledGame`, but their layouts match for the
+    // method calls codegen emits (`getComponent` / `setField` /
+    // `emit`), the same trick the existing flow-codegen lifecycle
+    // handlers rely on by accepting `game: anytype`.
+    try w.writeAll("        const game: *Game = @ptrCast(@alignCast(self.game_ptr));\n");
+
+    // Render the body to a buffer so we can detect which of the fixed
+    // parameters (`game`, `payload`) the topo-sorted node bodies
+    // actually mention. Zig 0.16 rejects both an unused parameter
+    // *and* a pointless `_ = x;` discard of a used one — the buffer
+    // pattern is the same one `renderEntryFunction` already uses.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body_aw.deinit();
+    try emitBody(allocator, &body_aw.writer, ctx, flow_name, true);
+    const body = try body_aw.toOwnedSlice();
+    defer allocator.free(body);
+
+    // Discard the param/binding when the body never reads it.
+    if (!mentionsIdent(body, "game")) try w.writeAll("        _ = game;\n");
+    if (!mentionsIdent(body, "payload")) try w.writeAll("        _ = payload;\n");
+
+    try indentBlock(w, body, "    ");
+    try w.writeAll("    }\n");
+    try w.writeAll("};\n");
+}
+
+/// Prepend `indent` to every non-empty line in `body` so a buffered
+/// function body (rendered with the lifecycle handler's `    ` prefix)
+/// nests one more level inside the new-form handler's enclosing
+/// `pub fn <tag>` block. Empty lines stay empty so the output keeps a
+/// clean look.
+fn indentBlock(w: *std.Io.Writer, body: []const u8, indent: []const u8) !void {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        if (first) {
+            first = false;
+        } else {
+            try w.writeByte('\n');
+        }
+        if (line.len > 0) {
+            try w.writeAll(indent);
+            try w.writeAll(line);
+        }
+    }
 }
 
 fn isIdentChar(c: u8) bool {
@@ -1151,13 +1319,78 @@ fn writeNodeBody(
             try w.writeAll(");\n");
         },
         // `Emit` lowers to `game.emit(.{ .<qualified_tag> = .{...} })`
-        // (RFC-PLUGIN-EVENTS §8). The payload fields are reflected
-        // from the resolved event variant — which lives in the
-        // assembler's comptime name resolver (phase 1) and is not yet
-        // available here. The parser accepts `Emit` so flow files can
-        // be authored ahead of the resolver; codegen rejects loudly
-        // until the follow-up lands the resolver-dependent lowering.
-        .Emit => return error.UnsupportedNodeKind,
+        // (RFC-PLUGIN-EVENTS §8). The payload's field set is the set
+        // of edges wired into the node — each input pin's name is a
+        // payload field — and the qualified tag is the dotted
+        // `event` mapped mechanically (`.` → `__`) to match the
+        // `PluginEvents` variant the assembler emits
+        // (labelle-assembler#174). Buffered (`game.emit`, not
+        // `emitSync`) per RFC §4 / §8 — the default that every
+        // shipped #422 use site uses; a `sync = true` opt-in is
+        // tracked for a later phase. No output pin: statement, not
+        // expression.
+        //
+        // Field-shape validation rides through the Zig compiler — an
+        // edge wired into a pin named after a non-existent payload
+        // field surfaces as an "unknown field" error against the
+        // generated `.{ .foo = ... }` literal; a missing required
+        // field surfaces as a "missing field" error against the
+        // resolved `__EvPayload` type. The resolver IS the union, so
+        // there is no second source of truth to keep in sync.
+        .Emit => |b| {
+            const qualified = try scratch.alloc(u8, b.event.len + countByte(b.event, '.'));
+            {
+                var i: usize = 0;
+                for (b.event) |c| {
+                    if (c == '.') {
+                        qualified[i] = '_';
+                        qualified[i + 1] = '_';
+                        i += 2;
+                    } else {
+                        qualified[i] = c;
+                        i += 1;
+                    }
+                }
+            }
+
+            // Collect the wired-pin edges going into this node, in
+            // ascending-pin-name order so the emitted struct literal is
+            // deterministic (the same payload wired the same way always
+            // produces byte-identical output — matters for git diffs
+            // and Ast.parse stability).
+            var pins: std.ArrayList(*const flow_io.Edge) = .empty;
+            defer pins.deinit(scratch);
+            for (ctx.flow.edges) |*e| {
+                if (e.to.node == node.id) try pins.append(scratch, e);
+            }
+            std.mem.sort(*const flow_io.Edge, pins.items, {}, struct {
+                fn lt(_: void, lhs: *const flow_io.Edge, rhs: *const flow_io.Edge) bool {
+                    return std.mem.order(u8, lhs.to.pin, rhs.to.pin) == .lt;
+                }
+            }.lt);
+
+            // A wireless `Emit` lowers to `game.emit(.{ .<tag> = .{} });`
+            // — a payload type with no fields trivially typechecks; one
+            // with fields surfaces a "missing field" error at compile
+            // time. Same one-line shape either way so the diagnostic is
+            // sourced against the generated line, not buried in a
+            // multi-line literal.
+            if (pins.items.len == 0) {
+                try w.print(
+                    "    game.emit(.{{ .{s} = .{{}} }});\n",
+                    .{qualified},
+                );
+            } else {
+                try w.print("    game.emit(.{{ .{s} = .{{\n", .{qualified});
+                for (pins.items) |edge| {
+                    const consumer = ctx.index.byId(node.id) orelse unreachable;
+                    const expr = (try ctx.resolveInput(scratch, consumer, edge.to.pin)) orelse
+                        return error.DanglingPin;
+                    try w.print("        .{s} = {s},\n", .{ edge.to.pin, expr });
+                }
+                try w.writeAll("    } });\n");
+            }
+        },
         // A Subflow node lowers to a *call* of the referenced flow's
         // generated function (RFC §6). Each param argument is supplied
         // explicitly: wired pin → binding literal → declared default.

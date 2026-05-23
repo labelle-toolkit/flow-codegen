@@ -922,6 +922,157 @@ pub fn saveFlow(io: std.Io, allocator: std.mem.Allocator, path: []const u8, load
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
 }
 
+/// Convert a legacy `OnEvent` flow (`module` + `callback` + `params`)
+/// to the new-form `name`-resolved shape (RFC-PLUGIN-EVENTS §7,
+/// Migration §"Flow side"). Used to migrate in-tree flows once the
+/// resolver phase 1 ships; the GUI flow editor can run the same pass.
+///
+/// **Name mapping.** The dotted event name is built as
+/// `<module>.<event>` where `<event>` is the callback name with its
+/// `on_` prefix stripped — `on_collision_begin` → `collision_begin`,
+/// matching the RFC §1 rationale that the merged-union variant drops
+/// the C-callback `on_` prefix. The qualified-tag form
+/// (`<plugin>__<event>`) is mechanical from there (`.` → `__`) and
+/// resolved at codegen against `@FieldType(PluginEvents, ...)`.
+///
+/// **Validation.** flow-codegen runs without a `PluginEvents` handle —
+/// validation against the discovered plugin event set is the codegen
+/// step's job, surfacing as a Zig compile error if the rewritten
+/// `name` doesn't match a variant. The converter rejects only the
+/// structural-error cases:
+///
+///   - the input flow's event is not `OnEvent` (`error.NotOnEvent`)
+///   - the `OnEvent` is already in the new form
+///     (`error.OnEventAlreadyNew`) — no conversion needed
+///   - the `callback` is empty after stripping the `on_` prefix
+///     (`error.MalformedCallback`) — `"on_"` itself maps to nothing
+///
+/// **Ownership.** The returned `LoadedFlow` owns its own arena; the
+/// input is **not** consumed (caller still owns + frees it).
+pub const ConvertError = error{
+    NotOnEvent,
+    OnEventAlreadyNew,
+    MalformedCallback,
+};
+
+pub fn legacy_onevent_to_name(
+    allocator: std.mem.Allocator,
+    input: LoadedFlow,
+) (ConvertError || std.mem.Allocator.Error)!LoadedFlow {
+    if (input.flow.event != .OnEvent) return error.NotOnEvent;
+    const ev = input.flow.event.OnEvent;
+    if (ev.name != null) return error.OnEventAlreadyNew;
+
+    // `buildEvent` guarantees `module` + `callback` set on the legacy
+    // form. The converter has both available as required input — a
+    // partial-legacy shape would have failed `buildEvent` already.
+    const module = ev.module orelse return error.MalformedCallback;
+    const callback = ev.callback orelse return error.MalformedCallback;
+
+    // `on_collision_begin` → `collision_begin` (RFC §1 — the merged-
+    // union variant name drops the C-callback `on_` prefix). Plugins
+    // that didn't follow the convention pass through verbatim — a
+    // callback named e.g. `physics_started` keeps that name and any
+    // mismatch surfaces at codegen against `PluginEvents`.
+    const event_stem = if (std.mem.startsWith(u8, callback, "on_"))
+        callback[3..]
+    else
+        callback;
+    if (event_stem.len == 0) return error.MalformedCallback;
+
+    // Build the new arena. Cloning everything keeps the input
+    // `LoadedFlow` untouched so the caller can free it on its own
+    // schedule.
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const dotted_name = try std.fmt.allocPrint(a, "{s}.{s}", .{ module, event_stem });
+
+    // Deep-copy nodes/edges/params into the new arena so the resulting
+    // `LoadedFlow` has no lifetime ties back to the input.
+    const new_name = if (input.flow.name.len > 0) try a.dupe(u8, input.flow.name) else "";
+    const new_params = try cloneParams(a, input.flow.params);
+    const new_nodes = try cloneNodes(a, input.flow.nodes);
+    const new_edges = try cloneEdges(a, input.flow.edges);
+
+    const new_flow: Flow = .{
+        .name = new_name,
+        .event = .{ .OnEvent = .{
+            .name = dotted_name,
+            .module = null,
+            .callback = null,
+            .params = &.{},
+        } },
+        .params = new_params,
+        .nodes = new_nodes,
+        .edges = new_edges,
+    };
+
+    return .{ .arena = arena, .flow = new_flow };
+}
+
+fn cloneParams(a: std.mem.Allocator, src: []const Param) ![]Param {
+    const out = try a.alloc(Param, src.len);
+    for (src, 0..) |p, i| {
+        out[i] = .{
+            .name = try a.dupe(u8, p.name),
+            .type = try a.dupe(u8, p.type),
+            .default = if (p.default) |d| .{ .zig_text = try a.dupe(u8, d.zig_text) } else null,
+        };
+    }
+    return out;
+}
+
+fn cloneNodes(a: std.mem.Allocator, src: []const Node) ![]Node {
+    const out = try a.alloc(Node, src.len);
+    for (src, 0..) |n, i| {
+        out[i] = .{
+            .id = n.id,
+            .pos = n.pos,
+            .kind = try cloneNodeKind(a, n.kind),
+        };
+    }
+    return out;
+}
+
+fn cloneNodeKind(a: std.mem.Allocator, k: NodeKind) !NodeKind {
+    return switch (k) {
+        .GetComponent => |b| .{ .GetComponent = .{ .type = try a.dupe(u8, b.type) } },
+        .SetField => |b| .{ .SetField = .{ .target = try a.dupe(u8, b.target) } },
+        .BinOp => |b| .{ .BinOp = .{ .op = b.op } },
+        .Literal => |b| .{ .Literal = .{ .value = try a.dupe(u8, b.value) } },
+        .Identifier => |b| .{ .Identifier = .{ .name = try a.dupe(u8, b.name) } },
+        .Call => |b| .{ .Call = .{ .callee = try a.dupe(u8, b.callee) } },
+        .Param => |b| .{ .Param = .{ .param = try a.dupe(u8, b.param) } },
+        .Output => |b| .{ .Output = .{ .name = try a.dupe(u8, b.name), .type = try a.dupe(u8, b.type) } },
+        .Subflow => |b| blk: {
+            const bindings = try a.alloc(Binding, b.bindings.len);
+            for (b.bindings, 0..) |bd, i| {
+                bindings[i] = .{
+                    .param = try a.dupe(u8, bd.param),
+                    .value = .{ .zig_text = try a.dupe(u8, bd.value.zig_text) },
+                };
+            }
+            break :blk .{ .Subflow = .{ .flow = try a.dupe(u8, b.flow), .bindings = bindings } };
+        },
+        .Emit => |b| .{ .Emit = .{ .event = try a.dupe(u8, b.event) } },
+    };
+}
+
+fn cloneEdges(a: std.mem.Allocator, src: []const Edge) ![]Edge {
+    const out = try a.alloc(Edge, src.len);
+    for (src, 0..) |e, i| {
+        out[i] = .{
+            .from = .{ .node = e.from.node, .pin = try a.dupe(u8, e.from.pin) },
+            .to = .{ .node = e.to.node, .pin = try a.dupe(u8, e.to.pin) },
+        };
+    }
+    return out;
+}
+
 /// Strip the trailing `.flow.jsonc` double extension from a path's
 /// basename and return the stem (RFC §5 — basename-as-effective-name).
 /// e.g. `"scripts/flows/move.flow.jsonc"` → `"move"`. Falls back to the

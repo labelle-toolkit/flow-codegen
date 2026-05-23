@@ -42,4 +42,29 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = zspec_dep.path("src/runner.zig"), .mode = .simple },
     });
     test_step.dependOn(&b.addRunArtifact(root_tests).step);
+
+    // `convert` step — drives `flow_io.legacy_onevent_to_name` over a
+    // single `.flow.jsonc` file (Migration "Flow side", RFC-PLUGIN-
+    // EVENTS §7). Lets in-tree flows be migrated without standing up a
+    // full editor pass.
+    //
+    //   zig build convert -- <path/to/foo.flow.jsonc>
+    //
+    // Idempotent — a file already on the new form is reported and left
+    // alone.
+    const convert_exe = b.addExecutable(.{
+        .name = "convert_legacy_onevent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/convert_legacy_onevent.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "flow_codegen", .module = flow_codegen_module },
+            },
+        }),
+    });
+    const convert_run = b.addRunArtifact(convert_exe);
+    if (b.args) |args| convert_run.addArgs(args);
+    const convert_step = b.step("convert", "Convert a legacy OnEvent .flow.jsonc to the new name form");
+    convert_step.dependOn(&convert_run.step);
 }
