@@ -211,6 +211,20 @@ pub const NodeKind = union(enum) {
     /// variable operations). Output pin `value` of type `bool`, lowering
     /// to `<var> != null`. Same nullability check as `ClearVariable`.
     HasValueVariable: struct { name: []const u8 },
+    /// `CustomNode` — plugin- or game-script-declared flow node
+    /// (RFC-FLOW-VOCABULARY §1 + §5). References an entry in the
+    /// assembler-emitted `PluginFlowNodes` registry by dotted name
+    /// (`"box2d.apply_impulse"`, `"my_helpers.print_score"`). The
+    /// assembler's resolver maps the dotted form to the qualified
+    /// `<module>__<name>` decl on `game_mod.PluginFlowNodes`; codegen
+    /// reflects on that decl's `impl` to derive the function's
+    /// signature — input pins by position (excluding the first
+    /// `game: anytype` param), output pin from the return type
+    /// (or no output for `void` impls).
+    ///
+    /// `validate` accepts any non-empty name; codegen rejects unknown
+    /// names against the registry as `UnknownFlowNode`.
+    CustomNode: struct { name: []const u8 },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -697,6 +711,14 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         return .{ .ClearVariable = .{ .name = try reqStr(a, o, "name") } };
     } else if (std.mem.eql(u8, type_name, "HasValueVariable")) {
         return .{ .HasValueVariable = .{ .name = try reqStr(a, o, "name") } };
+    } else if (std.mem.eql(u8, type_name, "CustomNode")) {
+        // RFC-FLOW-VOCABULARY §1 — plugin-declared verb. The dotted
+        // `name` (`"box2d.apply_impulse"`) is resolved at codegen
+        // against `game_mod.PluginFlowNodes`; here we only require
+        // the field is present and non-empty.
+        const name = try reqStr(a, o, "name");
+        if (name.len == 0) return error.MalformedFlow;
+        return .{ .CustomNode = .{ .name = name } };
     }
     return error.UnknownNodeType;
 }
@@ -1143,6 +1165,10 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"name\": ");
             try writeJsonString(w, b.name);
         },
+        .CustomNode => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
     }
 }
 
@@ -1201,6 +1227,158 @@ pub fn saveFlow(io: std.Io, allocator: std.mem.Allocator, path: []const u8, load
     const text = try renderFlowJsonc(allocator, loaded);
     defer allocator.free(text);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
+}
+
+// =====================================================================
+// Legacy v1 → v2 conversion (RFC-FLOW-VOCABULARY §3 Migration —
+// flow-codegen#15 item 4)
+// =====================================================================
+
+/// Result of a `convertLegacyV1ToV2` call — what the converter did.
+pub const ConvertOutcome = enum {
+    /// Input was a v1 file (`event: { OnEvent, ... }` header, no Event
+    /// node) — the loader synthesized the Event node and rewrote the
+    /// file. The returned `LoadedFlow` is the v2 form.
+    converted,
+    /// Input was already a v2 file (carries an in-graph Event node).
+    /// The loader returns the parsed flow unchanged — re-saving it is
+    /// idempotent (byte-identical bytes when re-rendered through
+    /// `renderFlowJsonc`).
+    already_v2,
+};
+
+/// Errors specific to legacy-flow conversion. `convertLegacyV1ToV2`
+/// returns these alongside the usual `ParseError` set.
+pub const ConvertError = error{
+    /// The flow's legacy `event:` header is not an `OnEvent` variant —
+    /// the Event-node form only models `OnEvent` triggers. Lifecycle
+    /// events (`OnCreate` / `OnUpdate` / `OnDestroy`) and `OnCall`
+    /// subgraphs remain on the header form; the engine doesn't yet
+    /// expose them as `pub const Events`, so an Event-node-form
+    /// rewrite would name a trigger the assembler cannot resolve.
+    NonOnEventLegacyHeader,
+};
+
+/// Convert a v1 `.flow.jsonc` (legacy `event:` header) to a v2
+/// `.flow.jsonc` (in-graph `Event` node). Idempotent on already-v2
+/// files. Lifecycle events (`OnCreate` / `OnUpdate` / `OnDestroy`) and
+/// `OnCall` subgraphs are not Event-node-compatible — they surface
+/// `NonOnEventLegacyHeader`. The caller frees the returned
+/// `LoadedFlow` via `deinit()` as usual.
+///
+/// Operation:
+/// 1. Parse `raw` via `parseFlow` — this already rejects
+///    `ConflictingEventSource` (both header AND Event node) and the
+///    no-source case.
+/// 2. If the parsed flow already carries an `Event` node in `nodes`,
+///    return it unchanged (`already_v2`).
+/// 3. Otherwise the flow has a header-form event. If it's not
+///    `OnEvent`, surface `NonOnEventLegacyHeader`.
+/// 4. Synthesize an `Event` node at `[0, 0]` carrying the dotted
+///    `name`; shift every existing node's position by `[+200, 0]` to
+///    leave room; copy edges unchanged.
+///
+/// The returned `LoadedFlow`'s arena owns every synthesized slice and
+/// the duplicated existing-node payloads. Call `saveFlow` to write
+/// the converted file back to disk.
+pub fn convertLegacyV1ToV2(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    outcome_out: *ConvertOutcome,
+) (ParseError || ConvertError || std.mem.Allocator.Error || std.Io.Writer.Error)!LoadedFlow {
+    var loaded = try parseFlow(allocator, raw);
+    errdefer loaded.deinit();
+
+    // Already v2 — at least one in-graph Event node.
+    var has_event_node = false;
+    for (loaded.flow.nodes) |n| if (n.kind == .Event) {
+        has_event_node = true;
+        break;
+    };
+    if (has_event_node) {
+        outcome_out.* = .already_v2;
+        return loaded;
+    }
+
+    // The header form must be `OnEvent` to lower to an Event node;
+    // lifecycle triggers stay on the header form per the RFC migration
+    // section.
+    if (loaded.flow.event != .OnEvent) {
+        return error.NonOnEventLegacyHeader;
+    }
+    // An `OnEvent` header with a null name is malformed (the loader
+    // already rejects it in `buildEvent`), so the unwrap is safe.
+    const ev_name = loaded.flow.event.OnEvent.name.?;
+
+    // Rewrite into a v2 form: synthesize an Event node at [0, 0],
+    // shift existing nodes by [+200, 0], drop the header. Everything
+    // is reallocated on the loaded arena so the returned LoadedFlow
+    // owns it.
+    const a = loaded.arena.allocator();
+    const new_nodes = try a.alloc(Node, loaded.flow.nodes.len + 1);
+    new_nodes[0] = .{
+        .id = nextUnusedNodeId(loaded.flow.nodes),
+        .pos = .{ 0, 0 },
+        .kind = .{ .Event = .{ .name = try a.dupe(u8, ev_name) } },
+    };
+    for (loaded.flow.nodes, 0..) |n, i| {
+        new_nodes[i + 1] = .{
+            .id = n.id,
+            .pos = .{ n.pos[0] + 200, n.pos[1] },
+            .kind = n.kind,
+        };
+    }
+    loaded.flow.nodes = new_nodes;
+
+    // Re-validate the rewritten flow — catches a structurally
+    // surprising input we hadn't anticipated (e.g. a duplicate id
+    // collision with the synthesized Event node, though
+    // `nextUnusedNodeId` guards against that).
+    try validate(loaded.flow);
+
+    outcome_out.* = .converted;
+    return loaded;
+}
+
+/// First node id not already used in `nodes` — picks the smallest
+/// positive value (1, 2, …) that's free. The synthesized Event node
+/// reserves an id that won't collide with the existing graph.
+fn nextUnusedNodeId(nodes: []const Node) u32 {
+    var candidate: u32 = 1;
+    while (true) : (candidate += 1) {
+        var used = false;
+        for (nodes) |n| if (n.id == candidate) {
+            used = true;
+            break;
+        };
+        if (!used) return candidate;
+    }
+}
+
+/// Read a `.flow.jsonc` from disk, convert it via
+/// `convertLegacyV1ToV2`, and write it back to the same path on
+/// success. `outcome_out` distinguishes a rewritten file from an
+/// idempotent no-op so callers can log the result. A
+/// `NonOnEventLegacyHeader` flow is left on disk unchanged (the
+/// caller logs and continues).
+pub fn convertLegacyFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    outcome_out: *ConvertOutcome,
+) !void {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(raw);
+
+    var loaded = try convertLegacyV1ToV2(allocator, raw, outcome_out);
+    defer loaded.deinit();
+
+    // Always save: on `.converted` we write the new form; on
+    // `.already_v2` we write canonical re-formatted bytes (idempotent
+    // — byte-identical on the second run). The single-write code path
+    // keeps tests simpler and matches the "canonical re-save" semantics
+    // already in `saveFlow`.
+    try saveFlow(io, allocator, path, loaded);
 }
 
 /// Strip the trailing `.flow.jsonc` double extension from a path's

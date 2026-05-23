@@ -2807,3 +2807,578 @@ pub const FlowVocabularyTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "__EvPayload_") == null);
     }
 };
+
+// =====================================================================
+// RFC-FLOW-VOCABULARY §1 + §5 — CustomNode (plugin / game-script
+// FlowNodes) (flow-codegen#15 item 2)
+// =====================================================================
+
+pub const CustomNodeTests = struct {
+    /// Build a `CustomNodeRegistry` populated with `(dotted, qualified,
+    /// is_void)` triples. Caller owns the returned registry.
+    fn buildRegistry(
+        allocator: std.mem.Allocator,
+        entries: []const struct { dotted: []const u8, qualified: []const u8, is_void: bool },
+    ) !flow_codegen.CustomNodeRegistry {
+        var reg = flow_codegen.CustomNodeRegistry.init(allocator);
+        errdefer reg.deinit();
+        for (entries) |e| {
+            try reg.add(e.dotted, .{ .qualified = e.qualified, .is_void = e.is_void });
+        }
+        return reg;
+    }
+
+    test "round-trips a CustomNode through renderFlowJsonc" {
+        // RFC-FLOW-VOCABULARY §1 — on-disk shape `{ "type":
+        // "CustomNode", "name": "<dotted>", "pos": [...] }`. The parser,
+        // validator, and writer all agree on the one-field payload.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "uses_custom",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [120, 40] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .CustomNode);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[0].kind.CustomNode.name, "box2d.apply_impulse"));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .CustomNode);
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.CustomNode.name, "box2d.apply_impulse"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "rejects a CustomNode with no name field" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "CustomNode", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "rejects a CustomNode with an empty name" {
+        // Validation rule: any non-empty name is accepted at parse time;
+        // codegen resolves it against the registry. An empty name is
+        // structurally malformed — no plugin can declare a zero-length
+        // dotted entry.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [ { "id": 1, "type": "CustomNode", "name": "", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "codegen lowers a value-returning CustomNode (reporter form)" {
+        // The impl returns a value — codegen binds the result to
+        // `n<id>_value` so downstream pins can wire from it.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "reporter_use",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
+            \\    { "id": 3, "type": "CustomNode", "name": "my_helpers.score", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "arg0" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "arg1" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "my_helpers.score", .qualified = "my_helpers__score", .is_void = false },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "reporter_use", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        // Reporter shape: binds result to `n3_value`, qualified decl
+        // path, both arg pins resolve to their wired producers.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game, n1_value, n2_value);") != null);
+    }
+
+    test "codegen lowers a void-returning CustomNode (command form)" {
+        // The impl returns void — codegen emits a bare statement, no
+        // `const n<id>_value = ...` binding.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "command_use",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
+            \\    { "id": 2, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "box2d.apply_impulse", .qualified = "box2d__apply_impulse", .is_void = true },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "command_use", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        // Command shape: bare statement (no `const n2_value =` binding).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game_mod.PluginFlowNodes.box2d__apply_impulse.impl(game, n1_value);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value =") == null);
+        // No discard line — there is no `n2_value` to discard.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n2_value;") == null);
+    }
+
+    test "codegen rejects unknown CustomNode name with UnknownFlowNode" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "unknown_use",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "nonexistent.thing", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        // Empty registry — every reference is unknown.
+        var reg = flow_codegen.CustomNodeRegistry.init(allocator);
+        defer reg.deinit();
+
+        try std.testing.expectError(
+            error.UnknownFlowNode,
+            flow_codegen.renderFlowZig(
+                allocator,
+                loaded.flow,
+                .{ .flow_name = "unknown_use", .custom_nodes = &reg },
+            ),
+        );
+    }
+
+    test "codegen rejects CustomNode when no registry is supplied" {
+        // `custom_nodes = null` means "no registry" — every CustomNode
+        // reference is unknown. Same diagnostic as an empty registry.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "no_reg",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        try std.testing.expectError(
+            error.UnknownFlowNode,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "no_reg" }),
+        );
+    }
+
+    test "Event + CustomNode flow emits FlowEventHandler + plugin call" {
+        // RFC integration — an `Event` node trigger + a value-returning
+        // `CustomNode` lower together: the handler struct is emitted as
+        // for any new-form `OnEvent` flow, and the body inlines the
+        // plugin call.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "log_hits",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
+            \\    { "id": 2, "type": "CustomNode", "name": "my_helpers.log_it", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "my_helpers.log_it", .qualified = "my_helpers__log_it", .is_void = true },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "log_hits", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        // The handler struct + dispatch method are emitted as usual.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub const FlowEventHandler = struct") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn box2d__collision_begin(self: *@This()") != null);
+        // The void CustomNode body — bare statement, no result binding.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game_mod.PluginFlowNodes.my_helpers__log_it.impl(game);") != null);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "value-returning CustomNode chains into a downstream consumer" {
+        // The reporter shape is "useful" precisely because its result
+        // can be wired into another node. Confirm the chain compiles:
+        // CustomNode → BinOp → discard.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "chain",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "my_helpers.score", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "BinOp", "op": "add", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "my_helpers.score", .qualified = "my_helpers__score", .is_void = false },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "chain", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value + n2_value;") != null);
+    }
+
+    // =====================================================================
+    // RFC-FLOW-VOCABULARY §3 Migration — v1 → v2 converter
+    // (flow-codegen#15 item 4)
+    // =====================================================================
+
+    test "convertLegacyV1ToV2 rewrites a v1 OnEvent header into an Event node" {
+        // RFC-FLOW-VOCABULARY §3 Migration — a legacy `event: { type:
+        // OnEvent, name: ... }` header rewrites into an in-graph
+        // `Event` node carrying the same dotted name. Existing nodes
+        // shift by +200 on the x axis to leave canvas room.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [100, 50] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        var converted = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
+        defer converted.deinit();
+
+        try expect.equal(outcome, flow_io.ConvertOutcome.converted);
+
+        // Two nodes: synthesized Event + the existing Literal.
+        try expect.equal(converted.flow.nodes.len, @as(usize, 2));
+
+        // Locate the Event + Literal nodes (the synthesized Event got
+        // id 2 — `nextUnusedNodeId` picks the smallest free positive id;
+        // id 1 is taken by the Literal).
+        var event_node: ?flow_io.Node = null;
+        var literal_node: ?flow_io.Node = null;
+        for (converted.flow.nodes) |n| switch (n.kind) {
+            .Event => event_node = n,
+            .Literal => literal_node = n,
+            else => {},
+        };
+        try expect.toBeTrue(event_node != null);
+        try expect.toBeTrue(literal_node != null);
+
+        try expect.toBeTrue(std.mem.eql(u8, event_node.?.kind.Event.name, "box2d.collision_begin"));
+        // Synthesized Event sits at [0, 0]; existing node shifted by [+200, 0].
+        try expect.equal(event_node.?.pos[0], @as(f32, 0));
+        try expect.equal(event_node.?.pos[1], @as(f32, 0));
+        try expect.equal(literal_node.?.pos[0], @as(f32, 300));
+        try expect.equal(literal_node.?.pos[1], @as(f32, 50));
+
+        // The converted flow's resolved trigger is still `OnEvent` —
+        // `buildFlow` synthesizes it from the first Event node by
+        // document order (matches the codegen path).
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), converted.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, converted.flow.event.OnEvent.name.?, "box2d.collision_begin"));
+    }
+
+    test "convertLegacyV1ToV2 is a no-op on an already-v2 file" {
+        // A flow that already carries an in-graph `Event` node is
+        // already on the v2 form — the converter returns it unchanged
+        // and reports `already_v2`. A subsequent render is byte-identical.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "v2_flow",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "x.y", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 1, "pos": [200, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        var loaded = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
+        defer loaded.deinit();
+        try expect.equal(outcome, flow_io.ConvertOutcome.already_v2);
+
+        // Same number of nodes — no synthesized Event was added.
+        try expect.equal(loaded.flow.nodes.len, @as(usize, 2));
+
+        // Round-trip through the renderer produces byte-identical
+        // output on a second pass — proves canonical-form idempotence.
+        const first = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(first);
+        var reparsed = try flow_io.parseFlow(allocator, first);
+        defer reparsed.deinit();
+        const second = try flow_io.renderFlowJsonc(allocator, reparsed);
+        defer allocator.free(second);
+        try expect.toBeTrue(std.mem.eql(u8, first, second));
+    }
+
+    test "convertLegacyV1ToV2 rejects a file with both header AND Event node" {
+        // The both-set case is caught by `buildFlow` before the
+        // converter sees it — surfaces as the canonical
+        // `ConflictingEventSource` rather than a converter-specific
+        // diagnostic.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "x.y" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "x.y", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        try std.testing.expectError(
+            error.ConflictingEventSource,
+            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
+        );
+    }
+
+    test "convertLegacyV1ToV2 rejects a lifecycle OnCreate header" {
+        // Lifecycle events aren't yet Event-node-compatible (the engine
+        // doesn't expose them as `pub const Events`); the converter
+        // refuses to rewrite them and leaves the file unchanged.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        try std.testing.expectError(
+            error.NonOnEventLegacyHeader,
+            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
+        );
+    }
+
+    test "convertLegacyV1ToV2 rejects a lifecycle OnUpdate header" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnUpdate", "arg_dt": "dt" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        try std.testing.expectError(
+            error.NonOnEventLegacyHeader,
+            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
+        );
+    }
+
+    test "convertLegacyV1ToV2 rejects an OnCall subgraph header" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        try std.testing.expectError(
+            error.NonOnEventLegacyHeader,
+            flow_io.convertLegacyV1ToV2(allocator, src, &outcome),
+        );
+    }
+
+    test "convertLegacyV1ToV2 preserves edges intact" {
+        // A v1 flow with edges between existing nodes must keep those
+        // edges unchanged across the rewrite — only positions shift.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "a.b" },
+            \\  "nodes": [
+            \\    { "id": 5, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 6, "type": "Literal", "value": 2, "pos": [100, 0] },
+            \\    { "id": 7, "type": "BinOp", "op": "add", "pos": [200, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 7, "pin": "a" } },
+            \\    { "from": { "node": 6, "pin": "value" }, "to": { "node": 7, "pin": "b" } }
+            \\  ]
+            \\}
+        ;
+        var outcome: flow_io.ConvertOutcome = undefined;
+        var converted = try flow_io.convertLegacyV1ToV2(allocator, src, &outcome);
+        defer converted.deinit();
+        try expect.equal(outcome, flow_io.ConvertOutcome.converted);
+        try expect.equal(converted.flow.edges.len, @as(usize, 2));
+        // Edges reference the same node ids — synthesized Event node
+        // picked the smallest free id, leaving 5/6/7 untouched.
+        try expect.equal(converted.flow.edges[0].from.node, @as(u32, 5));
+        try expect.equal(converted.flow.edges[0].to.node, @as(u32, 7));
+        try expect.equal(converted.flow.edges[1].from.node, @as(u32, 6));
+        try expect.equal(converted.flow.edges[1].to.node, @as(u32, 7));
+    }
+
+    test "convertLegacyV1ToV2 + saveFlow + parseFlow round trip via tmpDir" {
+        // End-to-end: a v1 file on disk converts, the on-disk bytes
+        // reparse cleanly via the standard `parseFlow` path, and a
+        // second `convertLegacyFile` call is the canonical no-op.
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+        const path = try std.fs.path.join(allocator, &.{ dir, "legacy.flow.jsonc" });
+        defer allocator.free(path);
+
+        // Write v1 source.
+        const v1_src =
+            \\{
+            \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 7, "pos": [50, 50] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = v1_src });
+
+        var first_outcome: flow_io.ConvertOutcome = undefined;
+        try flow_io.convertLegacyFile(std.testing.io, allocator, path, &first_outcome);
+        try expect.equal(first_outcome, flow_io.ConvertOutcome.converted);
+
+        // The on-disk file is now a v2 flow — load + verify.
+        var loaded_v2 = try flow_io.loadFromFile(std.testing.io, allocator, path);
+        defer loaded_v2.deinit();
+        var saw_event_node = false;
+        for (loaded_v2.flow.nodes) |n| if (n.kind == .Event) {
+            saw_event_node = true;
+            try expect.toBeTrue(std.mem.eql(u8, n.kind.Event.name, "box2d.collision_begin"));
+        };
+        try expect.toBeTrue(saw_event_node);
+
+        // Second pass — already_v2, byte-identical output.
+        const bytes_before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
+        defer allocator.free(bytes_before);
+        var second_outcome: flow_io.ConvertOutcome = undefined;
+        try flow_io.convertLegacyFile(std.testing.io, allocator, path, &second_outcome);
+        try expect.equal(second_outcome, flow_io.ConvertOutcome.already_v2);
+        const bytes_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
+        defer allocator.free(bytes_after);
+        try expect.toBeTrue(std.mem.eql(u8, bytes_before, bytes_after));
+    }
+
+    test "value-returning CustomNode with no consumer emits a discard" {
+        // RFC §6 — the reporter shape binds `n<id>_value`. If no
+        // downstream edge consumes it, `discardUnconsumedResult` adds
+        // `_ = n<id>_value;` so Zig doesn't surface an "unused local
+        // constant" error against the codegen output.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "unused_reporter",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "CustomNode", "name": "my_helpers.score", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "my_helpers.score", .qualified = "my_helpers__score", .is_void = false },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "unused_reporter", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n1_value;") != null);
+    }
+};

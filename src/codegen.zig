@@ -52,6 +52,16 @@ const components_import_path_fmt = "../../components/{s}.zig";
 /// Caller-facing configuration for a single-flow render.
 pub const Options = struct {
     flow_name: []const u8,
+    /// Optional registry of plugin / game-script `FlowNodes`
+    /// (RFC-FLOW-VOCABULARY §1 + §5). Required when the flow uses
+    /// `CustomNode` nodes — codegen consults the registry to map
+    /// dotted names to qualified `PluginFlowNodes` decls and to pick
+    /// the command-vs-reporter lowering shape per the impl's return
+    /// type. `null` is equivalent to an empty registry: a flow with no
+    /// `CustomNode` nodes renders unchanged; any `CustomNode` reference
+    /// is rejected as `UnknownFlowNode`. The assembler fills this from
+    /// its phase-2 discovery walk; tests construct it inline.
+    custom_nodes: ?*const CustomNodeRegistry = null,
 };
 
 /// Codegen-side failure modes.
@@ -90,6 +100,13 @@ pub const CodegenError = error{
     /// lifecycle `dt` / `entity` arg) — the emitted signature would
     /// have duplicate parameter identifiers.
     ParamNameCollision,
+    /// A `CustomNode` (RFC-FLOW-VOCABULARY §1) names a dotted entry
+    /// that is not registered in the `CustomNodeRegistry` passed to
+    /// `renderFlowZig` / `renderFlowFile`. The assembler-emitted
+    /// `PluginFlowNodes` registry is the source of truth at build
+    /// time; an unknown name surfaces here at codegen rather than as
+    /// a deferred Zig compile error against the missing decl.
+    UnknownFlowNode,
 };
 
 // =====================================================================
@@ -126,6 +143,67 @@ pub const FlowRegistry = struct {
 
     pub fn get(self: *const FlowRegistry, name: []const u8) ?flow_io.Flow {
         return self.map.get(name);
+    }
+};
+
+// =====================================================================
+// CustomNode registry — name-keyed metadata for plugin / game-script
+// FlowNodes (RFC-FLOW-VOCABULARY §1 + §5, flow-codegen#15 item 2)
+// =====================================================================
+
+/// One entry per discoverable plugin / game-script `FlowNode`. Built by
+/// the assembler from its `PluginFlowNodes` walk (labelle-assembler
+/// phase 2, RFC §2) and passed to `renderFlowFile` so codegen can:
+///
+/// - reject `CustomNode` references to unknown names as
+///   `error.UnknownFlowNode` rather than deferring to a vaguer Zig
+///   compile error against the missing decl;
+/// - emit the **command** lowering (a bare statement) for `void`
+///   impls vs the **reporter** lowering (`const n<id>_value = ...;`)
+///   for value-returning impls (RFC §6 — command vs reporter shape).
+///
+/// The reflection on the `impl` decl happens once at assembler time;
+/// flow-codegen consumes the precomputed `is_void` flag here. The
+/// registry borrows its string slices from the caller.
+pub const CustomNodeEntry = struct {
+    /// Qualified decl name as it appears on `game_mod.PluginFlowNodes`
+    /// (`"box2d__apply_impulse"`). Used directly in the emitted call
+    /// site. The dotted form (`"box2d.apply_impulse"`) is what the
+    /// `.flow.jsonc` author writes; the assembler maps the two via
+    /// `PluginFlowNodes.resolve(...)`.
+    qualified: []const u8,
+    /// True when the impl's return type is `void` — codegen emits a
+    /// bare statement; false when it returns a value — codegen binds
+    /// the result to `n<id>_value`. RFC §6 ("Command vs reporter
+    /// visual" — defaulted from `impl`'s return type).
+    is_void: bool,
+};
+
+/// A flat, name-keyed registry of `CustomNode` entries. Empty by
+/// default (`CustomNodeRegistry.empty(allocator)`) so callers that
+/// don't use `CustomNode` nodes — every pre-RFC-FLOW-VOCABULARY-§1
+/// flow — keep an unchanged call signature; an empty registry simply
+/// rejects every `CustomNode` reference as `UnknownFlowNode`.
+pub const CustomNodeRegistry = struct {
+    map: std.StringHashMap(CustomNodeEntry),
+
+    pub fn init(allocator: std.mem.Allocator) CustomNodeRegistry {
+        return .{ .map = std.StringHashMap(CustomNodeEntry).init(allocator) };
+    }
+
+    pub fn deinit(self: *CustomNodeRegistry) void {
+        self.map.deinit();
+    }
+
+    /// Register `entry` under its dotted name (`"box2d.apply_impulse"`).
+    /// Borrows the slices on `entry` from the caller; the assembler's
+    /// arena holds them for the lifetime of the codegen call.
+    pub fn add(self: *CustomNodeRegistry, dotted: []const u8, entry: CustomNodeEntry) !void {
+        try self.map.put(dotted, entry);
+    }
+
+    pub fn get(self: *const CustomNodeRegistry, dotted: []const u8) ?CustomNodeEntry {
+        return self.map.get(dotted);
     }
 };
 
@@ -346,12 +424,12 @@ pub fn renderFlowFile(
     }
 
     // Entry flow → its event `pub fn`.
-    try renderEntryFunction(allocator, w, entry, registry, options.flow_name);
+    try renderEntryFunction(allocator, w, entry, registry, options.custom_nodes, options.flow_name);
 
     // Subgraphs → one `fn` each (RFC §6).
     for (subgraphs.items) |sg| {
         try w.writeAll("\n");
-        try renderSubgraphFunction(allocator, w, sg, registry);
+        try renderSubgraphFunction(allocator, w, sg, registry, options.custom_nodes);
     }
 
     return aw.toOwnedSlice();
@@ -387,15 +465,16 @@ fn renderEntryFunction(
     w: *std.Io.Writer,
     flow: flow_io.Flow,
     registry: *const FlowRegistry,
+    custom_nodes: ?*const CustomNodeRegistry,
     flow_name: []const u8,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     // An `OnEvent` flow has a different shape from the lifecycle events
     // — a plugin-callback handler plus a `setup` that installs it —
     // so it has its own renderer.
     if (flow.event == .OnEvent)
-        return renderEventEntry(allocator, w, flow, registry, flow_name);
+        return renderEventEntry(allocator, w, flow, registry, custom_nodes, flow_name);
 
-    var ctx = try GraphContext.init(allocator, flow, registry);
+    var ctx = try GraphContext.init(allocator, flow, registry, custom_nodes);
     defer ctx.deinit();
 
     // An `OnCall` entry is a subgraph in its own right (RFC §3/§6) —
@@ -539,9 +618,10 @@ fn renderEventEntry(
     w: *std.Io.Writer,
     flow: flow_io.Flow,
     registry: *const FlowRegistry,
+    custom_nodes: ?*const CustomNodeRegistry,
     flow_name: []const u8,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
-    var ctx = try GraphContext.init(allocator, flow, registry);
+    var ctx = try GraphContext.init(allocator, flow, registry, custom_nodes);
     defer ctx.deinit();
 
     // `name` is `?[]const u8` (RFC-FLOW-VOCABULARY §3 — the field is
@@ -825,8 +905,9 @@ fn renderSubgraphFunction(
     w: *std.Io.Writer,
     flow: flow_io.Flow,
     registry: *const FlowRegistry,
+    custom_nodes: ?*const CustomNodeRegistry,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
-    var ctx = try GraphContext.init(allocator, flow, registry);
+    var ctx = try GraphContext.init(allocator, flow, registry, custom_nodes);
     defer ctx.deinit();
 
     // A subgraph has no `entity` in scope — only declared params. An
@@ -959,6 +1040,16 @@ fn discardUnconsumedResult(
         const ref = ctx.registry.get(node.kind.Subflow.flow) orelse return;
         if (!anyOutput(ref.nodes)) return;
     }
+    // A `CustomNode` with a `void` impl emits a bare call statement
+    // (see `writeNodeBody`) — no `n<id>_value` exists to discard. The
+    // registry's `is_void` flag is the source of truth; an unregistered
+    // name would already have raised `UnknownFlowNode` in
+    // `writeNodeBody`, so a fall-through `return` here is safe.
+    if (node.kind == .CustomNode) {
+        const reg = ctx.custom_nodes orelse return;
+        const entry = reg.get(node.kind.CustomNode.name) orelse return;
+        if (entry.is_void) return;
+    }
     for (ctx.flow.edges) |e| {
         if (e.from.node == node.id) return; // consumed by some edge
     }
@@ -973,6 +1064,12 @@ const GraphContext = struct {
     allocator: std.mem.Allocator,
     flow: flow_io.Flow,
     registry: *const FlowRegistry,
+    /// Optional `CustomNode` registry (RFC-FLOW-VOCABULARY §1) — when
+    /// `null`, any `CustomNode` reference is rejected as
+    /// `UnknownFlowNode`. Threaded through here so `writeNodeBody` and
+    /// `resolveInput` can consult it without changing every helper
+    /// signature.
+    custom_nodes: ?*const CustomNodeRegistry,
     index: Index,
     order: []u32,
 
@@ -980,6 +1077,7 @@ const GraphContext = struct {
         allocator: std.mem.Allocator,
         flow: flow_io.Flow,
         registry: *const FlowRegistry,
+        custom_nodes: ?*const CustomNodeRegistry,
     ) (CodegenError || std.mem.Allocator.Error)!GraphContext {
         var index = try buildIndex(allocator, flow);
         errdefer index.deinit();
@@ -998,6 +1096,7 @@ const GraphContext = struct {
             .allocator = allocator,
             .flow = flow,
             .registry = registry,
+            .custom_nodes = custom_nodes,
             .index = index,
             .order = order,
         };
@@ -1493,6 +1592,54 @@ fn writeNodeBody(
             "    const n{d}_value = {s} != null;\n",
             .{ node.id, b.name },
         ),
+        // `CustomNode` lowers to a call against the assembler-emitted
+        // `game_mod.PluginFlowNodes.<qualified>.impl` (RFC-FLOW-VOCABULARY
+        // §1 + §5). The dotted name on the node maps to the qualified
+        // decl through the `CustomNodeRegistry` (built by the assembler
+        // from its phase-2 discovery walk); an unknown name is
+        // `UnknownFlowNode` here rather than a vaguer Zig compile error
+        // against a missing decl.
+        //
+        // Pins are positional, named `arg0`/`arg1`/... matching the
+        // `Call` node convention (and counted the same way via
+        // `countCallArgs`). Unwired pins resolve to `undefined` — Zig's
+        // type-checker catches the mismatch against the impl's actual
+        // signature, which is the source of truth for arity at compile
+        // time of the generated file.
+        //
+        // Command vs reporter shape is keyed off the registry's
+        // `is_void` flag (RFC §6 — "defaults from `impl`'s return
+        // type"): a `void` impl emits a bare statement; a value-
+        // returning impl binds the result to `n<id>_value` so downstream
+        // pins can wire from it. The `kind` override on the FlowNode
+        // factory is editor-side metadata; codegen ignores it.
+        .CustomNode => |b| {
+            const reg = ctx.custom_nodes orelse return error.UnknownFlowNode;
+            const entry = reg.get(b.name) orelse return error.UnknownFlowNode;
+
+            const arity = countCallArgs(ctx.flow, node.id);
+            if (entry.is_void) {
+                try w.print(
+                    "    game_mod.PluginFlowNodes.{s}.impl(game",
+                    .{entry.qualified},
+                );
+            } else {
+                try w.print(
+                    "    const n{d}_value = game_mod.PluginFlowNodes.{s}.impl(game",
+                    .{ node.id, entry.qualified },
+                );
+            }
+            var i: usize = 0;
+            while (i < arity) : (i += 1) {
+                try w.writeAll(", ");
+                var buf: [16]u8 = undefined;
+                const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
+                const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                    try scratch.dupe(u8, "undefined");
+                try w.writeAll(expr);
+            }
+            try w.writeAll(");\n");
+        },
         // A Subflow node lowers to a *call* of the referenced flow's
         // generated function (RFC §6). Each param argument is supplied
         // explicitly: wired pin → binding literal → declared default.
@@ -1577,6 +1724,19 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // nullable variable operations) — single output pin `value` of
         // type `bool`, the same naming as `GetVariable`.
         .HasValueVariable => "value",
+        // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
+        // §1 + §5). When the impl returns a value, the binding name is
+        // `n<id>_value` (matching the reporter naming convention shared
+        // with `GetVariable` / `Literal` / `Identifier`); when the impl
+        // returns `void` the node emits a bare statement and the value
+        // pin is `""`. The branch is resolved at emission time from the
+        // `CustomNodeRegistry`, but the output-pin name for downstream
+        // pin resolution stays `value` either way — Zig's type-checker
+        // catches a wire from a void impl's pin against the generated
+        // call site. `discardUnconsumedResult` consults the registry
+        // through the producer-node lookup to know whether a discard
+        // line is needed.
+        .CustomNode => "value",
         // `Emit` lowers to a statement, not an expression — it has no
         // output pin (RFC-PLUGIN-EVENTS §8); same as `SetField` /
         // `Output`. Skipped by `discardUnconsumedResult`. `ClearVariable`
@@ -1626,6 +1786,12 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // `null` keyword. `HasValueVariable` is a no-input reporter —
         // its single output pin is `value` (the `<var> != null` test).
         .ClearVariable, .HasValueVariable => false,
+        // `CustomNode` input pins are positional, named `argN` (the
+        // same convention as `Call`). Any well-formed pin name is
+        // accepted here; the impl's actual signature is the source of
+        // truth for arity at compile time of the generated `.zig` —
+        // Zig's type-checker catches mismatches against the call site.
+        .CustomNode => isCallArgPin(pin),
     };
 }
 
