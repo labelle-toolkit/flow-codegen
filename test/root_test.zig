@@ -2367,7 +2367,13 @@ pub const FlowVocabularyTests = struct {
         );
     }
 
-    test "rejects multiple Event nodes" {
+    test "parses a multi-trigger flow with two Event nodes" {
+        // RFC-FLOW-VOCABULARY §3 — "A flow with multiple Event nodes is
+        // a multi-trigger flow" (resolves RFC open question O2). The
+        // v1 `MultipleEventNodes` rejection is gone; both Event nodes
+        // round-trip through the parser. `Flow.event` lifts the first
+        // Event node's name for back-compat with `flow_scanner`; codegen
+        // reads the full set off `flow.nodes`.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -2378,10 +2384,11 @@ pub const FlowVocabularyTests = struct {
             \\  "edges": []
             \\}
         ;
-        try std.testing.expectError(
-            error.MultipleEventNodes,
-            flow_io.parseFlow(allocator, src),
-        );
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.event.OnEvent.name.?, "a.b"));
+        try expect.equal(loaded.flow.nodes.len, @as(usize, 2));
     }
 
     test "rejects ChangeVariable naming an unknown variable" {
@@ -2517,5 +2524,286 @@ pub const FlowVocabularyTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var count: i32 = 0;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = count;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "count = n3_result;") != null);
+    }
+
+    // =====================================================================
+    // RFC-FLOW-VOCABULARY §4 — nullable variable operations
+    // (flow-codegen#15 item 1)
+    // =====================================================================
+
+    test "round-trips ClearVariable + HasValueVariable through renderFlowJsonc" {
+        // RFC-FLOW-VOCABULARY §4 — the nullable-only ops are
+        // structurally identical to `GetVariable` / `SetVariable` on
+        // the wire: one `name` payload field. Round-trip confirms the
+        // parser, validator, and writer all agree on the shape.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "target_picker",
+            \\  "variables": [
+            \\    { "name": "target", "type": "?EntityId", "default": null }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .HasValueVariable);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[0].kind.HasValueVariable.name, "target"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[1].kind), .ClearVariable);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.ClearVariable.name, "target"));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(roundtrip.flow.nodes.len, @as(usize, 2));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .HasValueVariable);
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[1].kind), .ClearVariable);
+    }
+
+    test "ClearVariable + HasValueVariable codegen lowering" {
+        // The variable is `?EntityId`, both ops are valid. `ClearVariable`
+        // lowers to `<var> = null;` (no output pin); `HasValueVariable`
+        // lowers to `const n<id>_value = <var> != null;` (bool output).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "target_picker",
+            \\  "variables": [
+            \\    { "name": "target", "type": "?EntityId", "default": null }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "target_picker" });
+        defer allocator.free(out);
+
+        // The file-scope nullable var.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var target: ?EntityId = null;") != null);
+        // `HasValueVariable` — reporter, `n<id>_value = target != null;`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = target != null;") != null);
+        // `ClearVariable` — command, `target = null;`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "target = null;") != null);
+    }
+
+    test "generated Zig parses as valid Zig (Clear + HasValue)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "target_picker",
+            \\  "variables": [
+            \\    { "name": "target", "type": "?u32", "default": null }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "target_picker" });
+        defer allocator.free(out);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "rejects ClearVariable on a non-nullable variable" {
+        // RFC-FLOW-VOCABULARY §4 — `Clear` is the nullable-only op; the
+        // declared `type` must start with `?`. A `Clear` on an `i32` is
+        // a flow-layer type error (`MalformedFlow`), not a Zig-compiler
+        // error against the generated `i32 = null;`.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [
+            \\    { "name": "count", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ClearVariable", "name": "count", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects HasValueVariable on a non-nullable variable" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [
+            \\    { "name": "count", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "HasValueVariable", "name": "count", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects ClearVariable naming an unknown variable" {
+        // Same `UnknownVariable` path the other Variable* ops use —
+        // checked before the nullability constraint, so a typo on a
+        // never-declared var surfaces the variable-existence error
+        // rather than the nullability error.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ClearVariable", "name": "ghost", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.UnknownVariable,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    // =====================================================================
+    // RFC-FLOW-VOCABULARY §3 — multi-trigger flows
+    // (flow-codegen#15 item 3, resolves RFC open question O2)
+    // =====================================================================
+
+    test "multi-trigger codegen emits one method per Event + shared bodyImpl" {
+        // Two Event nodes share a downstream `ChangeVariable hits`. The
+        // generated `FlowEventHandler` exposes one `pub fn` per trigger,
+        // each dispatching to a shared `bodyImpl(game)` helper that runs
+        // the topo-sorted body. Per-event payload aliases keep each
+        // method's signature accurate against `PluginEvents`.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "multi_hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Event", "name": "game.level_complete", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "multi_hit_counter" });
+        defer allocator.free(out);
+
+        // Per-event payload aliases — `.` → `__` for the qualified tag.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const __EvPayload_box2d__collision_begin = @FieldType(PluginEvents, \"box2d__collision_begin\");") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const __EvPayload_game__level_complete = @FieldType(PluginEvents, \"game__level_complete\");") != null);
+        // One `pub fn` per trigger.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn box2d__collision_begin(self: *@This(), payload: __EvPayload_box2d__collision_begin) void") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn game__level_complete(self: *@This(), payload: __EvPayload_game__level_complete) void") != null);
+        // Shared helper — takes already-downcast `*Game`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn bodyImpl(game: *Game) void") != null);
+        // Each dispatch method calls into the helper.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "bodyImpl(game);") != null);
+        // The single `__EvPayload` alias (single-event shape) is NOT
+        // emitted in the multi-trigger path.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const __EvPayload =") == null);
+        // The shared body still carries the increment + the debug print.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "hits += 1;") != null);
+    }
+
+    test "generated Zig parses as valid Zig (multi-trigger)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "multi_hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Event", "name": "game.level_complete", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "multi_hit_counter" });
+        defer allocator.free(out);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "single-trigger flow still emits the original single-method shape" {
+        // The single-event shape is unchanged — one `__EvPayload`, one
+        // `pub fn` whose body is inlined directly (no `bodyImpl` helper).
+        // The existing bouncing-ball test (`generated Zig parses as
+        // valid Zig (Event + ChangeVariable)`) covers the byte-for-byte
+        // codegen; this assertion just guards against accidental
+        // regression to the multi-trigger shape.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "hit_counter" });
+        defer allocator.free(out);
+
+        // The single-event payload alias.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const __EvPayload = @FieldType(PluginEvents, \"box2d__collision_begin\");") != null);
+        // No `bodyImpl` helper — single-event flows inline the body.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "fn bodyImpl(") == null);
+        // No per-event-aliased payload.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "__EvPayload_") == null);
     }
 };

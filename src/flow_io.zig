@@ -200,6 +200,17 @@ pub const NodeKind = union(enum) {
     /// kid path. Defaults to `"1"` (the most common case — increment
     /// by one) when absent.
     ChangeVariable: struct { name: []const u8, by: []const u8 = "1" },
+    /// `ClearVariable` — command (RFC-FLOW-VOCABULARY §4 — nullable
+    /// variable operations). Sets the named `?T` variable to `null`.
+    /// Validated against the `variables` block: the named variable must
+    /// exist (`UnknownVariable`) and its declared `type` must start with
+    /// `?` (`MalformedFlow`) — clearing a non-nullable variable is a
+    /// type error at the flow layer.
+    ClearVariable: struct { name: []const u8 },
+    /// `HasValueVariable` — reporter (RFC-FLOW-VOCABULARY §4 — nullable
+    /// variable operations). Output pin `value` of type `bool`, lowering
+    /// to `<var> != null`. Same nullability check as `ClearVariable`.
+    HasValueVariable: struct { name: []const u8 },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -310,10 +321,12 @@ pub const ParseError = error{
     /// `Event` node, or declares neither (RFC-FLOW-VOCABULARY §3 —
     /// exactly one trigger source).
     ConflictingEventSource,
-    /// A flow file declares more than one in-graph `Event` node. v1
-    /// rejects multi-trigger flows; multi-trigger is RFC open question
-    /// 2 (deferred). Future work landing the multi-trigger lowering
-    /// will widen this.
+    /// Reserved — formerly returned for flows with multiple `Event`
+    /// nodes. Multi-trigger flows are now allowed (RFC-FLOW-VOCABULARY
+    /// §3 — "A flow with multiple Event nodes is a multi-trigger flow",
+    /// resolved per RFC open question O2). Kept in the public error set
+    /// so downstream callers that exhaustively switch on `ParseError`
+    /// continue to compile.
     MultipleEventNodes,
     /// Two top-level `variables` share a `name` (RFC-FLOW-VOCABULARY §4).
     DuplicateVariableName,
@@ -392,30 +405,34 @@ fn buildFlow(
     if (obj.get("edges") == null and obj.get("links") != null) return error.MalformedFlow;
     const edges = try buildEdges(a, obj.get("edges"));
 
-    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3, exactly
-    // one of (file-level `event:` header, in-graph `Event` node) is
-    // present; declaring both or neither is `ConflictingEventSource`.
-    // The Event-node form synthesizes an equivalent `Event.OnEvent`
-    // value so the rest of the loader (and downstream consumers like
-    // the assembler `flow_scanner`) see the same shape regardless of
-    // which on-disk form the file uses.
+    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3, the
+    // trigger comes from either the file-level `event:` header (legacy
+    // / lifecycle path) or one-or-more in-graph `Event` nodes (the
+    // multi-trigger form, RFC §3 — "A flow with multiple Event nodes
+    // is a multi-trigger flow"). Declaring both a header AND any Event
+    // node, or declaring neither, is `ConflictingEventSource`.
+    //
+    // The `Flow.event` field carries a single `Event` for back-compat
+    // with downstream consumers (`flow_scanner`). For the multi-trigger
+    // case we populate it from the *first* Event node by document
+    // order; codegen reads the full set of Event nodes off `flow.nodes`
+    // directly and emits one `FlowEventHandler` method per trigger.
     const header_event_val = obj.get("event");
     var event_node_count: usize = 0;
-    var event_node_name: []const u8 = "";
+    var first_event_node_name: []const u8 = "";
     for (nodes) |n| if (n.kind == .Event) {
+        if (event_node_count == 0) first_event_node_name = n.kind.Event.name;
         event_node_count += 1;
-        event_node_name = n.kind.Event.name;
     };
-    if (event_node_count > 1) return error.MultipleEventNodes;
 
     const event: Event = blk: {
         if (header_event_val) |v| {
             if (event_node_count != 0) return error.ConflictingEventSource;
             break :blk try buildEvent(a, v);
         }
-        if (event_node_count == 1) {
+        if (event_node_count >= 1) {
             break :blk .{ .OnEvent = .{
-                .name = try a.dupe(u8, event_node_name),
+                .name = try a.dupe(u8, first_event_node_name),
                 .priority = null,
             } };
         }
@@ -676,6 +693,10 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
             else
                 try a.dupe(u8, "1"),
         } };
+    } else if (std.mem.eql(u8, type_name, "ClearVariable")) {
+        return .{ .ClearVariable = .{ .name = try reqStr(a, o, "name") } };
+    } else if (std.mem.eql(u8, type_name, "HasValueVariable")) {
+        return .{ .HasValueVariable = .{ .name = try reqStr(a, o, "name") } };
     }
     return error.UnknownNodeType;
 }
@@ -815,6 +836,22 @@ fn validate(flow: Flow) ParseError!void {
             .ChangeVariable => |b| {
                 if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
             },
+            // `ClearVariable` / `HasValueVariable` are the nullable-only
+            // operations (RFC-FLOW-VOCABULARY §4). The named variable
+            // must exist (`UnknownVariable`) AND its declared `type`
+            // must start with `?` — clearing or null-testing a
+            // non-nullable variable is a flow-layer type error. The
+            // declared `type` text is held verbatim by `Variable.type`
+            // (the loader stores it as the raw Zig source), so the
+            // check is a literal first-byte sniff.
+            .ClearVariable => |b| {
+                const v = findVariable(flow.variables, b.name) orelse return error.UnknownVariable;
+                if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
+            },
+            .HasValueVariable => |b| {
+                const v = findVariable(flow.variables, b.name) orelse return error.UnknownVariable;
+                if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
+            },
             else => {},
         }
     }
@@ -823,6 +860,14 @@ fn validate(flow: Flow) ParseError!void {
 fn hasVariable(variables: []const Variable, name: []const u8) bool {
     for (variables) |v| if (std.mem.eql(u8, v.name, name)) return true;
     return false;
+}
+
+/// Look up a declared variable by name — used by the nullable-only
+/// validators (`ClearVariable` / `HasValueVariable`) that need to read
+/// the declared `type` text. Returns `null` when not found.
+fn findVariable(variables: []const Variable, name: []const u8) ?Variable {
+    for (variables) |v| if (std.mem.eql(u8, v.name, name)) return v;
+    return null;
 }
 
 fn hasNode(nodes: []const Node, id: u32) bool {
@@ -1089,6 +1134,14 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             // exposes the increment, no hidden default semantics.
             try w.writeAll(", \"by\": ");
             try writeVariableDefault(w, allocator, b.by);
+        },
+        .ClearVariable => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
+        .HasValueVariable => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
         },
     }
 }

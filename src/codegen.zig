@@ -617,9 +617,6 @@ fn renderNewFormEventEntry(
     flow_name: []const u8,
     dotted_name: []const u8,
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
-    const qualified = try qualifiedTagFromDotted(allocator, dotted_name);
-    defer allocator.free(qualified);
-
     // Entity-scoped nodes inside a new-form flow MUST wire the entity
     // pin (RFC §9 — "the entity pin is mandatory; no lifecycle `entity`
     // fallback"). A new-form flow has `game` reachable through
@@ -628,63 +625,151 @@ fn renderNewFormEventEntry(
     // already raises for `OnCall` entries and `Subflow` subgraphs.
     try assertEntityAvailable(flow);
 
+    // Collect every in-graph `Event` node — by document order — so a
+    // multi-trigger flow (RFC-FLOW-VOCABULARY §3 — "A flow with multiple
+    // Event nodes is a multi-trigger flow", resolves RFC open question
+    // O2) emits one `FlowEventHandler` method per trigger sharing a
+    // common downstream-body helper.
+    //
+    // For the legacy header path (no Event nodes, `event:` carries the
+    // trigger), we fall back to the single passed-in `dotted_name`.
+    var trigger_names: std.ArrayList([]const u8) = .empty;
+    defer trigger_names.deinit(allocator);
+    for (flow.nodes) |n| {
+        if (n.kind == .Event) try trigger_names.append(allocator, n.kind.Event.name);
+    }
+    if (trigger_names.items.len == 0) try trigger_names.append(allocator, dotted_name);
+
     // Header — flow files compile in isolation, so the import of
     // `PluginEvents` rides through the same `game_mod` (`@import("game")`)
     // shim the existing `Game`/`EntityId` decls do. The shim re-export
     // is the phase-3 assembler-side change paired with this codegen.
     try w.writeAll("const PluginEvents = game_mod.PluginEvents;\n\n");
 
-    // Reflect the payload type through `@FieldType(...)`. The compiler
-    // catches an unknown tag here — a flow naming `frobnitz.foo` when
-    // no plugin declares it surfaces as a build-time error against the
-    // `PluginEvents` field set, not a missing-key in a sidecar.
-    try w.print(
-        "const __EvPayload = @FieldType(PluginEvents, \"{s}\");\n\n",
-        .{qualified},
-    );
+    // Single-trigger flow (the established shape): keep one `__EvPayload`
+    // alias and inline the topo-sorted body into the single dispatch
+    // method, where `payload` is in scope. This preserves the existing
+    // single-event tests + the bouncing-ball codegen byte-for-byte.
+    if (trigger_names.items.len == 1) {
+        const qualified = try qualifiedTagFromDotted(allocator, trigger_names.items[0]);
+        defer allocator.free(qualified);
 
-    // The handler struct. `game_ptr: *anyopaque = undefined` is the
-    // field the engine's `setHooks` loop (`game.zig:419-429`) recognizes
-    // and writes `@ptrCast(self)` into at init. The struct is named
-    // `FlowEventHandler` (not the qualified tag) so phase 4's
-    // receiver-tuple wiring can reach it through a stable symbol
-    // independent of the event name.
+        // Reflect the payload type through `@FieldType(...)`. The compiler
+        // catches an unknown tag here — a flow naming `frobnitz.foo` when
+        // no plugin declares it surfaces as a build-time error against the
+        // `PluginEvents` field set, not a missing-key in a sidecar.
+        try w.print(
+            "const __EvPayload = @FieldType(PluginEvents, \"{s}\");\n\n",
+            .{qualified},
+        );
+
+        try w.writeAll("pub const FlowEventHandler = struct {\n");
+        try w.writeAll("    game_ptr: *anyopaque = undefined,\n\n");
+
+        try w.print(
+            "    pub fn {s}(self: *@This(), payload: __EvPayload) void {{\n",
+            .{qualified},
+        );
+
+        try w.writeAll("        const game: *Game = @ptrCast(@alignCast(self.game_ptr));\n");
+
+        // Render the body to a buffer so we can detect which of the fixed
+        // parameters (`game`, `payload`) the topo-sorted node bodies
+        // actually mention. Zig 0.16 rejects both an unused parameter
+        // *and* a pointless `_ = x;` discard of a used one — the buffer
+        // pattern is the same one `renderEntryFunction` already uses.
+        var body_aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer body_aw.deinit();
+        try emitBody(allocator, &body_aw.writer, ctx, flow_name, true);
+        const body = try body_aw.toOwnedSlice();
+        defer allocator.free(body);
+
+        // Discard the param/binding when the body never reads it.
+        if (!mentionsIdent(body, "game")) try w.writeAll("        _ = game;\n");
+        if (!mentionsIdent(body, "payload")) try w.writeAll("        _ = payload;\n");
+
+        try indentBlock(w, body, "    ");
+        try w.writeAll("    }\n");
+        try w.writeAll("};\n");
+        return;
+    }
+
+    // Multi-trigger flow — one `FlowEventHandler` struct, one `pub fn`
+    // per Event node, each method dispatching to a shared `bodyImpl`
+    // helper that runs the topo-sorted downstream node bodies (RFC §3,
+    // open question O2). Per-event payload aliases (`__EvPayload_<tag>`)
+    // keep each method's signature accurate against `PluginEvents`; the
+    // helper takes only `game` because the shared body cannot bind to a
+    // single payload shape across distinct triggers.
+    //
+    // De-duplicate trigger names — a flow declaring the same event on
+    // two nodes is a structural duplicate (one method per event variant
+    // is what `MergeHooks.emit` dispatches against; emitting it twice
+    // would be a duplicate decl). `qualified_seen` is a name set;
+    // `qualified_storage` keeps the appearance order so the emitted
+    // method order matches the document order.
+    var qualified_seen: std.StringHashMap(void) = .init(allocator);
+    defer qualified_seen.deinit();
+    var qualified_storage: std.ArrayList([]u8) = .empty;
+    defer {
+        for (qualified_storage.items) |q| allocator.free(q);
+        qualified_storage.deinit(allocator);
+    }
+    for (trigger_names.items) |dotted| {
+        const q = try qualifiedTagFromDotted(allocator, dotted);
+        const gop = try qualified_seen.getOrPut(q);
+        if (gop.found_existing) {
+            allocator.free(q);
+            continue;
+        }
+        try qualified_storage.append(allocator, q);
+    }
+
+    // Per-event payload alias — `__EvPayload_<qualified>`. Same
+    // `@FieldType` reflection as the single-event path; the compiler
+    // catches an unknown tag against the `PluginEvents` field set.
+    for (qualified_storage.items) |q| {
+        try w.print(
+            "const __EvPayload_{s} = @FieldType(PluginEvents, \"{s}\");\n",
+            .{ q, q },
+        );
+    }
+    try w.writeAll("\n");
+
     try w.writeAll("pub const FlowEventHandler = struct {\n");
     try w.writeAll("    game_ptr: *anyopaque = undefined,\n\n");
 
-    // The dispatch method — its name IS the qualified tag, which is
-    // also the `PluginEvents` variant name and the decl name
-    // `HookDispatcher.emit` looks up on each receiver
-    // (`labelle-core/src/dispatcher.zig:99-111`). Same shape as every
-    // shipped game/plugin hook handler.
-    try w.print(
-        "    pub fn {s}(self: *@This(), payload: __EvPayload) void {{\n",
-        .{qualified},
-    );
+    // One dispatch method per Event node. The body is a discard of the
+    // unused `payload` (each method picks one event's payload shape,
+    // but the shared body can't bind to a specific one) + a call into
+    // `bodyImpl(game)`. Same `*Game` downcast every shipped handler
+    // uses (`labelle-engine/src/game.zig:419-429`).
+    for (qualified_storage.items) |q| {
+        try w.print(
+            "    pub fn {s}(self: *@This(), payload: __EvPayload_{s}) void {{\n",
+            .{ q, q },
+        );
+        try w.writeAll("        const game: *Game = @ptrCast(@alignCast(self.game_ptr));\n");
+        try w.writeAll("        _ = payload;\n");
+        try w.writeAll("        bodyImpl(game);\n");
+        try w.writeAll("    }\n\n");
+    }
 
-    // The `*Game` downcast — `@import("game").Game` is the engine's
-    // default `GameWith(void)` type. The runtime pointer is actually
-    // the project's `*AssembledGame`, but their layouts match for the
-    // method calls codegen emits (`getComponent` / `setField` /
-    // `emit`), the same trick the existing flow-codegen lifecycle
-    // handlers rely on by accepting `game: anytype`.
-    try w.writeAll("        const game: *Game = @ptrCast(@alignCast(self.game_ptr));\n");
-
-    // Render the body to a buffer so we can detect which of the fixed
-    // parameters (`game`, `payload`) the topo-sorted node bodies
-    // actually mention. Zig 0.16 rejects both an unused parameter
-    // *and* a pointless `_ = x;` discard of a used one — the buffer
-    // pattern is the same one `renderEntryFunction` already uses.
+    // `bodyImpl(game: *Game) void` — the shared helper. Takes the
+    // already-downcast `*Game` so each dispatch method does the
+    // `@ptrCast` once, not the helper itself; this also keeps the
+    // helper independent of `*anyopaque` so callers outside the struct
+    // (the test harness, future opt-in inline-flow inspection) can
+    // exercise it directly. `fn` (not `pub fn`) — the helper is a
+    // codegen implementation detail.
     var body_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer body_aw.deinit();
     try emitBody(allocator, &body_aw.writer, ctx, flow_name, true);
     const body = try body_aw.toOwnedSlice();
     defer allocator.free(body);
 
-    // Discard the param/binding when the body never reads it.
+    try w.writeAll("    fn bodyImpl(game: *Game) void {\n");
     if (!mentionsIdent(body, "game")) try w.writeAll("        _ = game;\n");
-    if (!mentionsIdent(body, "payload")) try w.writeAll("        _ = payload;\n");
-
     try indentBlock(w, body, "    ");
     try w.writeAll("    }\n");
     try w.writeAll("};\n");
@@ -1389,6 +1474,25 @@ fn writeNodeBody(
                 .{ b.name, b.name },
             );
         },
+        // `ClearVariable` writes the bare `null` keyword into the
+        // nullable variable (RFC-FLOW-VOCABULARY §4 — nullable variable
+        // operations). The flow-layer nullability check happened in
+        // `flow_io.validate`; here the type signal is the keyword
+        // `null` itself, which Zig accepts as the initial / cleared
+        // value of any `?T`.
+        .ClearVariable => |b| try w.print(
+            "    {s} = null;\n",
+            .{b.name},
+        ),
+        // `HasValueVariable` lowers to a `bool`-typed local — the
+        // `<var> != null` test (RFC-FLOW-VOCABULARY §4 — nullable
+        // variable operations). The reporter shape mirrors
+        // `GetVariable`: one `n<id>_value` binding consumers read
+        // through their input pins.
+        .HasValueVariable => |b| try w.print(
+            "    const n{d}_value = {s} != null;\n",
+            .{ node.id, b.name },
+        ),
         // A Subflow node lowers to a *call* of the referenced flow's
         // generated function (RFC §6). Each param argument is supplied
         // explicitly: wired pin → binding literal → declared default.
@@ -1469,10 +1573,16 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // graph trigger and is dropped from the body entirely (see
         // `emitBody`).
         .GetVariable => "value",
+        // `HasValueVariable` is a reporter (RFC-FLOW-VOCABULARY §4 —
+        // nullable variable operations) — single output pin `value` of
+        // type `bool`, the same naming as `GetVariable`.
+        .HasValueVariable => "value",
         // `Emit` lowers to a statement, not an expression — it has no
         // output pin (RFC-PLUGIN-EVENTS §8); same as `SetField` /
-        // `Output`. Skipped by `discardUnconsumedResult`.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable => "",
+        // `Output`. Skipped by `discardUnconsumedResult`. `ClearVariable`
+        // is a command (RFC-FLOW-VOCABULARY §4) — it writes the bare
+        // `null` keyword into the variable and binds no value.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable => "",
     };
 }
 
@@ -1512,6 +1622,10 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // when no edge is present — see `writeNodeBody`).
         .SetVariable => std.mem.eql(u8, pin, "value"),
         .ChangeVariable => std.mem.eql(u8, pin, "by"),
+        // `ClearVariable` is a no-input command — it writes the bare
+        // `null` keyword. `HasValueVariable` is a no-input reporter —
+        // its single output pin is `value` (the `<var> != null` test).
+        .ClearVariable, .HasValueVariable => false,
     };
 }
 
