@@ -329,6 +329,22 @@ pub fn renderFlowFile(
     }
     try w.writeAll("\n");
 
+    // File-scope `var` declarations (RFC-FLOW-VOCABULARY §4 —
+    // variables). One `pub var <name>: <type> = <default>;` per
+    // declared entry. Scoped to this flow's emitted `.zig` module
+    // (persistent across handler invocations); declared `pub` so
+    // integration tests and the eventual global-variables story
+    // (project-wide `variables/` folder generating cross-flow `pub
+    // var`s) share one shape. Codegen never emits `@import("…")` of
+    // another flow's variables, so the RFC's "invisible to other
+    // flows" constraint holds at the codegen layer.
+    if (entry.variables.len != 0) {
+        for (entry.variables) |v| {
+            try w.print("pub var {s}: {s} = {s};\n", .{ v.name, v.type, v.default.zig_text });
+        }
+        try w.writeAll("\n");
+    }
+
     // Entry flow → its event `pub fn`.
     try renderEntryFunction(allocator, w, entry, registry, options.flow_name);
 
@@ -528,7 +544,12 @@ fn renderEventEntry(
     var ctx = try GraphContext.init(allocator, flow, registry);
     defer ctx.deinit();
 
-    return renderNewFormEventEntry(allocator, w, flow, &ctx, flow_name, flow.event.OnEvent.name);
+    // `name` is `?[]const u8` (RFC-FLOW-VOCABULARY §3 — the field is
+    // optional so an `Event` *node* can carry the trigger name; the
+    // loader's `buildFlow` already populated it either from the header
+    // or the synthesized node, and the empty-name case is rejected
+    // upstream). The unwrap reaches the resolved name unconditionally.
+    return renderNewFormEventEntry(allocator, w, flow, &ctx, flow_name, flow.event.OnEvent.name.?);
 }
 
 /// Map a dotted event name (`box2d.collision_begin`) to the qualified
@@ -811,6 +832,10 @@ fn writeReturnType(
 /// Emit the topo-sorted node bodies for a flow into `w`. `emit_preview`
 /// gates the per-node `emitNodeEntered` pulse — it reads `game`, so an
 /// `OnEvent` handler (which has no `game`) passes `false`.
+///
+/// `Event` nodes (RFC-FLOW-VOCABULARY §3) are graph triggers and emit
+/// no body — they're dropped here so they participate in neither the
+/// preview pulse nor the body lowering.
 fn emitBody(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -822,6 +847,7 @@ fn emitBody(
     defer scratch.deinit();
     for (ctx.order) |id| {
         const node = ctx.index.byId(id) orelse unreachable;
+        if (node.kind == .Event) continue;
         if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
         try writeNodeBody(w, node, ctx, scratch.allocator());
         try discardUnconsumedResult(w, node, ctx);
@@ -1308,6 +1334,61 @@ fn writeNodeBody(
                 try w.writeAll("    } });\n");
             }
         },
+        // The graph-trigger `Event` node carries no body — it
+        // identifies the flow's trigger (the loader synthesizes the
+        // file's `event:` from it) but doesn't itself emit Zig.
+        // `emitBody` filters it out of the topo order so this arm is
+        // a defensive no-op.
+        .Event => {},
+        // `GetVariable` reads the file-scope `var`. Its declared
+        // identifier is the variable name verbatim (variables are
+        // already Zig identifiers per the `Variable.name` contract).
+        .GetVariable => |b| try w.print(
+            "    const n{d}_value = {s};\n",
+            .{ node.id, b.name },
+        ),
+        // `SetVariable` writes the wired `value` into the file-scope
+        // `var`. The `value` pin MUST be wired — `SetVariable` with no
+        // input is `DanglingPin` (unlike `ChangeVariable` whose `by`
+        // has an inline default).
+        .SetVariable => |b| {
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    {s} = {s};\n",
+                .{ b.name, value_expr },
+            );
+        },
+        // `ChangeVariable` increments the file-scope `var` by the
+        // wired `by` pin — or, when the pin is unwired, by the inline
+        // `by` literal stored on the node (defaults to `"1"`). This
+        // matches Scratch's "change X by [1]" block: the `1` lives on
+        // the node itself, no edge required.
+        //
+        // The lowering is `var += by` (numerics) or `var = var != by`
+        // (boolean toggle). v1 doesn't distinguish at codegen time —
+        // `+=` typechecks for `i32`/`f32` and the boolean form is left
+        // for a follow-up node; a user wiring `ChangeVariable` to a
+        // `bool` variable today gets a Zig type error at compile time.
+        //
+        // A `DEBUG`-mode print is emitted after the change so the
+        // running counter is visible without a sidecar `.zig` (the
+        // RFC's goal: collapse `setTotal`'s `std.debug.print` into
+        // the codegen itself). `builtin.mode == .Debug` keeps release
+        // builds silent. The format `{s}: {d}\n` uses the variable
+        // name as the label — matches the "counts ball hits live"
+        // verification format.
+        .ChangeVariable => |b| {
+            const by_expr = (try ctx.resolveInput(scratch, node, "by")) orelse
+                try scratch.dupe(u8, b.by);
+            try w.print(
+                "    {s} += {s};\n",
+                .{ b.name, by_expr },
+            );
+            try w.print(
+                "    if (@import(\"builtin\").mode == .Debug) std.debug.print(\"{s}: {{d}}\\n\", .{{{s}}});\n",
+                .{ b.name, b.name },
+            );
+        },
         // A Subflow node lowers to a *call* of the referenced flow's
         // generated function (RFC §6). Each param argument is supplied
         // explicitly: wired pin → binding literal → declared default.
@@ -1380,10 +1461,18 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
     return switch (k) {
         .GetComponent, .Literal, .Identifier, .Param => "value",
         .BinOp, .Call, .Subflow => "result",
+        // `GetVariable` is a reporter (RFC-FLOW-VOCABULARY §4) — its
+        // single output pin is `value`, the same shape as `Literal` /
+        // `Identifier` / `GetComponent`. `SetVariable` /
+        // `ChangeVariable` are commands and bind no value (same as
+        // `SetField` / `Emit` / `Output`); the `Event` node is the
+        // graph trigger and is dropped from the body entirely (see
+        // `emitBody`).
+        .GetVariable => "value",
         // `Emit` lowers to a statement, not an expression — it has no
         // output pin (RFC-PLUGIN-EVENTS §8); same as `SetField` /
         // `Output`. Skipped by `discardUnconsumedResult`.
-        .SetField, .Output, .Emit => "",
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable => "",
     };
 }
 
@@ -1393,7 +1482,7 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // (RFC-PLUGIN-EVENTS §9) — when wired it overrides the
         // in-scope `entity` identifier. No other inputs.
         .GetComponent => std.mem.eql(u8, pin, "entity"),
-        .Literal, .Identifier, .Param => false,
+        .Literal, .Identifier, .Param, .GetVariable => false,
         // `SetField` takes `value` (existing) and the same optional
         // `entity` pin as `GetComponent` (RFC-PLUGIN-EVENTS §9).
         .SetField => std.mem.eql(u8, pin, "value") or std.mem.eql(u8, pin, "entity"),
@@ -1412,6 +1501,17 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // literal (Zig's compiler reports the unknown/missing field
         // against the resolved `PluginEvents` variant type).
         .Emit => pin.len != 0,
+        // The `Event` node is the graph trigger — it has no input
+        // pins (the file-level event source is what defines the
+        // payload; payload fields surface as the node's *output* pins,
+        // tracked separately by the editor — codegen drops the node
+        // from the body entirely so no input edges should target it).
+        .Event => false,
+        // `SetVariable` consumes the wired `value`; `ChangeVariable`
+        // consumes the wired `by` (or its inline-default `by` literal
+        // when no edge is present — see `writeNodeBody`).
+        .SetVariable => std.mem.eql(u8, pin, "value"),
+        .ChangeVariable => std.mem.eql(u8, pin, "by"),
     };
 }
 

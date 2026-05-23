@@ -189,7 +189,7 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
         const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(std.mem.eql(u8, ev.name, "box2d.collision_begin"));
+        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "box2d.collision_begin"));
     }
 
     test "round-trips a new-form OnEvent flow through renderFlowJsonc" {
@@ -209,7 +209,7 @@ pub const FlowIoTests = struct {
         var l2 = try flow_io.parseFlow(allocator, rendered);
         defer l2.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
-        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name, "box2d.collision_begin"));
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name.?, "box2d.collision_begin"));
 
         const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
         defer allocator.free(rendered2);
@@ -294,7 +294,7 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
         try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
         const ev = loaded.flow.event.OnEvent;
-        try expect.toBeTrue(std.mem.eql(u8, ev.name, "ui.click"));
+        try expect.toBeTrue(std.mem.eql(u8, ev.name.?, "ui.click"));
         try expect.toBeTrue(ev.priority != null);
         try expect.equal(ev.priority.?, @as(i32, 100));
     }
@@ -2101,6 +2101,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         .name = "flow",
         .event = flow_io.Event{ .OnCall = {} },
         .params = &.{},
+        .variables = &.{},
         .nodes = &.{},
         .edges = &.{},
     });
@@ -2254,3 +2255,267 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         );
     }
 });
+
+// =====================================================================
+// RFC-FLOW-VOCABULARY — events as graph nodes (§3) + variables (§4)
+// =====================================================================
+
+pub const FlowVocabularyTests = struct {
+    // Round-trip a flow with an Event node + ChangeVariable through
+    // the parser and writer — exercises the new file format end-to-end.
+    test "parses Event node + variables + ChangeVariable" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        // The synthetic event matches the header form: `OnEvent` with
+        // the node's name. `priority` is null when synthesized from a
+        // node (only the header form carries a priority on disk).
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.event.OnEvent.name.?, "box2d.collision_begin"));
+        try expect.equal(loaded.flow.event.OnEvent.priority, @as(?i32, null));
+
+        // The variable is declared.
+        try expect.equal(loaded.flow.variables.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.variables[0].name, "hits"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.variables[0].type, "i32"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.variables[0].default.zig_text, "0"));
+
+        try expect.equal(loaded.flow.nodes.len, @as(usize, 2));
+        // Order on disk: id 1 = Event, id 2 = ChangeVariable.
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .Event);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[0].kind.Event.name, "box2d.collision_begin"));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[1].kind), .ChangeVariable);
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.ChangeVariable.name, "hits"));
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.ChangeVariable.by, "1"));
+    }
+
+    test "round-trips Event node + variables through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), l2.flow.event), .OnEvent);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.event.OnEvent.name.?, "box2d.collision_begin"));
+        try expect.equal(l2.flow.variables.len, @as(usize, 1));
+        try expect.equal(l2.flow.nodes.len, @as(usize, 2));
+
+        // The re-rendered file must NOT contain a top-level `event:`
+        // key (the node form is the source of truth on re-save).
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"event\":") == null);
+    }
+
+    test "rejects file with both header and Event node" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.ConflictingEventSource,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects file with no event source" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.ConflictingEventSource,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects multiple Event nodes" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "a.b", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Event", "name": "c.d", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.MultipleEventNodes,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects ChangeVariable naming an unknown variable" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "x.y", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "ghost", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.UnknownVariable,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects duplicate variable names" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "variables": [
+            \\    { "name": "x", "type": "i32", "default": 0 },
+            \\    { "name": "x", "type": "f32", "default": 1.0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.DuplicateVariableName,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "codegen emits file-scope var for declared variables" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "hit_counter" });
+        defer allocator.free(out);
+
+        // The file-scope var.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var hits: i32 = 0;") != null);
+        // The increment.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "hits += 1;") != null);
+        // The debug print.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "std.debug.print(\"hits: {d}") != null);
+        // The Event node was dropped from the body — no `n1_*` decl.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n1_") == null);
+        // The `FlowEventHandler` struct still gets emitted (the event
+        // came from the Event node, not a file-level header).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub const FlowEventHandler") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "box2d__collision_begin") != null);
+    }
+
+    test "generated Zig parses as valid Zig (Event + ChangeVariable)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "hit_counter",
+            \\  "variables": [
+            \\    { "name": "hits", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "box2d.collision_begin", "pos": [40, 40] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "hits", "by": 1, "pos": [40, 160] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "hit_counter" });
+        defer allocator.free(out);
+
+        const z = try allocator.allocSentinel(u8, out.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..out.len], out);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{out});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
+    test "GetVariable + SetVariable codegen lowering" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "counter",
+            \\  "variables": [
+            \\    { "name": "count", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "count", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 3, "type": "BinOp", "op": "add", "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "count", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "counter" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var count: i32 = 0;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = count;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "count = n3_result;") != null);
+    }
+};

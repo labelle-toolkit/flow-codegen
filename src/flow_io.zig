@@ -64,8 +64,16 @@ pub const Event = union(enum) {
     /// `buildEvent` rejects an `OnEvent` whose `name` is absent.
     OnEvent: struct {
         /// Plugin-qualified event name
-        /// (`"box2d.collision_begin"`).
-        name: []const u8,
+        /// (`"box2d.collision_begin"`). Nullable so the field can be
+        /// the synthetic backing for an in-graph `Event` node
+        /// (RFC-FLOW-VOCABULARY §3 — events as first-class graph nodes)
+        /// without breaking consumers (assembler `flow_scanner`) that
+        /// check `ev.OnEvent.name != null`. In the new-form path the
+        /// loader populates this field from the Event node's `name`;
+        /// the legacy header path sets it directly. Either way codegen
+        /// reads `flow.event.OnEvent.name.?` once an `OnEvent` event is
+        /// resolved.
+        name: ?[]const u8 = null,
         /// Optional dispatch-priority hint for **consumable** events
         /// (RFC-PLUGIN-EVENTS O4, phase 7 — labelle-core#16). Meaningful
         /// only when the resolved event is consumable (the payload
@@ -163,6 +171,35 @@ pub const NodeKind = union(enum) {
     /// input pins are the payload struct's fields, reflected at codegen
     /// time; lowering deferred until the resolver lands.
     Emit: struct { event: []const u8 },
+    /// `Event` — graph-level trigger (RFC-FLOW-VOCABULARY §3 — events
+    /// as first-class graph nodes). Replaces the file-level `event:`
+    /// header for new-form flows; the loader synthesizes
+    /// `Flow.event = .{ .OnEvent = .{ .name = <node.name> } }` so
+    /// existing consumers (assembler `flow_scanner`, codegen's
+    /// `FlowEventHandler` path) keep working unchanged.
+    ///
+    /// Codegen *drops* the in-graph node from the rendered body — it
+    /// is the trigger, not a value-producing node — so it doesn't
+    /// participate in topo sort or pin resolution.
+    Event: struct { name: []const u8 },
+    /// `GetVariable` — reporter (RFC-FLOW-VOCABULARY §4). Reads a
+    /// declared `Variable` by name, output pin `value` typed to the
+    /// variable's declared `type`.
+    GetVariable: struct { name: []const u8 },
+    /// `SetVariable` — command (RFC-FLOW-VOCABULARY §4). Writes the
+    /// wired `value` input pin into the declared `Variable`.
+    SetVariable: struct { name: []const u8 },
+    /// `ChangeVariable` — command (RFC-FLOW-VOCABULARY §4). Increments
+    /// the declared numeric/boolean `Variable` by the wired `by` input
+    /// pin (or by the inline `by` literal when no wire is present).
+    /// For numerics: `var += by`; for `bool`: `var = var != by` (XOR
+    /// toggle when `by == true`).
+    ///
+    /// Inline `by` matches Scratch's "change X by [1]" block, where the
+    /// `1` is part of the node itself; no edge is required for the
+    /// kid path. Defaults to `"1"` (the most common case — increment
+    /// by one) when absent.
+    ChangeVariable: struct { name: []const u8, by: []const u8 = "1" },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -189,14 +226,43 @@ pub const Edge = struct {
 /// Back-compat alias — codegen and tests still spell it `Link`.
 pub const Link = Edge;
 
+/// A top-level declared variable (RFC-FLOW-VOCABULARY §4). Lowers to a
+/// file-scope `var <name>: <type> = <default>;` in the generated `.zig`
+/// module — scoped to the flow, persistent across handler invocations,
+/// invisible to other flows. `GetVariable` / `SetVariable` /
+/// `ChangeVariable` node kinds read and write it.
+pub const Variable = struct {
+    /// Zig identifier — the variable's symbol in the generated module.
+    name: []const u8,
+    /// Zig source text of the variable's type — e.g. `"i32"`, `"f32"`,
+    /// `"bool"`, `"?EntityId"`. Emitted verbatim by codegen.
+    type: []const u8,
+    /// Zig source text of the variable's initial value — e.g. `"0"`,
+    /// `"true"`, `"null"`. Same encoding as `Param.default` /
+    /// `Subflow.binding` literals (see `parseParamLiteral`); emitted
+    /// verbatim by codegen as the right-hand side of `var x: T = …;`.
+    default: Literal,
+};
+
 /// A fully parsed flow. Every slice is owned by the surrounding
 /// `LoadedFlow.arena`. `name` is the effective registry key (RFC §5).
 pub const Flow = struct {
     /// Effective name (RFC §5): the top-level `"name"` field, else the
     /// filename basename. Empty when neither is available.
     name: []const u8 = "",
+    /// The flow's trigger. Either set from the file-level `event:`
+    /// header (legacy / lifecycle path) or synthesized from an `Event`
+    /// node in `nodes` (RFC-FLOW-VOCABULARY §3 — new-form flows). At
+    /// most one of the two sources may be present; `buildFlow`
+    /// rejects a file with both.
     event: Event,
     params: []Param = &.{},
+    /// Top-level declared variables (RFC-FLOW-VOCABULARY §4). Each
+    /// entry lowers to a file-scope `var <name>: <type> = <default>;`
+    /// in the generated `.zig` module. Empty for flows that declare
+    /// none — the default. Optional in the source file; absence is
+    /// indistinguishable from `"variables": []`.
+    variables: []Variable = &.{},
     nodes: []Node,
     /// Renamed from `links` per RFC §2; the field keeps the name
     /// `edges` to match the on-disk schema.
@@ -240,6 +306,20 @@ pub const ParseError = error{
     DuplicateParamName,
     /// Two `Output` nodes share a `name` (RFC §3).
     DuplicateOutputName,
+    /// A flow file declares both an `event:` header and an in-graph
+    /// `Event` node, or declares neither (RFC-FLOW-VOCABULARY §3 —
+    /// exactly one trigger source).
+    ConflictingEventSource,
+    /// A flow file declares more than one in-graph `Event` node. v1
+    /// rejects multi-trigger flows; multi-trigger is RFC open question
+    /// 2 (deferred). Future work landing the multi-trigger lowering
+    /// will widen this.
+    MultipleEventNodes,
+    /// Two top-level `variables` share a `name` (RFC-FLOW-VOCABULARY §4).
+    DuplicateVariableName,
+    /// A `GetVariable` / `SetVariable` / `ChangeVariable` names a
+    /// variable not in the top-level `variables` block.
+    UnknownVariable,
 };
 
 /// Read `path` as JSONC and parse it into a `LoadedFlow`. The flow's
@@ -303,8 +383,8 @@ fn buildFlow(
         break :blk "";
     };
 
-    const event = try buildEvent(a, obj.get("event") orelse return error.MalformedFlow);
     const params = try buildParams(a, obj.get("params"));
+    const variables = try buildVariables(a, obj.get("variables"));
     const nodes = try buildNodes(a, obj.get("nodes") orelse return error.MalformedFlow);
     // `links` was the pre-rename (RFC §2) name for `edges`. A file
     // still using it would otherwise load with zero connections and
@@ -312,10 +392,41 @@ fn buildFlow(
     if (obj.get("edges") == null and obj.get("links") != null) return error.MalformedFlow;
     const edges = try buildEdges(a, obj.get("edges"));
 
+    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3, exactly
+    // one of (file-level `event:` header, in-graph `Event` node) is
+    // present; declaring both or neither is `ConflictingEventSource`.
+    // The Event-node form synthesizes an equivalent `Event.OnEvent`
+    // value so the rest of the loader (and downstream consumers like
+    // the assembler `flow_scanner`) see the same shape regardless of
+    // which on-disk form the file uses.
+    const header_event_val = obj.get("event");
+    var event_node_count: usize = 0;
+    var event_node_name: []const u8 = "";
+    for (nodes) |n| if (n.kind == .Event) {
+        event_node_count += 1;
+        event_node_name = n.kind.Event.name;
+    };
+    if (event_node_count > 1) return error.MultipleEventNodes;
+
+    const event: Event = blk: {
+        if (header_event_val) |v| {
+            if (event_node_count != 0) return error.ConflictingEventSource;
+            break :blk try buildEvent(a, v);
+        }
+        if (event_node_count == 1) {
+            break :blk .{ .OnEvent = .{
+                .name = try a.dupe(u8, event_node_name),
+                .priority = null,
+            } };
+        }
+        return error.ConflictingEventSource;
+    };
+
     return .{
         .name = name,
         .event = event,
         .params = params,
+        .variables = variables,
         .nodes = nodes,
         .edges = edges,
     };
@@ -377,6 +488,45 @@ fn strField(obj: std.json.ObjectMap, key: []const u8, default: []const u8) Parse
     const v = obj.get(key) orelse return default;
     if (v != .string) return error.MalformedFlow;
     return v.string;
+}
+
+fn buildVariables(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Variable {
+    const v = maybe orelse return &.{};
+    if (v != .array) return error.MalformedFlow;
+    const items = v.array.items;
+    const out = try a.alloc(Variable, items.len);
+    for (items, 0..) |it, i| {
+        if (it != .object) return error.MalformedFlow;
+        const o = it.object;
+        const vname = o.get("name") orelse return error.MalformedFlow;
+        const vtype = o.get("type") orelse return error.MalformedFlow;
+        const vdefault = o.get("default") orelse return error.MalformedFlow;
+        if (vname != .string or vtype != .string) return error.MalformedFlow;
+        out[i] = .{
+            .name = try a.dupe(u8, vname.string),
+            .type = try a.dupe(u8, vtype.string),
+            .default = .{ .zig_text = try parseVariableDefault(a, vdefault) },
+        };
+    }
+    return out;
+}
+
+/// Render a JSON-native variable default as Zig source text. Like
+/// `parseParamLiteral`, but accepts JSON `null` (for nullable `?T`
+/// variables) and renders it as the Zig `null` keyword.
+fn parseVariableDefault(a: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+    return switch (v) {
+        .null => try a.dupe(u8, "null"),
+        .bool => |b| if (b) "true" else "false",
+        .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
+        .float => |f| try std.fmt.allocPrint(a, "{d}", .{f}),
+        .number_string => |s| try a.dupe(u8, s),
+        // A JSON string becomes a Zig string literal — quote it. This
+        // also covers the enum-tag-as-string pattern (`"idle"` →
+        // `"idle"` in the Zig source; the consumer types it).
+        .string => |s| try std.fmt.allocPrint(a, "\"{f}\"", .{std.zig.fmtString(s)}),
+        else => error.MalformedFlow,
+    };
 }
 
 fn buildParams(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Param {
@@ -505,6 +655,27 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         // a sourced diagnostic; validate just confirms the field is
         // present — the assembler's resolver is the source of truth.
         return .{ .Emit = .{ .event = try reqStr(a, o, "event") } };
+    } else if (std.mem.eql(u8, type_name, "Event")) {
+        // RFC-FLOW-VOCABULARY §3 — graph-level trigger.
+        return .{ .Event = .{ .name = try reqStr(a, o, "name") } };
+    } else if (std.mem.eql(u8, type_name, "GetVariable")) {
+        return .{ .GetVariable = .{ .name = try reqStr(a, o, "name") } };
+    } else if (std.mem.eql(u8, type_name, "SetVariable")) {
+        return .{ .SetVariable = .{ .name = try reqStr(a, o, "name") } };
+    } else if (std.mem.eql(u8, type_name, "ChangeVariable")) {
+        // `by` is the inline-default increment — defaults to `"1"`
+        // when omitted (RFC-FLOW-VOCABULARY §4 — matches Scratch's
+        // "change X by [1]" block). Same Zig-source-text encoding as
+        // `Variable.default` / `Param.default`; an incoming wire on
+        // the `by` pin still takes precedence (codegen's
+        // `resolveInput` fall-through).
+        return .{ .ChangeVariable = .{
+            .name = try reqStr(a, o, "name"),
+            .by = if (o.get("by")) |bv|
+                try parseVariableDefault(a, bv)
+            else
+                try a.dupe(u8, "1"),
+        } };
     }
     return error.UnknownNodeType;
 }
@@ -601,6 +772,13 @@ fn validate(flow: Flow) ParseError!void {
         }
     }
 
+    // Unique variable names (RFC-FLOW-VOCABULARY §4).
+    for (flow.variables, 0..) |v, i| {
+        for (flow.variables[i + 1 ..]) |w| {
+            if (std.mem.eql(u8, v.name, w.name)) return error.DuplicateVariableName;
+        }
+    }
+
     // Every edge endpoint resolves to a real node.
     for (flow.edges) |e| {
         if (!hasNode(flow.nodes, e.from.node)) return error.DanglingLink;
@@ -608,7 +786,8 @@ fn validate(flow: Flow) ParseError!void {
     }
 
     // `Param` nodes must name a declared parameter (RFC §3); `Output`
-    // node names must be unique (RFC §3).
+    // node names must be unique (RFC §3); Variable-touching nodes must
+    // name a declared variable (RFC-FLOW-VOCABULARY §4).
     for (flow.nodes, 0..) |n, i| {
         switch (n.kind) {
             .Param => |b| {
@@ -627,9 +806,23 @@ fn validate(flow: Flow) ParseError!void {
                         return error.DuplicateOutputName;
                 }
             },
+            .GetVariable => |b| {
+                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+            },
+            .SetVariable => |b| {
+                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+            },
+            .ChangeVariable => |b| {
+                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+            },
             else => {},
         }
     }
+}
+
+fn hasVariable(variables: []const Variable, name: []const u8) bool {
+    for (variables) |v| if (std.mem.eql(u8, v.name, name)) return true;
+    return false;
 }
 
 fn hasNode(nodes: []const Node, id: u32) bool {
@@ -664,9 +857,37 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
         try w.writeAll(",\n");
     }
 
-    try w.writeAll("  \"event\": ");
-    try writeEvent(w, flow.event);
-    try w.writeAll(",\n");
+    // The `event:` header is emitted only when the flow does NOT carry
+    // an in-graph `Event` node (RFC-FLOW-VOCABULARY §3). When the file
+    // uses the new-form trigger node, the event source lives in
+    // `nodes` and the header is omitted; the loader's `buildFlow`
+    // round-trips the same way.
+    const has_event_node = blk: {
+        for (flow.nodes) |n| if (n.kind == .Event) break :blk true;
+        break :blk false;
+    };
+    if (!has_event_node) {
+        try w.writeAll("  \"event\": ");
+        try writeEvent(w, flow.event);
+        try w.writeAll(",\n");
+    }
+
+    // Variables block (RFC-FLOW-VOCABULARY §4). Omitted when empty.
+    if (flow.variables.len != 0) {
+        try w.writeAll("  \"variables\": [\n");
+        for (flow.variables, 0..) |v, i| {
+            try w.writeAll("    { \"name\": ");
+            try writeJsonString(w, v.name);
+            try w.writeAll(", \"type\": ");
+            try writeJsonString(w, v.type);
+            try w.writeAll(", \"default\": ");
+            try writeVariableDefault(w, allocator, v.default.zig_text);
+            try w.writeAll(" }");
+            if (i + 1 < flow.variables.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("  ],\n");
+    }
 
     if (flow.params.len != 0) {
         try w.writeAll("  \"params\": [\n");
@@ -847,6 +1068,28 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"event\": ");
             try writeJsonString(w, b.event);
         },
+        .Event => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
+        .GetVariable => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
+        .SetVariable => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+        },
+        .ChangeVariable => |b| {
+            try w.writeAll(", \"name\": ");
+            try writeJsonString(w, b.name);
+            // `by` is the inline-default increment. Even when it
+            // equals the codegen default (`"1"`) we still emit it so
+            // round-tripping is byte-deterministic — the on-disk file
+            // exposes the increment, no hidden default semantics.
+            try w.writeAll(", \"by\": ");
+            try writeVariableDefault(w, allocator, b.by);
+        },
     }
 }
 
@@ -870,7 +1113,12 @@ fn writeEvent(w: anytype, ev: Event) !void {
         .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
         .OnEvent => |b| {
             try w.writeAll("{ \"type\": \"OnEvent\", \"name\": ");
-            try writeJsonString(w, b.name);
+            // `name` is `?[]const u8` (post-RFC-FLOW-VOCABULARY §3 — see
+            // `Event.OnEvent.name` docs). `writeEvent` is only reached
+            // for the header form (the synthetic-from-Event-node case
+            // skips this writer entirely in `renderFlowJsonc`), so the
+            // field is always set here; the unwrap is the contract.
+            try writeJsonString(w, b.name.?);
             // `priority` (RFC-PLUGIN-EVENTS O4 / phase 7) is emitted
             // right after `name` so the on-disk key order stays in sync
             // with the in-source struct field order; `null` is omitted
@@ -881,6 +1129,18 @@ fn writeEvent(w: anytype, ev: Event) !void {
             try w.writeAll(" }");
         },
     }
+}
+
+/// Write a variable `default` as JSON. Parallel to `writeParamLiteral`
+/// — emits a scalar (`true` / `1` / `1.5`) verbatim, decodes a Zig
+/// string literal back to its JSON-string form, and renders the literal
+/// `null` (a nullable variable's default) as JSON `null`.
+fn writeVariableDefault(w: anytype, allocator: std.mem.Allocator, zig_text: []const u8) !void {
+    if (std.mem.eql(u8, zig_text, "null")) {
+        try w.writeAll("null");
+        return;
+    }
+    try writeParamLiteral(w, allocator, zig_text);
 }
 
 /// Persist `loaded` to disk at `path` as `.flow.jsonc`.
