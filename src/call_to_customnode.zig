@@ -241,6 +241,15 @@ pub fn convertFlow(
             .to = .{ .node = e.to.node, .pin = try a.dupe(u8, e.to.pin) },
         };
     }
+    // Control-flow edges (flow-codegen#8) pass through untouched — the
+    // converter only rewrites `Call` data nodes; exec wiring is unrelated.
+    const new_exec_edges = try a.alloc(flow_io.ExecEdge, flow.exec_edges.len);
+    for (flow.exec_edges, 0..) |x, i| {
+        new_exec_edges[i] = .{
+            .from = .{ .node = x.from.node, .pin = try a.dupe(u8, x.from.pin) },
+            .to_node = x.to_node,
+        };
+    }
     const new_params = try a.alloc(flow_io.Param, flow.params.len);
     for (flow.params, 0..) |p, i| {
         new_params[i] = .{
@@ -276,6 +285,7 @@ pub fn convertFlow(
         .variables = new_variables,
         .nodes = new_nodes,
         .edges = new_edges,
+        .exec_edges = new_exec_edges,
     };
 
     return .{
@@ -323,6 +333,8 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .ClearVariable => |b| .{ .ClearVariable = .{ .name = try a.dupe(u8, b.name) } },
         .HasValueVariable => |b| .{ .HasValueVariable = .{ .name = try a.dupe(u8, b.name) } },
         .CustomNode => |b| .{ .CustomNode = .{ .name = try a.dupe(u8, b.name) } },
+        // `Branch` carries no payload (flow-codegen#8).
+        .Branch => .{ .Branch = .{} },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }
