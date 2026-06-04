@@ -3590,4 +3590,422 @@ pub const CoercionTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "    const n1_value = 4;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "    out = n1_value;") != null);
     }
+
+    // =====================================================================
+    // ForRange / While — loop control flow + body exec edges (flow-codegen#21)
+    // =====================================================================
+
+    test "ForRange lowers to a scoped i32 while loop with a nested body" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fr_basic",
+            \\  "variables": [ { "name": "acc", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 2, "pos": [0, 0] },
+            \\    { "id": 4, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 5, "type": "SetVariable", "name": "acc", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 4, "pin": "start" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 4, "pin": "end" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "step" } },
+            \\    { "from": { "node": 4, "pin": "index" }, "to": { "node": 5, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "fr_basic" });
+        defer allocator.free(out);
+
+        // The loop var is declared `i32` (a bare `var i = 0` would be a
+        // comptime_int error) and the `while` is counted with the wired
+        // start/end/step.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var i_4: i32 = n1_value;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (i_4 < n2_value) : (i_4 += n3_value) {") != null);
+        // A body node reading the `index` pin references the loop var
+        // `i_4`, NOT an `n4_…` binding.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "acc = i_4;") != null);
+        const idx_at = std.mem.indexOf(u8, out, "acc = i_4;");
+        const while_at = std.mem.indexOf(u8, out, "while (i_4 <");
+        try expect.toBeTrue(idx_at.? > while_at.?);
+        // The body is nested two levels under the entry fn (enclosing block
+        // + the `while`) → 12-space indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            acc = i_4;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForRange with unwired start/end/step uses 0/0/1 defaults" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fr_default",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "fr_default" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var i_1: i32 = 0;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (i_1 < 0) : (i_1 += 1) {") != null);
+        // The body command runs inside the loop block (12-space indent).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            out = n2_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "While re-evaluates its condition via deep-inlining (not a frozen binding)" {
+        const allocator = std.testing.allocator;
+        // The cond is `GetVariable x < Literal 10`. A `while` must re-read
+        // `x` every iteration — so the header must be `while (x < 10)`, NOT
+        // `while (n3_result)` (which would freeze the once-bound compare).
+        const src =
+            \\{
+            \\  "name": "wh_reeval",
+            \\  "variables": [ { "name": "x", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "While", "pos": [0, 0] },
+            \\    { "id": 5, "type": "ChangeVariable", "name": "x", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_reeval" });
+        defer allocator.free(out);
+
+        // Condition deep-inlined into the header — re-reads `x` each pass.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while ((x < 10)) {") != null);
+        // NOT the frozen binding reference.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (n3_result)") == null);
+        // The body (ChangeVariable) runs inside the loop block — one level
+        // under the entry fn → 8-space indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        x += 1;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "While with unwired cond defaults to false (loop never runs)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "wh_default",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "While", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_default" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (false) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        out = n2_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "loop node is a valid exec source with pin body (flow-codegen#21)" {
+        // A `ForRange`/`While` body exec edge parses fine; a non-loop /
+        // non-Branch exec source, or a wrong pin, is rejected.
+        const allocator = std.testing.allocator;
+
+        // Valid: ForRange `body` exec edge.
+        {
+            const ok_src =
+                \\{
+                \\  "name": "ok_for",
+                \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
+                \\  "event": { "type": "OnCall" },
+                \\  "nodes": [
+                \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
+                \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
+                \\  ],
+                \\  "edges": [],
+                \\  "exec_edges": [
+                \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+                \\  ]
+                \\}
+            ;
+            var loaded = try flow_io.parseFlow(allocator, ok_src);
+            defer loaded.deinit();
+            try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .ForRange);
+        }
+
+        // Valid: While `body` exec edge.
+        {
+            const ok_src =
+                \\{
+                \\  "name": "ok_while",
+                \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
+                \\  "event": { "type": "OnCall" },
+                \\  "nodes": [
+                \\    { "id": 1, "type": "While", "pos": [0, 0] },
+                \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
+                \\  ],
+                \\  "edges": [],
+                \\  "exec_edges": [
+                \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+                \\  ]
+                \\}
+            ;
+            var loaded = try flow_io.parseFlow(allocator, ok_src);
+            defer loaded.deinit();
+            try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .While);
+        }
+
+        // Rejected: a non-loop, non-Branch exec source (a Literal here).
+        {
+            const bad_src =
+                \\{
+                \\  "name": "bad_src",
+                \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
+                \\  "event": { "type": "OnCall" },
+                \\  "nodes": [
+                \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+                \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
+                \\  ],
+                \\  "edges": [],
+                \\  "exec_edges": [
+                \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+                \\  ]
+                \\}
+            ;
+            try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, bad_src));
+        }
+
+        // Rejected: a loop source with the wrong exec pin (`then`, not
+        // `body`).
+        {
+            const bad_pin =
+                \\{
+                \\  "name": "bad_pin",
+                \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
+                \\  "event": { "type": "OnCall" },
+                \\  "nodes": [
+                \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
+                \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
+                \\  ],
+                \\  "edges": [],
+                \\  "exec_edges": [
+                \\    { "from": { "node": 1, "pin": "then" }, "to": { "node": 2 } }
+                \\  ]
+                \\}
+            ;
+            try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, bad_pin));
+        }
+    }
+
+    test "nested ForRange inside a While compounds body indentation" {
+        const allocator = std.testing.allocator;
+        // A While whose body is a ForRange whose body sets a variable —
+        // the innermost statement nests under both loops.
+        const src =
+            \\{
+            \\  "name": "nested",
+            \\  "variables": [ { "name": "go", "type": "bool", "default": true }, { "name": "acc", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "go", "pos": [0, 0] },
+            \\    { "id": 2, "type": "While", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "acc", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "cond" } },
+            \\    { "from": { "node": 3, "pin": "index" }, "to": { "node": 4, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "body" }, "to": { "node": 3 } },
+            \\    { "from": { "node": 3, "pin": "body" }, "to": { "node": 4 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "nested" });
+        defer allocator.free(out);
+
+        // While re-reads `go`; the inner ForRange and its body nest deeper.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (go) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var i_3: i32 = 0;") != null);
+        // Innermost statement reads the inner loop var and is deeply nested.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "acc = i_3;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "While cond reporters inlined-only are suppressed (no orphan bindings)" {
+        // bugbot HIGH (flow-codegen#21): `Compare(GetVariable x, Literal 10)
+        // → While.cond` inlines the comparison into the `while` header. The
+        // Compare/GetVariable/Literal reporters feed ONLY the cond, so their
+        // `n<id>_…` bindings would be orphaned, unused `const`s → a Zig
+        // "unused local constant" compile error. They must be suppressed.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "wh_suppress",
+            \\  "variables": [ { "name": "x", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "While", "pos": [0, 0] },
+            \\    { "id": 5, "type": "ChangeVariable", "name": "x", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_suppress" });
+        defer allocator.free(out);
+
+        // The header still inlines the condition.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while ((x < 10)) {") != null);
+        // NONE of the inlined-only reporters emit a binding before the loop.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n3_result") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n1_value") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n2_value") == null);
+        // No `const n…` binding at all survives this flow (all reporters
+        // were inlined into the header).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n") == null);
+        // …and their preview pulses are gone too (no emit for node 1/2/3).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "emitNodeEntered(\"wh_suppress\", 1)") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "emitNodeEntered(\"wh_suppress\", 3)") == null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "While cond reporter shared with a real consumer keeps its binding" {
+        // Precision (flow-codegen#21): a reporter inlined into a `While.cond`
+        // but ALSO feeding a real consumer must KEEP its binding — only the
+        // cond inlines a separate recomputed copy. Here `GetVariable x`
+        // feeds both the Compare (cond) and a `SetVariable y` command, so
+        // `n1_value` is still referenced and must be emitted.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "wh_shared",
+            \\  "variables": [ { "name": "x", "type": "i32", "default": 0 }, { "name": "y", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "While", "pos": [0, 0] },
+            \\    { "id": 5, "type": "ChangeVariable", "name": "x", "by": 1, "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "y", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 6, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_shared" });
+        defer allocator.free(out);
+
+        // The cond still inlines a recomputed copy.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while ((x < 10)) {") != null);
+        // GetVariable x is shared → its binding survives and is referenced
+        // by the SetVariable.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = x;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "y = n1_value;") != null);
+        // The Compare and Literal feed ONLY the cond → still suppressed.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n3_result") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n2_value") == null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForRange index consumed outside the loop body is rejected" {
+        // bugbot MEDIUM (flow-codegen#21): a node OUTSIDE the loop body that
+        // reads `ForRange.index` would emit `i_<id>` out of scope. Codegen
+        // rejects it (`error.MalformedFlow`) rather than emit uncompilable
+        // Zig. Here a top-level SetVariable reads the index but is NOT wired
+        // to the loop's `body` exec edge, so its scope is top-level.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fr_oos",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "index" }, "to": { "node": 2, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "fr_oos" }),
+        );
+    }
 };
