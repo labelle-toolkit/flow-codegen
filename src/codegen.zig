@@ -1229,10 +1229,16 @@ fn computeScopes(
     errdefer sm.deinit();
     const a = sm.arena.allocator();
 
-    // 1. Command / Branch scopes from the exec edges.
+    // 1. Exec-targeted nodes take the scope of the exec edge targeting
+    //    them. Commands / Branch nodes are the usual case, but a reporter
+    //    can also be exec-wired into a branch (a side-effecting
+    //    Call/CustomNode/Subflow run for its effect, value unused) — it
+    //    must run on that side, so exec-targeted reporters take their exec
+    //    scope here rather than falling to the data-consumer LCA below,
+    //    which would leave an unconsumed one top-level (flow-codegen#8).
     for (ctx.flow.nodes) |n| {
         if (n.kind == .Event) continue;
-        if (isReporter(n.kind)) continue;
+        if (isReporter(n.kind) and !isExecTarget(ctx, n.id)) continue;
         const sc = try execScopeOf(a, ctx, n.id, 0);
         try sm.map.put(n.id, sc);
     }
@@ -1247,6 +1253,8 @@ fn computeScopes(
         const node = ctx.index.byId(id) orelse unreachable;
         if (node.kind == .Event) continue;
         if (!isReporter(node.kind)) continue;
+        // An exec-wired reporter already got its scope in step 1.
+        if (sm.map.contains(id)) continue;
 
         var acc: ?[]const ScopeFrame = null;
         var any_consumer = false;
@@ -1297,6 +1305,16 @@ fn execScopeOf(
 /// and the trigger `Event` node return `false`.
 fn isReporter(k: flow_io.NodeKind) bool {
     return primaryOutputPin(k).len != 0;
+}
+
+/// Whether any exec edge targets `node_id` (the loader guarantees at
+/// most one). Such a node runs on a branch side regardless of whether
+/// it's a command or a value-binding reporter (flow-codegen#8).
+fn isExecTarget(ctx: *GraphContext, node_id: u32) bool {
+    for (ctx.flow.exec_edges) |x| {
+        if (x.to_node == node_id) return true;
+    }
+    return false;
 }
 
 fn emitBody(

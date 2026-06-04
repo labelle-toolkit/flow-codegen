@@ -3451,6 +3451,48 @@ pub const CoercionTests = struct {
         try expectParses(allocator, out);
     }
 
+    test "exec-wired reporter with unused output runs inside the branch (flow-codegen#8)" {
+        // A value node (here a Call) can be exec-wired into a branch side
+        // to run for its side effect, value unused. It must emit INSIDE
+        // the if-block, not hoisted to top-level (bugbot follow-up).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_exec_reporter",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 7, "type": "Call", "callee": "doThing", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 7 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "br_exec_reporter" });
+        defer allocator.free(out);
+
+        const if_at = std.mem.indexOf(u8, out, "if (n3_result) {");
+        const call_at = std.mem.indexOf(u8, out, "n7_result = doThing");
+        try expect.toBeTrue(if_at != null);
+        try expect.toBeTrue(call_at != null);
+        // The exec-wired Call runs inside the branch — after `if (`, not
+        // hoisted before it (the bug: an unconsumed reporter stayed
+        // top-level despite the exec edge).
+        try expect.toBeTrue(call_at.? > if_at.?);
+        try expectParses(allocator, out);
+    }
+
     test "Branch with unwired cond defaults to false" {
         const allocator = std.testing.allocator;
         const src =
