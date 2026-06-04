@@ -349,6 +349,28 @@ pub const FlowIoTests = struct {
         try std.testing.expectError(error.DanglingLink, flow_io.parseFlow(allocator, src));
     }
 
+    test "rejects a node targeted by two exec edges (ambiguous scope, flow-codegen#8)" {
+        const allocator = std.testing.allocator;
+        // Node 9 is wired to BOTH the branch's `then` and `else` — its
+        // control scope is ambiguous, so the loader rejects it.
+        const src =
+            \\{
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 9, "type": "ClearVariable", "name": "x", "pos": [0, 0] }
+            \\  ],
+            \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 9 } },
+            \\    { "from": { "node": 4, "pin": "else" }, "to": { "node": 9 } }
+            \\  ]
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
     test "rejects node id == 0" {
         const allocator = std.testing.allocator;
         const src =

@@ -883,6 +883,18 @@ fn validate(flow: Flow) ParseError!void {
             return error.MalformedFlow;
     }
 
+    // A node may be the exec-target of at most one Branch side. A node
+    // wired to two exec outputs (both sides of a branch, or different
+    // branches) has an ambiguous control scope — it can't lower into a
+    // single `if`/`else` arm, and "run on both sides" is better expressed
+    // as a top-level (unconditional) node. Reject it rather than silently
+    // taking the first matching edge (flow-codegen#8).
+    for (flow.exec_edges, 0..) |x, i| {
+        for (flow.exec_edges[i + 1 ..]) |y| {
+            if (x.to_node == y.to_node) return error.MalformedFlow;
+        }
+    }
+
     // `Param` nodes must name a declared parameter (RFC §3); `Output`
     // node names must be unique (RFC §3); Variable-touching nodes must
     // name a declared variable (RFC-FLOW-VOCABULARY §4).
