@@ -289,6 +289,8 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .GetComponent => |b| .{ .GetComponent = .{ .type = try a.dupe(u8, b.type) } },
         .SetField => |b| .{ .SetField = .{ .target = try a.dupe(u8, b.target) } },
         .BinOp => |b| .{ .BinOp = .{ .op = b.op } },
+        .Compare => |b| .{ .Compare = .{ .op = b.op } },
+        .Logic => |b| .{ .Logic = .{ .op = b.op } },
         .Literal => |b| .{ .Literal = .{ .value = try a.dupe(u8, b.value) } },
         .Identifier => |b| .{ .Identifier = .{ .name = try a.dupe(u8, b.name) } },
         .Call => |b| .{ .Call = .{ .callee = try a.dupe(u8, b.callee) } },
