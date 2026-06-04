@@ -239,6 +239,25 @@ pub const NodeKind = union(enum) {
     /// scope model). Carries no per-kind payload — the `then`/`else`
     /// targets are the exec edges, and the `cond` source is a data edge.
     Branch: struct {},
+    /// `ForRange` — count loop (flow-codegen#21). Consumes three **data**
+    /// input pins — `start`, `end`, `step` (all unwired-defaultable) — and
+    /// exposes a single **exec** output pin `body`, wired through
+    /// `Flow.exec_edges` exactly like a `Branch` side. Its `index` output
+    /// pin is the loop variable, readable only by body nodes (codegen
+    /// special-cases the read — see `resolveInput`). Codegen lowers it to a
+    /// scoped Zig `while` with an explicit `i32` loop var:
+    /// `{ var i_<id>: i32 = <start>; while (i_<id> < <end>) : (i_<id> +=
+    /// <step>) { <body> } }`. Carries no per-kind payload — every input is
+    /// a data edge, the body target is an exec edge.
+    ForRange: struct {},
+    /// `While` — condition loop (flow-codegen#21). Consumes one **data**
+    /// input pin `cond` (a `bool`) and exposes a single **exec** output
+    /// pin `body`. Unlike `Branch`, a `while` re-checks its condition every
+    /// iteration; codegen therefore deep-inlines the `cond` reporter
+    /// subtree into the loop header so it recomputes each pass (a binding
+    /// reference would freeze the once-bound value — see codegen's
+    /// `deepInlineExpr`). Carries no per-kind payload.
+    While: struct {},
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -732,6 +751,15 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         // payload — the `cond` source is a data edge and the
         // `then`/`else` targets are exec edges (`Flow.exec_edges`).
         return .{ .Branch = .{} };
+    } else if (std.mem.eql(u8, type_name, "ForRange")) {
+        // Count loop (flow-codegen#21). No per-kind payload — `start`,
+        // `end`, `step` are data edges and the `body` target is an exec
+        // edge.
+        return .{ .ForRange = .{} };
+    } else if (std.mem.eql(u8, type_name, "While")) {
+        // Condition loop (flow-codegen#21). No per-kind payload — `cond`
+        // is a data edge and the `body` target is an exec edge.
+        return .{ .While = .{} };
     }
     return error.UnknownNodeType;
 }
@@ -872,15 +900,23 @@ fn validate(flow: Flow) ParseError!void {
         if (!hasNode(flow.nodes, e.to.node)) return error.DanglingLink;
     }
 
-    // Exec edges (flow-codegen#8): both endpoints resolve to real nodes,
-    // the `from` node is a `Branch`, and the `from` pin is `then`/`else`.
+    // Exec edges (flow-codegen#8, #21): both endpoints resolve to real
+    // nodes, and the `(from kind, from pin)` pair is a valid exec source.
+    // A `Branch` routes through `then`/`else`; a `ForRange`/`While` loop
+    // routes its single `body` exec output (flow-codegen#21). Any other
+    // source kind or pin is malformed — exec edges only originate from a
+    // control-flow node's declared exec outputs.
     for (flow.exec_edges) |x| {
         if (!hasNode(flow.nodes, x.from.node)) return error.DanglingLink;
         if (!hasNode(flow.nodes, x.to_node)) return error.DanglingLink;
         const src = findNode(flow.nodes, x.from.node) orelse return error.DanglingLink;
-        if (src.kind != .Branch) return error.MalformedFlow;
-        if (!std.mem.eql(u8, x.from.pin, "then") and !std.mem.eql(u8, x.from.pin, "else"))
-            return error.MalformedFlow;
+        const ok = switch (src.kind) {
+            .Branch => std.mem.eql(u8, x.from.pin, "then") or
+                std.mem.eql(u8, x.from.pin, "else"),
+            .ForRange, .While => std.mem.eql(u8, x.from.pin, "body"),
+            else => false,
+        };
+        if (!ok) return error.MalformedFlow;
     }
 
     // A node may be the exec-target of at most one Branch side. A node
@@ -1276,8 +1312,11 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         },
         // `Branch` carries no per-kind fields (flow-codegen#8) — its
         // wiring lives in the data `edges` (`cond`) and `exec_edges`
-        // (`then`/`else`) lists, not on the node.
-        .Branch => {},
+        // (`then`/`else`) lists, not on the node. `ForRange`/`While`
+        // (flow-codegen#21) are the same shape: their `start`/`end`/`step`
+        // / `cond` inputs are data edges and their `body` target is an
+        // exec edge, so they carry no on-node payload either.
+        .Branch, .ForRange, .While => {},
     }
 }
 

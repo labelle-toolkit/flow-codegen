@@ -1369,6 +1369,14 @@ fn emitScope(
             continue;
         }
 
+        // Loop control nodes (flow-codegen#21) expand to a `while` header
+        // wrapping the recursively-emitted body scope — mirroring how a
+        // `Branch` expands to nested `if`/`else` blocks (see `emitLoop`).
+        if (node.kind == .ForRange or node.kind == .While) {
+            try emitLoop(allocator, w, ctx, flow_name, emit_preview, scopes, scope, node, scratch);
+            continue;
+        }
+
         if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
         try writeNodeBody(w, node, ctx, scratch);
         try discardUnconsumedResult(w, node, ctx);
@@ -1420,6 +1428,199 @@ fn emitBranch(
         if (body.len != 0) try indentBlock(w, body, "    ");
     }
     try w.writeAll("    }\n");
+}
+
+/// Lower a `ForRange` / `While` loop node at `scope` to a Zig `while`
+/// (flow-codegen#21). The body scope frame reuses the `branch` field as
+/// the controlling node id with side `"body"`, so `execScopeOf` already
+/// routes body-targeted nodes here (the field is named `branch` for the
+/// `Branch`-era code, but it is just "the controlling node's id").
+///
+/// `ForRange` emits a scoped block declaring an explicit `i32` loop var
+/// (`var i_<id>: i32 = …`) — Zig 0.16 rejects a bare `var i = 0` as a
+/// `comptime_int`, so the annotation is required — and a counted
+/// `while (i_<id> < <end>) : (i_<id> += <step>)`. Unwired
+/// `start`/`end`/`step` default to `0`/`0`/`1`. The block scopes the loop
+/// var so two `ForRange` nodes never collide even before the per-id
+/// suffix.
+///
+/// `While` re-checks its condition every iteration, but the data model
+/// binds reporters ONCE before the loop — referencing a binding would
+/// freeze the condition. So the `cond` is **deep-inlined**
+/// (`deepInlineExpr`) into the header: its pure reporter subtree is
+/// expanded into a single Zig expression that re-reads its operands each
+/// pass (e.g. a `Compare(GetVariable x, Literal 10)` → `while (x < 10)`).
+/// A `cond` whose subtree can't be deep-inlined (a side-effecting
+/// `Call` / `CustomNode` / `GetComponent` / `Subflow`) falls back to the
+/// frozen `n<id>_…` binding reference — such a condition does NOT
+/// re-evaluate (documented limitation; deep-inline covers the pure
+/// comparison/logic/variable cases the loop nodes are designed for).
+///
+/// The body is rendered to a buffer and re-indented one level with
+/// `indentBlock` — the same buffer+indent mechanism `emitBranch` uses —
+/// so nested loop bodies compound the 4-space base indent cleanly.
+fn emitLoop(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    // Render the body scope to a buffer, then re-indent it under the loop
+    // header. The body scope frame is `{ branch: <loop id>, side: "body" }`
+    // — every node reached by the loop's `body` exec edge, plus every
+    // reporter whose LCA scope sinks into the body (recomputed each pass).
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer body_aw.deinit();
+    const child = try appendFrame(allocator, scope, node.id, "body");
+    defer allocator.free(child);
+    try emitScope(allocator, &body_aw.writer, ctx, flow_name, emit_preview, scopes, child, scratch);
+    const body = body_aw.written();
+
+    switch (node.kind) {
+        .ForRange => {
+            // Defaults: start → 0, end → 0, step → 1 (a zero-trip loop
+            // when nothing is wired). The loop var is `i_<id>` so two
+            // ForRange nodes never collide; the enclosing block scopes it.
+            const start_expr = (try ctx.resolveInput(scratch, node, "start")) orelse
+                try scratch.dupe(u8, "0");
+            const end_expr = (try ctx.resolveInput(scratch, node, "end")) orelse
+                try scratch.dupe(u8, "0");
+            const step_expr = (try ctx.resolveInput(scratch, node, "step")) orelse
+                try scratch.dupe(u8, "1");
+
+            try w.writeAll("    {\n");
+            try w.print("        var i_{d}: i32 = {s};\n", .{ node.id, start_expr });
+            try w.print(
+                "        while (i_{d} < {s}) : (i_{d} += {s}) {{\n",
+                .{ node.id, end_expr, node.id, step_expr },
+            );
+            // Body buffered at the 4-space base; re-indent it two levels
+            // (the enclosing block + the `while`) so its statements land at
+            // 12 spaces.
+            if (body.len != 0) try indentBlock(w, body, "        ");
+            try w.writeAll("        }\n");
+            try w.writeAll("    }\n");
+        },
+        .While => {
+            // Deep-inline the cond so the `while` re-evaluates it each
+            // iteration; fall back to `false` (loop never runs) when the
+            // `cond` pin is unwired.
+            const cond_expr = (try deepInlineExpr(scratch, ctx, node, "cond")) orelse
+                try scratch.dupe(u8, "false");
+            try w.print("    while ({s}) {{\n", .{cond_expr});
+            if (body.len != 0) try indentBlock(w, body, "    ");
+            try w.writeAll("    }\n");
+        },
+        else => unreachable,
+    }
+}
+
+/// Recursively expand the pure reporter subtree feeding `pin` on
+/// `consumer` into a single Zig expression, allocated on `alloc`
+/// (flow-codegen#21). Unlike `resolveInput` — which returns the
+/// producer's once-bound `n<id>_…` *reference* — this re-reads the
+/// producer's own inputs inline, so the expression recomputes wherever it
+/// is placed (the key to a `While` header re-evaluating its condition).
+///
+/// Only *pure* reporter kinds are inlined: `GetVariable`, `Literal`,
+/// `Identifier`, `HasValueVariable`, `BinOp`, `Compare`, `Logic`. Anything
+/// else (a side-effecting `Call` / `CustomNode` / `GetComponent` /
+/// `Subflow`, or a producer with no primary value) falls back to the
+/// `resolveInput` binding reference — correct for value, but frozen
+/// (does not re-evaluate). Returns `null` only when `pin` is unwired.
+fn deepInlineExpr(
+    alloc: std.mem.Allocator,
+    ctx: *GraphContext,
+    consumer: *const flow_io.Node,
+    pin: []const u8,
+) (CodegenError || std.mem.Allocator.Error)!?[]const u8 {
+    const edge = ctx.index.producerOf(consumer.id, pin) orelse return null;
+    const producer = ctx.index.byId(edge.from.node) orelse return error.UnknownPin;
+    return try deepInlineNode(alloc, ctx, producer);
+}
+
+/// Inline a single producer node into a parenthesised Zig expression,
+/// recursing through its own pure inputs. The fallback for a non-pure or
+/// value-less producer is the `resolveInput` binding reference.
+fn deepInlineNode(
+    alloc: std.mem.Allocator,
+    ctx: *GraphContext,
+    producer: *const flow_io.Node,
+) (CodegenError || std.mem.Allocator.Error)![]const u8 {
+    switch (producer.kind) {
+        // Leaf reporters — re-emit the source text verbatim, so a
+        // `GetVariable` re-reads the file-scope `var` each iteration.
+        .GetVariable => |b| return try alloc.dupe(u8, b.name),
+        .Literal => |b| return try alloc.dupe(u8, b.value),
+        .Identifier => |b| return try alloc.dupe(u8, b.name),
+        .HasValueVariable => |b| return try std.fmt.allocPrint(alloc, "({s} != null)", .{b.name}),
+        // Binary/unary combinators — recurse into each operand so the
+        // whole subtree recomputes. Unwired operands fall back to the
+        // same per-kind defaults `writeNodeBody` uses.
+        .BinOp => |b| {
+            const a_expr = (try deepInlineOperand(alloc, ctx, producer, "a")) orelse try alloc.dupe(u8, "0");
+            const b_expr = (try deepInlineOperand(alloc, ctx, producer, "b")) orelse try alloc.dupe(u8, "0");
+            const op_text: []const u8 = switch (b.op) {
+                .add => "+",
+                .sub => "-",
+                .mul => "*",
+                .div => "/",
+            };
+            return try std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ a_expr, op_text, b_expr });
+        },
+        .Compare => |b| {
+            const a_expr = (try deepInlineOperand(alloc, ctx, producer, "a")) orelse try alloc.dupe(u8, "0");
+            const b_expr = (try deepInlineOperand(alloc, ctx, producer, "b")) orelse try alloc.dupe(u8, "0");
+            const op_text: []const u8 = switch (b.op) {
+                .eq => "==",
+                .ne => "!=",
+                .lt => "<",
+                .le => "<=",
+                .gt => ">",
+                .ge => ">=",
+            };
+            return try std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ a_expr, op_text, b_expr });
+        },
+        .Logic => |b| switch (b.op) {
+            .not => {
+                const a_expr = (try deepInlineOperand(alloc, ctx, producer, "a")) orelse try alloc.dupe(u8, "false");
+                return try std.fmt.allocPrint(alloc, "(!{s})", .{a_expr});
+            },
+            .@"and", .@"or" => {
+                const a_expr = (try deepInlineOperand(alloc, ctx, producer, "a")) orelse try alloc.dupe(u8, "false");
+                const b_expr = (try deepInlineOperand(alloc, ctx, producer, "b")) orelse try alloc.dupe(u8, "false");
+                const op_text: []const u8 = if (b.op == .@"and") "and" else "or";
+                return try std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ a_expr, op_text, b_expr });
+            },
+        },
+        // Side-effecting or value-less producers: fall back to the frozen
+        // binding reference (does NOT re-evaluate — documented limitation).
+        else => {
+            const primary = primaryOutputPin(producer.kind);
+            if (primary.len == 0) return error.UnknownPin;
+            return try std.fmt.allocPrint(alloc, "n{d}_{s}", .{ producer.id, primary });
+        },
+    }
+}
+
+/// Resolve an operand `pin` of a node being deep-inlined: recurse when a
+/// wire feeds it, `null` when it is unwired (caller supplies the default).
+fn deepInlineOperand(
+    alloc: std.mem.Allocator,
+    ctx: *GraphContext,
+    node: *const flow_io.Node,
+    pin: []const u8,
+) (CodegenError || std.mem.Allocator.Error)!?[]const u8 {
+    const edge = ctx.index.producerOf(node.id, pin) orelse return null;
+    const producer = ctx.index.byId(edge.from.node) orelse return error.UnknownPin;
+    return try deepInlineNode(alloc, ctx, producer);
 }
 
 /// Emit `_ = n<id>_<pin>;` for a node whose result value is bound to a
@@ -1527,6 +1728,15 @@ const GraphContext = struct {
         // scalar-vs-struct shape (RFC §6) is honoured.
         if (producer.kind == .Subflow) {
             return try self.resolveSubflowOutput(alloc, producer, edge.from.pin);
+        }
+
+        // A `ForRange`'s `index` output pin IS the loop variable
+        // (flow-codegen#21) — it resolves to the `i_<id>` name declared by
+        // the loop header, NOT an `n<id>_…` binding. Body nodes that read
+        // `index` emit inside the `while` block, where `i_<id>` is in
+        // scope. (`ForRange` exposes no other output pin.)
+        if (producer.kind == .ForRange and std.mem.eql(u8, edge.from.pin, "index")) {
+            return try std.fmt.allocPrint(alloc, "i_{d}", .{producer.id});
         }
 
         const primary = primaryOutputPin(producer.kind);
@@ -2112,6 +2322,11 @@ fn writeNodeBody(
         // exhaustive switch; reaching it would mean the scope walker
         // mis-classified a control-flow node.
         .Branch => unreachable,
+        // `ForRange` / `While` (flow-codegen#21) are loop control nodes —
+        // like `Branch`, `emitScope` intercepts them and emits the `while`
+        // header + recursively emits the body scope (see `emitLoop`). This
+        // arm is unreachable in a well-formed walk.
+        .ForRange, .While => unreachable,
     }
 }
 
@@ -2185,7 +2400,15 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // *data* value. Empty primary pin (no `n<id>_…` binding); the
         // `if`/else wrapper is emitted by the scope walker, not the flat
         // `discardUnconsumedResult` path.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch => "",
+        // `ForRange` / `While` are control-flow loop nodes (flow-codegen#21)
+        // — like `Branch`, they route execution (through their `body` exec
+        // output) rather than bind a top-level `n<id>_…` data value, so the
+        // primary pin is empty. `ForRange`'s `index` is a special-cased
+        // *output* pin (the loop var, readable only inside the body) but it
+        // is not a primary value binding — `resolveInput` handles it
+        // directly. The loop nodes are expanded by the scope walker
+        // (`emitScope`), never reaching the flat `discardUnconsumedResult`.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While => "",
     };
 }
 
@@ -2243,6 +2466,16 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // via `Flow.exec_edges`, not data input pins, so they never
         // appear here.
         .Branch => std.mem.eql(u8, pin, "cond"),
+        // `ForRange` consumes three data inputs — `start`, `end`, `step`
+        // (all unwired-defaultable; see `writeNodeBody`). Its `body` is an
+        // exec *output* and `index` is a data *output* (the loop var), so
+        // neither appears here (flow-codegen#21).
+        .ForRange => std.mem.eql(u8, pin, "start") or
+            std.mem.eql(u8, pin, "end") or
+            std.mem.eql(u8, pin, "step"),
+        // `While` consumes a single `cond` data input (a `bool`); its
+        // `body` is an exec output, wired via `exec_edges` (flow-codegen#21).
+        .While => std.mem.eql(u8, pin, "cond"),
     };
 }
 

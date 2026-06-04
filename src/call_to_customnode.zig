@@ -333,8 +333,11 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .ClearVariable => |b| .{ .ClearVariable = .{ .name = try a.dupe(u8, b.name) } },
         .HasValueVariable => |b| .{ .HasValueVariable = .{ .name = try a.dupe(u8, b.name) } },
         .CustomNode => |b| .{ .CustomNode = .{ .name = try a.dupe(u8, b.name) } },
-        // `Branch` carries no payload (flow-codegen#8).
+        // `Branch` carries no payload (flow-codegen#8); `ForRange`/`While`
+        // loops are payload-free too (flow-codegen#21).
         .Branch => .{ .Branch = .{} },
+        .ForRange => .{ .ForRange = .{} },
+        .While => .{ .While = .{} },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }
