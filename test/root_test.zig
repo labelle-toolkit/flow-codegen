@@ -3879,4 +3879,133 @@ pub const CoercionTests = struct {
 
         try expectParses(allocator, out);
     }
+
+    test "While cond reporters inlined-only are suppressed (no orphan bindings)" {
+        // bugbot HIGH (flow-codegen#21): `Compare(GetVariable x, Literal 10)
+        // → While.cond` inlines the comparison into the `while` header. The
+        // Compare/GetVariable/Literal reporters feed ONLY the cond, so their
+        // `n<id>_…` bindings would be orphaned, unused `const`s → a Zig
+        // "unused local constant" compile error. They must be suppressed.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "wh_suppress",
+            \\  "variables": [ { "name": "x", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "While", "pos": [0, 0] },
+            \\    { "id": 5, "type": "ChangeVariable", "name": "x", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_suppress" });
+        defer allocator.free(out);
+
+        // The header still inlines the condition.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while ((x < 10)) {") != null);
+        // NONE of the inlined-only reporters emit a binding before the loop.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n3_result") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n1_value") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n2_value") == null);
+        // No `const n…` binding at all survives this flow (all reporters
+        // were inlined into the header).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n") == null);
+        // …and their preview pulses are gone too (no emit for node 1/2/3).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "emitNodeEntered(\"wh_suppress\", 1)") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "emitNodeEntered(\"wh_suppress\", 3)") == null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "While cond reporter shared with a real consumer keeps its binding" {
+        // Precision (flow-codegen#21): a reporter inlined into a `While.cond`
+        // but ALSO feeding a real consumer must KEEP its binding — only the
+        // cond inlines a separate recomputed copy. Here `GetVariable x`
+        // feeds both the Compare (cond) and a `SetVariable y` command, so
+        // `n1_value` is still referenced and must be emitted.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "wh_shared",
+            \\  "variables": [ { "name": "x", "type": "i32", "default": 0 }, { "name": "y", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "While", "pos": [0, 0] },
+            \\    { "id": 5, "type": "ChangeVariable", "name": "x", "by": 1, "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "y", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 6, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "body" }, "to": { "node": 5 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "wh_shared" });
+        defer allocator.free(out);
+
+        // The cond still inlines a recomputed copy.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while ((x < 10)) {") != null);
+        // GetVariable x is shared → its binding survives and is referenced
+        // by the SetVariable.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = x;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "y = n1_value;") != null);
+        // The Compare and Literal feed ONLY the cond → still suppressed.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n3_result") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n2_value") == null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForRange index consumed outside the loop body is rejected" {
+        // bugbot MEDIUM (flow-codegen#21): a node OUTSIDE the loop body that
+        // reads `ForRange.index` would emit `i_<id>` out of scope. Codegen
+        // rejects it (`error.MalformedFlow`) rather than emit uncompilable
+        // Zig. Here a top-level SetVariable reads the index but is NOT wired
+        // to the loop's `body` exec edge, so its scope is top-level.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fr_oos",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "index" }, "to": { "node": 2, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "fr_oos" }),
+        );
+    }
 };
