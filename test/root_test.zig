@@ -2795,7 +2795,7 @@ pub const CustomNodeTests = struct {
 
         // Reporter shape: binds result to `n3_value`, qualified decl
         // path, both arg pins resolve to their wired producers.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game, n1_value, n2_value);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game, n1_value, n2_value);") != null);
     }
 
     test "codegen lowers a void-returning CustomNode (command form)" {
@@ -2831,7 +2831,7 @@ pub const CustomNodeTests = struct {
         defer allocator.free(out);
 
         // Command shape: bare statement (no `const n2_value =` binding).
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "game_mod.PluginFlowNodes.box2d__apply_impulse.impl(game, n1_value);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "@TypeOf(game_mod.PluginFlowNodes.box2d__apply_impulse).impl(game, n1_value);") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value =") == null);
         // No discard line — there is no `n2_value` to discard.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n2_value;") == null);
@@ -2924,7 +2924,7 @@ pub const CustomNodeTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub const FlowEventHandler = struct") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn box2d__collision_begin(self: *@This()") != null);
         // The void CustomNode body — bare statement, no result binding.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "game_mod.PluginFlowNodes.my_helpers__log_it.impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "@TypeOf(game_mod.PluginFlowNodes.my_helpers__log_it).impl(game);") != null);
 
         const z = try allocator.allocSentinel(u8, out.len, 0);
         defer allocator.free(z);
@@ -2970,7 +2970,7 @@ pub const CustomNodeTests = struct {
         );
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game);") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value + n2_value;") != null);
     }
 
@@ -3012,7 +3012,7 @@ pub const CustomNodeTests = struct {
         );
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game_mod.PluginFlowNodes.my_helpers__score.impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game);") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n1_value;") != null);
     }
 };

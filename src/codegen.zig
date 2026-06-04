@@ -1726,14 +1726,20 @@ fn writeNodeBody(
             const entry = reg.get(b.name) orelse return error.UnknownFlowNode;
 
             const arity = countCallArgs(ctx.flow, node.id);
+            // Reach `impl` through the registry entry's TYPE, not the value.
+            // `PluginFlowNodes.<q>` is a FlowNode *value*; `value.impl(game, …)`
+            // would trip Zig's method-call syntax and bind the value as impl's
+            // first parameter (`game`), shifting every real arg. `@TypeOf(...)`
+            // gives the FlowNodeReturn struct type, so `Type.impl(game, …)` is a
+            // plain namespaced call with no receiver to bind (flow-codegen#28).
             if (entry.is_void) {
                 try w.print(
-                    "    game_mod.PluginFlowNodes.{s}.impl(game",
+                    "    @TypeOf(game_mod.PluginFlowNodes.{s}).impl(game",
                     .{entry.qualified},
                 );
             } else {
                 try w.print(
-                    "    const n{d}_value = game_mod.PluginFlowNodes.{s}.impl(game",
+                    "    const n{d}_value = @TypeOf(game_mod.PluginFlowNodes.{s}).impl(game",
                     .{ node.id, entry.qualified },
                 );
             }
