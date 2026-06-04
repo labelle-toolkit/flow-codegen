@@ -1521,6 +1521,42 @@ fn writeNodeBody(
                 .{ node.id, a_expr, op_text, b_expr },
             );
         },
+        // Comparison (flow-codegen#7) — binary, `result` is a `bool`.
+        // Unwired inputs default to `0` (a benign `0 == 0`-style compare),
+        // matching BinOp's arithmetic default.
+        .Compare => |b| {
+            const a_expr = (try ctx.resolveInput(scratch, node, "a")) orelse try scratch.dupe(u8, "0");
+            const b_expr = (try ctx.resolveInput(scratch, node, "b")) orelse try scratch.dupe(u8, "0");
+            const op_text: []const u8 = switch (b.op) {
+                .eq => "==",
+                .ne => "!=",
+                .lt => "<",
+                .le => "<=",
+                .gt => ">",
+                .ge => ">=",
+            };
+            try w.print(
+                "    const n{d}_result = {s} {s} {s};\n",
+                .{ node.id, a_expr, op_text, b_expr },
+            );
+        },
+        // Boolean logic (flow-codegen#7) — `not` is unary (`a` only),
+        // `and`/`or` are binary. Unwired inputs default to `false`.
+        .Logic => |b| switch (b.op) {
+            .not => {
+                const a_expr = (try ctx.resolveInput(scratch, node, "a")) orelse try scratch.dupe(u8, "false");
+                try w.print("    const n{d}_result = !{s};\n", .{ node.id, a_expr });
+            },
+            .@"and", .@"or" => {
+                const a_expr = (try ctx.resolveInput(scratch, node, "a")) orelse try scratch.dupe(u8, "false");
+                const b_expr = (try ctx.resolveInput(scratch, node, "b")) orelse try scratch.dupe(u8, "false");
+                const op_text: []const u8 = if (b.op == .@"and") "and" else "or";
+                try w.print(
+                    "    const n{d}_result = {s} {s} {s};\n",
+                    .{ node.id, a_expr, op_text, b_expr },
+                );
+            },
+        },
         .Literal => |b| try w.print(
             "    const n{d}_value = {s};\n",
             .{ node.id, b.value },
@@ -1826,6 +1862,9 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
     return switch (k) {
         .GetComponent, .Literal, .Identifier, .Param => "value",
         .BinOp, .Call, .Subflow => "result",
+        // Comparison / logic reporters (flow-codegen#7) — single `bool`
+        // output pin, same `result` naming as `BinOp`.
+        .Compare, .Logic => "result",
         // `GetVariable` is a reporter (RFC-FLOW-VOCABULARY §4) — its
         // single output pin is `value`, the same shape as `Literal` /
         // `Identifier` / `GetComponent`. `SetVariable` /
@@ -1872,6 +1911,9 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         .SetField => std.mem.eql(u8, pin, "value") or std.mem.eql(u8, pin, "entity"),
         .Output => std.mem.eql(u8, pin, "value"),
         .BinOp => std.mem.eql(u8, pin, "a") or std.mem.eql(u8, pin, "b"),
+        // Compare is binary (`a`,`b`); Logic accepts `a` (+ `b` for
+        // and/or — a stray `b` on a `not` node is ignored at lowering).
+        .Compare, .Logic => std.mem.eql(u8, pin, "a") or std.mem.eql(u8, pin, "b"),
         .Call => isCallArgPin(pin),
         // A Subflow's input pins are its referenced flow's params —
         // any non-empty name is accepted here; an unknown param is

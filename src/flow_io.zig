@@ -92,6 +92,14 @@ pub const Event = union(enum) {
 /// Binary operator for `NodeKind.BinOp`.
 pub const BinOpKind = enum { add, sub, mul, div };
 
+/// Comparison operator for `NodeKind.Compare` — binary, produces a
+/// `bool`. (flow-codegen#7)
+pub const CompareKind = enum { eq, ne, lt, le, gt, ge };
+
+/// Boolean operator for `NodeKind.Logic` — produces a `bool`. `not` is
+/// unary (only the `a` pin); `@"and"`/`@"or"` are binary. (flow-codegen#7)
+pub const LogicKind = enum { @"and", @"or", not };
+
 /// On-disk position. `[120, 80]` in JSONC. Index 0 is x, 1 is y.
 pub const Pos = [2]f32;
 
@@ -139,6 +147,8 @@ pub const NodeKind = union(enum) {
     GetComponent: struct { type: []const u8 },
     SetField: struct { target: []const u8 },
     BinOp: struct { op: BinOpKind },
+    Compare: struct { op: CompareKind },
+    Logic: struct { op: LogicKind },
     Literal: struct { value: []const u8 },
     Identifier: struct { name: []const u8 },
     Call: struct { callee: []const u8 },
@@ -612,6 +622,14 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         const op_s = try reqStr(a, o, "op");
         const op = std.meta.stringToEnum(BinOpKind, op_s) orelse return error.MalformedFlow;
         return .{ .BinOp = .{ .op = op } };
+    } else if (std.mem.eql(u8, type_name, "Compare")) {
+        const op_s = try reqStr(a, o, "op");
+        const op = std.meta.stringToEnum(CompareKind, op_s) orelse return error.MalformedFlow;
+        return .{ .Compare = .{ .op = op } };
+    } else if (std.mem.eql(u8, type_name, "Logic")) {
+        const op_s = try reqStr(a, o, "op");
+        const op = std.meta.stringToEnum(LogicKind, op_s) orelse return error.MalformedFlow;
+        return .{ .Logic = .{ .op = op } };
     } else if (std.mem.eql(u8, type_name, "Literal")) {
         return .{ .Literal = .{ .value = try literalValue(a, o) } };
     } else if (std.mem.eql(u8, type_name, "Identifier")) {
@@ -1042,6 +1060,8 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try writeJsonString(w, b.target);
         },
         .BinOp => |b| try w.print(", \"op\": \"{s}\"", .{@tagName(b.op)}),
+        .Compare => |b| try w.print(", \"op\": \"{s}\"", .{@tagName(b.op)}),
+        .Logic => |b| try w.print(", \"op\": \"{s}\"", .{@tagName(b.op)}),
         // `value` is Zig expression text: a JSON-native scalar is
         // written bare so it round-trips through `literalValue`'s
         // number/bool arms; anything else as a JSON string.

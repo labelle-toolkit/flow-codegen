@@ -615,6 +615,64 @@ pub const FlowCodegenTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_result = 0 * 0;") != null);
     }
 
+    test "renders Compare into a bool comparison (flow-codegen#7)" {
+        const allocator = std.testing.allocator;
+        const out = try render(allocator,
+            \\{
+            \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 1, "type": "Literal", "value": "3", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": "5", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } }
+            \\  ]
+            \\}
+        , "cmp");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value < n2_value;") != null);
+    }
+
+    test "renders Logic and over two bool inputs (flow-codegen#7)" {
+        const allocator = std.testing.allocator;
+        const out = try render(allocator,
+            \\{
+            \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 1, "type": "Literal", "value": "true", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": "false", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Logic", "op": "and", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } }
+            \\  ]
+            \\}
+        , "logic");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value and n2_value;") != null);
+    }
+
+    test "renders Logic not as a unary negation (flow-codegen#7)" {
+        const allocator = std.testing.allocator;
+        const out = try render(allocator,
+            \\{
+            \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 1, "type": "Literal", "value": "true", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Logic", "op": "not", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "a" } }
+            \\  ]
+            \\}
+        , "lnot");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_result = !n1_value;") != null);
+    }
+
     test "renders GetComponent node with component @import" {
         const allocator = std.testing.allocator;
         // Post-Phase 6: Event-node-form flows have no in-scope `entity`
