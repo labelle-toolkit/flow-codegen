@@ -349,6 +349,28 @@ pub const FlowIoTests = struct {
         try std.testing.expectError(error.DanglingLink, flow_io.parseFlow(allocator, src));
     }
 
+    test "rejects a node targeted by two exec edges (ambiguous scope, flow-codegen#8)" {
+        const allocator = std.testing.allocator;
+        // Node 9 is wired to BOTH the branch's `then` and `else` — its
+        // control scope is ambiguous, so the loader rejects it.
+        const src =
+            \\{
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 9, "type": "ClearVariable", "name": "x", "pos": [0, 0] }
+            \\  ],
+            \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 9 } },
+            \\    { "from": { "node": 4, "pin": "else" }, "to": { "node": 9 } }
+            \\  ]
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
     test "rejects node id == 0" {
         const allocator = std.testing.allocator;
         const src =
@@ -1985,6 +2007,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         .variables = &.{},
         .nodes = &.{},
         .edges = &.{},
+        .exec_edges = &.{},
     });
 
     /// Assert `src` is syntactically valid Zig — generated code must
@@ -3091,6 +3114,18 @@ pub const CoercionTests = struct {
         return reg;
     }
 
+    /// Assert `src` is syntactically valid Zig — generated control-flow
+    /// code (flow-codegen#8) must parse. Mirrors `FlowFileTests`'.
+    fn expectParses(allocator: std.mem.Allocator, src: []const u8) !void {
+        const z = try allocator.allocSentinel(u8, src.len, 0);
+        defer allocator.free(z);
+        @memcpy(z[0..src.len], src);
+        var ast = try std.zig.Ast.parse(allocator, z, .zig);
+        defer ast.deinit(allocator);
+        if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{src});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+    }
+
     test "wireFitAccepts: type equality returns .exact" {
         // Rule 1 — Zig type equality always fits. The registry doesn't
         // need to contain anything for this path; it's the trivial
@@ -3258,5 +3293,259 @@ pub const CoercionTests = struct {
 
         // Sanity: the body of the entry fn was emitted.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn onCall(game: anytype)") != null);
+    }
+
+    // =====================================================================
+    // Branch — control flow / if-then-else + exec edges (flow-codegen#8)
+    // =====================================================================
+
+    test "Branch lowers to if/else with both sides' assignments nested" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_if_else",
+            \\  "variables": [
+            \\    { "name": "lo", "type": "i32", "default": 0 },
+            \\    { "name": "hi", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "lt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 5, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "lo", "pos": [0, 0] },
+            \\    { "id": 7, "type": "Literal", "value": 2, "pos": [0, 0] },
+            \\    { "id": 8, "type": "SetVariable", "name": "hi", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 6, "pin": "value" } },
+            \\    { "from": { "node": 7, "pin": "value" }, "to": { "node": 8, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } },
+            \\    { "from": { "node": 4, "pin": "else" }, "to": { "node": 8 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "br_if_else" });
+        defer allocator.free(out);
+
+        // The Compare condition gates a real `if`, with an `else` arm.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "if (n3_result) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "} else {") != null);
+        // Both sides' assignments appear, each nested one level deeper
+        // than the `if` (8-space indent under the entry fn's 4).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        lo = n5_value;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        hi = n7_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Branch sinks a reporter read-after-write into the if-block" {
+        // A side that does `SetVariable count = …` then reads `count`
+        // (GetVariable) feeding another command must emit the
+        // GetVariable binding INSIDE the if-block, AFTER the
+        // SetVariable — proving the reporter is sunk into the side's
+        // scope rather than hoisted before the branch (where it would
+        // read the pre-write value).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_raw",
+            \\  "variables": [
+            \\    { "name": "count", "type": "i32", "default": 0 },
+            \\    { "name": "mirror", "type": "i32", "default": 0 },
+            \\    { "name": "flag", "type": "bool", "default": true }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "flag", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "count", "pos": [0, 0] },
+            \\    { "id": 5, "type": "GetVariable", "name": "count", "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "mirror", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "cond" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "value" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 6, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "then" }, "to": { "node": 4 } },
+            \\    { "from": { "node": 2, "pin": "then" }, "to": { "node": 6 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "br_raw" });
+        defer allocator.free(out);
+
+        // The GetVariable binding must appear, and AFTER the write.
+        const write_at = std.mem.indexOf(u8, out, "count = n3_value;");
+        const read_at = std.mem.indexOf(u8, out, "const n5_value = count;");
+        const if_at = std.mem.indexOf(u8, out, "if (n1_value) {");
+        try expect.toBeTrue(write_at != null);
+        try expect.toBeTrue(read_at != null);
+        try expect.toBeTrue(if_at != null);
+        // Read is sunk into the if-block (after the `if (`) and ordered
+        // after the write (read-after-write preserved).
+        try expect.toBeTrue(read_at.? > if_at.?);
+        try expect.toBeTrue(read_at.? > write_at.?);
+        // Sunk one level deep — 8-space indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        const n5_value = count;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Branch shared cond reporter computes before the if" {
+        // The Compare result feeding the Branch `cond` is shared (it IS
+        // the condition) and must be bound BEFORE `if (`.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_shared",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "gt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 5, "type": "Literal", "value": 9, "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "cond" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 6, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 4, "pin": "then" }, "to": { "node": 6 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "br_shared" });
+        defer allocator.free(out);
+
+        const cmp_at = std.mem.indexOf(u8, out, "const n3_result = n1_value > n2_value;");
+        const if_at = std.mem.indexOf(u8, out, "if (n3_result) {");
+        try expect.toBeTrue(cmp_at != null);
+        try expect.toBeTrue(if_at != null);
+        // The condition's binding precedes the `if` that consumes it,
+        // and is at top-level (4-space) indent — not sunk.
+        try expect.toBeTrue(cmp_at.? < if_at.?);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "    const n3_result = n1_value > n2_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Branch with unwired cond defaults to false" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_default",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "then" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "br_default" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "if (false) {") != null);
+        try expectParses(allocator, out);
+    }
+
+    test "Branch + exec_edges round-trip through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "br_rt",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Branch", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "then" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(loaded.flow.exec_edges.len, @as(usize, 1));
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), loaded.flow.nodes[0].kind), .Branch);
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"exec_edges\"") != null);
+
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(roundtrip.flow.exec_edges.len, @as(usize, 1));
+        try expect.equal(roundtrip.flow.exec_edges[0].from.node, @as(u32, 1));
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.exec_edges[0].from.pin, "then"));
+        try expect.equal(roundtrip.flow.exec_edges[0].to_node, @as(u32, 3));
+    }
+
+    test "no Branch / empty exec_edges still emits the flat form" {
+        // Backward-compat: a flow with no control flow renders the same
+        // top-level flat body it always did (no `if` wrapper).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "flat",
+            \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 4, "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "flat" });
+        defer allocator.free(out);
+
+        // No branch wrapper: no `else` arm, and the body stays at the
+        // entry fn's 4-space indent (no 8-space sunk statements). The
+        // preview pulse's own `if (game.preview)` is unrelated, so we
+        // assert on the absence of the control-flow shapes specifically.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "} else {") == null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "    const n1_value = 4;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "    out = n1_value;") != null);
     }
 };

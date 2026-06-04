@@ -228,6 +228,17 @@ pub const NodeKind = union(enum) {
     /// `validate` accepts any non-empty name; codegen rejects unknown
     /// names against the registry as `UnknownFlowNode`.
     CustomNode: struct { name: []const u8 },
+    /// `Branch` — control-flow `if`/then-else (flow-codegen#8). The first
+    /// control-flow node: it consumes a single `cond` **data** input pin
+    /// (a `bool`) and exposes two **exec** outputs, `then` and `else`,
+    /// which route control flow rather than carry values. The exec wiring
+    /// lives in `Flow.exec_edges`, NOT in the data `edges` list — exec
+    /// edges don't participate in the data topo sort. Codegen lowers a
+    /// `Branch` to a Zig `if (<cond>) { … } else { … }` and sinks each
+    /// side's commands/reporters into the matching block (see codegen's
+    /// scope model). Carries no per-kind payload — the `then`/`else`
+    /// targets are the exec edges, and the `cond` source is a data edge.
+    Branch: struct {},
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -253,6 +264,23 @@ pub const Edge = struct {
 
 /// Back-compat alias — codegen and tests still spell it `Link`.
 pub const Link = Edge;
+
+/// A control-flow (execution) edge (flow-codegen#8). Distinct from a
+/// data `Edge`: where a data edge wires a producer pin's *value* into a
+/// consumer pin, an exec edge wires a `Branch`'s `then`/`else` exec
+/// output to the *node that runs* on that side. `from` is the source
+/// exec pin — `{ .node = <branch id>, .pin = "then" | "else" }` — and
+/// `to_node` is the id of the command/`Branch` node that executes when
+/// control reaches that side.
+///
+/// On disk (RFC-FLOWS-JSONC, `.flow.jsonc`): a separate `exec_edges`
+/// array, each entry `{ "from": { "node": 1, "pin": "then" }, "to": {
+/// "node": 2 } }` — note `to` is a bare node ref (no `pin`), since the
+/// target node is *entered*, not wired to a specific input pin.
+pub const ExecEdge = struct {
+    from: PinRef,
+    to_node: u32,
+};
 
 /// A top-level declared variable (RFC-FLOW-VOCABULARY §4). Lowers to a
 /// file-scope `var <name>: <type> = <default>;` in the generated `.zig`
@@ -295,6 +323,11 @@ pub const Flow = struct {
     /// Renamed from `links` per RFC §2; the field keeps the name
     /// `edges` to match the on-disk schema.
     edges: []Edge,
+    /// Control-flow (execution) edges (flow-codegen#8). Empty for every
+    /// flow that declares no `Branch` node — the default, and the only
+    /// shape that existed before control flow. Optional in the source
+    /// file; absence is indistinguishable from `"exec_edges": []`.
+    exec_edges: []ExecEdge = &.{},
 
     /// Compatibility accessor — older codegen code reads `flow.links`.
     pub fn links(self: Flow) []Edge {
@@ -421,6 +454,7 @@ fn buildFlow(
     // pass validation — reject the stale key rather than ignore it.
     if (obj.get("edges") == null and obj.get("links") != null) return error.MalformedFlow;
     const edges = try buildEdges(a, obj.get("edges"));
+    const exec_edges = try buildExecEdges(a, obj.get("exec_edges"));
 
     // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3 (Phase 6),
     // event-driven flows declare their trigger as one or more in-graph
@@ -463,6 +497,7 @@ fn buildFlow(
         .variables = variables,
         .nodes = nodes,
         .edges = edges,
+        .exec_edges = exec_edges,
     };
 }
 
@@ -692,6 +727,11 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         const name = try reqStr(a, o, "name");
         if (name.len == 0) return error.MalformedFlow;
         return .{ .CustomNode = .{ .name = name } };
+    } else if (std.mem.eql(u8, type_name, "Branch")) {
+        // Control-flow `if`/then-else (flow-codegen#8). No per-kind
+        // payload — the `cond` source is a data edge and the
+        // `then`/`else` targets are exec edges (`Flow.exec_edges`).
+        return .{ .Branch = .{} };
     }
     return error.UnknownNodeType;
 }
@@ -768,6 +808,37 @@ fn buildPinRef(a: std.mem.Allocator, maybe: ?std.json.Value) !PinRef {
     };
 }
 
+/// Parse the optional `exec_edges` array (flow-codegen#8). Absent →
+/// empty slice (every pre-control-flow file). Each entry is `{ "from":
+/// { "node", "pin" }, "to": { "node" } }`: `from` is a full pin ref
+/// (the `Branch`'s `then`/`else` exec output), `to` is a bare node ref
+/// — the target node is *entered*, not wired to a named input pin.
+fn buildExecEdges(a: std.mem.Allocator, maybe: ?std.json.Value) ![]ExecEdge {
+    const v = maybe orelse return &.{};
+    if (v != .array) return error.MalformedFlow;
+    const items = v.array.items;
+    const out = try a.alloc(ExecEdge, items.len);
+    for (items, 0..) |it, i| {
+        if (it != .object) return error.MalformedFlow;
+        out[i] = .{
+            .from = try buildPinRef(a, it.object.get("from")),
+            .to_node = try buildNodeRef(it.object.get("to")),
+        };
+    }
+    return out;
+}
+
+/// Parse a bare node reference — `{ "node": <id> }` — the `to` end of
+/// an exec edge. Unlike `buildPinRef` there is no `pin`: an exec edge
+/// enters a node, it does not target one of its input pins.
+fn buildNodeRef(maybe: ?std.json.Value) !u32 {
+    const v = maybe orelse return error.MalformedFlow;
+    if (v != .object) return error.MalformedFlow;
+    const node_v = v.object.get("node") orelse return error.MalformedFlow;
+    if (node_v != .integer or node_v.integer < 0) return error.MalformedFlow;
+    return std.math.cast(u32, node_v.integer) orelse return error.MalformedFlow;
+}
+
 // =====================================================================
 // Validation
 // =====================================================================
@@ -799,6 +870,29 @@ fn validate(flow: Flow) ParseError!void {
     for (flow.edges) |e| {
         if (!hasNode(flow.nodes, e.from.node)) return error.DanglingLink;
         if (!hasNode(flow.nodes, e.to.node)) return error.DanglingLink;
+    }
+
+    // Exec edges (flow-codegen#8): both endpoints resolve to real nodes,
+    // the `from` node is a `Branch`, and the `from` pin is `then`/`else`.
+    for (flow.exec_edges) |x| {
+        if (!hasNode(flow.nodes, x.from.node)) return error.DanglingLink;
+        if (!hasNode(flow.nodes, x.to_node)) return error.DanglingLink;
+        const src = findNode(flow.nodes, x.from.node) orelse return error.DanglingLink;
+        if (src.kind != .Branch) return error.MalformedFlow;
+        if (!std.mem.eql(u8, x.from.pin, "then") and !std.mem.eql(u8, x.from.pin, "else"))
+            return error.MalformedFlow;
+    }
+
+    // A node may be the exec-target of at most one Branch side. A node
+    // wired to two exec outputs (both sides of a branch, or different
+    // branches) has an ambiguous control scope — it can't lower into a
+    // single `if`/`else` arm, and "run on both sides" is better expressed
+    // as a top-level (unconditional) node. Reject it rather than silently
+    // taking the first matching edge (flow-codegen#8).
+    for (flow.exec_edges, 0..) |x, i| {
+        for (flow.exec_edges[i + 1 ..]) |y| {
+            if (x.to_node == y.to_node) return error.MalformedFlow;
+        }
     }
 
     // `Param` nodes must name a declared parameter (RFC §3); `Output`
@@ -868,6 +962,11 @@ fn findVariable(variables: []const Variable, name: []const u8) ?Variable {
 fn hasNode(nodes: []const Node, id: u32) bool {
     for (nodes) |n| if (n.id == id) return true;
     return false;
+}
+
+fn findNode(nodes: []const Node, id: u32) ?*const Node {
+    for (nodes) |*n| if (n.id == id) return n;
+    return null;
 }
 
 fn hasParam(params: []const Param, name: []const u8) bool {
@@ -977,7 +1076,28 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
         if (i + 1 < sorted_edges.len) try w.writeAll(",");
         try w.writeAll("\n");
     }
-    try w.writeAll("  ]\n");
+    // The `edges` block keeps no trailing comma unless an `exec_edges`
+    // block follows it — emitted only when non-empty so pre-control-flow
+    // files round-trip byte-for-byte (flow-codegen#8).
+    if (flow.exec_edges.len == 0) {
+        try w.writeAll("  ]\n");
+    } else {
+        try w.writeAll("  ],\n");
+
+        const sorted_exec = try allocator.dupe(ExecEdge, flow.exec_edges);
+        defer allocator.free(sorted_exec);
+        std.mem.sort(ExecEdge, sorted_exec, {}, lessThanExecEdge);
+
+        try w.writeAll("  \"exec_edges\": [\n");
+        for (sorted_exec, 0..) |x, i| {
+            try w.print("    {{ \"from\": {{ \"node\": {d}, \"pin\": ", .{x.from.node});
+            try writeJsonString(w, x.from.pin);
+            try w.print(" }}, \"to\": {{ \"node\": {d} }} }}", .{x.to_node});
+            if (i + 1 < sorted_exec.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("  ]\n");
+    }
 
     try w.writeAll("}\n");
     return aw.toOwnedSlice();
@@ -1043,6 +1163,16 @@ fn lessThanEdge(_: void, a: Edge, b: Edge) bool {
     if (fp != .eq) return fp == .lt;
     if (a.to.node != b.to.node) return a.to.node < b.to.node;
     return std.mem.order(u8, a.to.pin, b.to.pin) == .lt;
+}
+
+/// Deterministic order for exec edges (flow-codegen#8) — by source
+/// `Branch` id, then by exec pin (`else` < `then`), then by target node.
+/// Keeps editor re-saves diff-clean, matching `lessThanEdge`.
+fn lessThanExecEdge(_: void, a: ExecEdge, b: ExecEdge) bool {
+    if (a.from.node != b.from.node) return a.from.node < b.from.node;
+    const fp = std.mem.order(u8, a.from.pin, b.from.pin);
+    if (fp != .eq) return fp == .lt;
+    return a.to_node < b.to_node;
 }
 
 fn nodeTypeName(k: NodeKind) []const u8 {
@@ -1144,6 +1274,10 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"name\": ");
             try writeJsonString(w, b.name);
         },
+        // `Branch` carries no per-kind fields (flow-codegen#8) — its
+        // wiring lives in the data `edges` (`cond`) and `exec_edges`
+        // (`then`/`else`) lists, not on the node.
+        .Branch => {},
     }
 }
 

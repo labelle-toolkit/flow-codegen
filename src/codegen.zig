@@ -1125,6 +1125,180 @@ fn writeReturnType(
 /// `Event` nodes (RFC-FLOW-VOCABULARY §3) are graph triggers and emit
 /// no body — they're dropped here so they participate in neither the
 /// preview pulse nor the body lowering.
+// =====================================================================
+// Control flow — scopes (flow-codegen#8)
+// =====================================================================
+
+/// One frame of a control-flow scope path: a `Branch` id plus which of
+/// its two exec sides we descended into. A scope is a slice of these,
+/// root-to-leaf; the empty slice is the top-level scope.
+const ScopeFrame = struct {
+    branch: u32,
+    /// `"then"` or `"else"` — the exec pin we entered the branch by.
+    side: []const u8,
+};
+
+/// Per-node computed scope (`node id → scope path`). Scopes are owned by
+/// an internal arena freed in `deinit`; `get` returns the empty slice
+/// for any node with no recorded scope (top-level / unknown).
+const ScopeMap = struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.AutoHashMap(u32, []const ScopeFrame),
+
+    fn get(self: *const ScopeMap, id: u32) []const ScopeFrame {
+        return self.map.get(id) orelse &.{};
+    }
+
+    fn deinit(self: *ScopeMap) void {
+        self.map.deinit();
+        self.arena.deinit();
+    }
+};
+
+fn scopeEql(a: []const ScopeFrame, b: []const ScopeFrame) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.branch != y.branch or !std.mem.eql(u8, x.side, y.side)) return false;
+    }
+    return true;
+}
+
+/// True when `anc` is an ancestor-or-equal of `desc` — i.e. `anc` is a
+/// prefix of `desc`. The lowest-common-ancestor reporter sink relies on
+/// this (a reporter sinks to the deepest scope that is a prefix of every
+/// consumer's scope).
+fn scopePrefix(anc: []const ScopeFrame, desc: []const ScopeFrame) bool {
+    if (anc.len > desc.len) return false;
+    return scopeEql(anc, desc[0..anc.len]);
+}
+
+/// Lowest common ancestor of two scope paths — their longest shared
+/// prefix. Returns a sub-slice of `a` (no allocation), valid as long as
+/// `a` lives.
+fn scopeLca(a: []const ScopeFrame, b: []const ScopeFrame) []const ScopeFrame {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (a[i].branch != b[i].branch or !std.mem.eql(u8, a[i].side, b[i].side)) break;
+    }
+    return a[0..i];
+}
+
+/// Append one frame to a scope, returning a freshly allocated path on
+/// `allocator`. The `side` string is a comptime literal (`"then"` /
+/// `"else"`) so it is not duped.
+fn appendFrame(
+    allocator: std.mem.Allocator,
+    scope: []const ScopeFrame,
+    branch: u32,
+    side: []const u8,
+) ![]ScopeFrame {
+    const out = try allocator.alloc(ScopeFrame, scope.len + 1);
+    @memcpy(out[0..scope.len], scope);
+    out[scope.len] = .{ .branch = branch, .side = side };
+    return out;
+}
+
+/// Compute every node's control-flow scope (flow-codegen#8).
+///
+/// **Command / `Branch` nodes** take the scope of the exec edge that
+/// targets them: a node entered from `(B, side)` has scope `scope(B) ++
+/// (B, side)`, which nests naturally (the branch `B`'s own scope is
+/// resolved the same way, recursively). A node targeted by no exec edge
+/// is top-level. Resolution memoizes and guards against an exec-edge
+/// cycle (a malformed graph) by bailing to top-level rather than
+/// looping.
+///
+/// **Reporter nodes** (anything with a primary output pin) take the
+/// lowest-common-ancestor of all their data consumers' scopes — the
+/// deepest scope that is an ancestor-or-equal of *every* consumer's
+/// scope. A reporter consumed only inside one branch side sinks into
+/// that side (so a `GetVariable` reading a `SetVariable` from the same
+/// side lands after it); a reporter shared across sides bubbles up to
+/// the common ancestor and computes before the `if`. An unconsumed
+/// reporter is top-level. Reporters are resolved in reverse topo order
+/// so each consumer's scope is known before its producers'.
+fn computeScopes(
+    allocator: std.mem.Allocator,
+    ctx: *GraphContext,
+) (CodegenError || std.mem.Allocator.Error)!ScopeMap {
+    var sm: ScopeMap = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .map = std.AutoHashMap(u32, []const ScopeFrame).init(allocator),
+    };
+    errdefer sm.deinit();
+    const a = sm.arena.allocator();
+
+    // 1. Command / Branch scopes from the exec edges.
+    for (ctx.flow.nodes) |n| {
+        if (n.kind == .Event) continue;
+        if (isReporter(n.kind)) continue;
+        const sc = try execScopeOf(a, ctx, n.id, 0);
+        try sm.map.put(n.id, sc);
+    }
+
+    // 2. Reporter scopes = LCA of consumers' scopes, in reverse topo
+    //    order so consumers (which appear later in topo order) are
+    //    resolved first.
+    var i: usize = ctx.order.len;
+    while (i > 0) {
+        i -= 1;
+        const id = ctx.order[i];
+        const node = ctx.index.byId(id) orelse unreachable;
+        if (node.kind == .Event) continue;
+        if (!isReporter(node.kind)) continue;
+
+        var acc: ?[]const ScopeFrame = null;
+        var any_consumer = false;
+        for (ctx.flow.edges) |e| {
+            if (e.from.node != id) continue;
+            any_consumer = true;
+            const consumer_scope = sm.get(e.to.node);
+            if (acc) |cur| {
+                acc = scopeLca(cur, consumer_scope);
+            } else {
+                acc = consumer_scope;
+            }
+        }
+        // Unconsumed reporters stay top-level. The LCA sub-slices alias
+        // a consumer's stored path, which the arena keeps alive; dupe to
+        // a fresh allocation so the entry owns its bytes regardless of
+        // later mutation.
+        if (any_consumer) {
+            const lca = acc orelse &.{};
+            try sm.map.put(id, try a.dupe(ScopeFrame, lca));
+        }
+    }
+
+    return sm;
+}
+
+/// Resolve a command/`Branch` node's scope from the exec edge targeting
+/// it. `depth` guards against an exec-edge cycle in a malformed graph —
+/// beyond the node count there must be a loop, so bail to top-level.
+fn execScopeOf(
+    a: std.mem.Allocator,
+    ctx: *GraphContext,
+    node_id: u32,
+    depth: usize,
+) (CodegenError || std.mem.Allocator.Error)![]const ScopeFrame {
+    if (depth > ctx.flow.nodes.len) return &.{};
+    for (ctx.flow.exec_edges) |x| {
+        if (x.to_node != node_id) continue;
+        // The branch's own scope, then descend into this side.
+        const branch_scope = try execScopeOf(a, ctx, x.from.node, depth + 1);
+        return try appendFrame(a, branch_scope, x.from.node, x.from.pin);
+    }
+    return &.{};
+}
+
+/// A node is a "reporter" when it binds a value (`n<id>_…`) — it has a
+/// non-empty primary output pin. Commands (`SetVariable`, `Branch`, …)
+/// and the trigger `Event` node return `false`.
+fn isReporter(k: flow_io.NodeKind) bool {
+    return primaryOutputPin(k).len != 0;
+}
+
 fn emitBody(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -1134,14 +1308,100 @@ fn emitBody(
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
+
+    // Control flow (flow-codegen#8). With zero `Branch` nodes / empty
+    // `exec_edges` every node's scope is the top-level (empty) path and
+    // `emitScope(top)` walks the topo `order` exactly as the old flat
+    // loop did — the output is byte-for-byte identical to the
+    // pre-control-flow shape. When a `Branch` is present its `then`/`else`
+    // sides are emitted as nested `if`/`else` blocks (see `emitScope`).
+    var scopes = try computeScopes(allocator, ctx);
+    defer scopes.deinit();
+
+    try emitScope(allocator, w, ctx, flow_name, emit_preview, &scopes, &.{}, scratch.allocator());
+}
+
+/// Emit every node whose computed scope equals `scope`, in topo order.
+/// A `Branch` node at this scope expands to a Zig `if (<cond>) { … }
+/// else { … }`, with each side recursively emitted at `scope ++ (branch,
+/// side)`. Nested-block bodies are rendered to a buffer and re-indented
+/// with `indentBlock` (the same mechanism `renderNewFormEventEntry` uses
+/// for the function body) so `writeNodeBody`'s hardcoded 4-space base
+/// indent compounds cleanly per nesting level without threading an
+/// indent counter through every emission helper (flow-codegen#8).
+fn emitScope(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    scope: []const ScopeFrame,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     for (ctx.order) |id| {
         const node = ctx.index.byId(id) orelse unreachable;
         if (node.kind == .Event) continue;
+
+        const node_scope = scopes.get(id);
+        if (!scopeEql(node_scope, scope)) continue;
+
+        if (node.kind == .Branch) {
+            try emitBranch(allocator, w, ctx, flow_name, emit_preview, scopes, scope, node, scratch);
+            continue;
+        }
+
         if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
-        try writeNodeBody(w, node, ctx, scratch.allocator());
+        try writeNodeBody(w, node, ctx, scratch);
         try discardUnconsumedResult(w, node, ctx);
-        _ = scratch.reset(.retain_capacity);
     }
+}
+
+/// Lower a `Branch` node at `scope` to `if (<cond>) { … } else { … }`.
+/// The `cond` data input resolves through the normal pin machinery;
+/// unwired it defaults to `false` (flow-codegen#8). Each side's body is
+/// the recursive `emitScope` of `scope ++ (branch, side)` — every
+/// command/`Branch` reached by an exec edge from this side, plus every
+/// reporter whose lowest-common-ancestor scope sinks into that side.
+fn emitBranch(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    const cond_expr = (try ctx.resolveInput(scratch, node, "cond")) orelse
+        try scratch.dupe(u8, "false");
+
+    inline for (.{ "then", "else" }) |side| {
+        // Render the side's body to a buffer, then re-indent it one
+        // level so it nests under the `if`/`else`. An empty side still
+        // emits `{}` — a valid, if vacuous, Zig block.
+        var side_aw: std.Io.Writer.Allocating = .init(allocator);
+        defer side_aw.deinit();
+        const child = try appendFrame(allocator, scope, node.id, side);
+        defer allocator.free(child);
+        try emitScope(allocator, &side_aw.writer, ctx, flow_name, emit_preview, scopes, child, scratch);
+        const body = side_aw.written();
+
+        if (std.mem.eql(u8, side, "then")) {
+            try w.print("    if ({s}) {{\n", .{cond_expr});
+        } else {
+            try w.writeAll("    } else {\n");
+        }
+        // The side body already ends in `\n`; `indentBlock` preserves
+        // that trailing newline (its final, empty split element writes
+        // the `\n` but no content), so the cursor lands at a fresh line
+        // ready for the next `} else {` / closing `}`.
+        if (body.len != 0) try indentBlock(w, body, "    ");
+    }
+    try w.writeAll("    }\n");
 }
 
 /// Emit `_ = n<id>_<pin>;` for a node whose result value is bound to a
@@ -1827,6 +2087,13 @@ fn writeNodeBody(
             }
             try w.writeAll(");\n");
         },
+        // `Branch` (flow-codegen#8) is never emitted through this flat
+        // path — `emitScope` intercepts a `Branch` node and expands it
+        // to an `if`/`else` wrapper (see `emitBranch`), recursing into
+        // each side's scope. This arm exists only to satisfy the
+        // exhaustive switch; reaching it would mean the scope walker
+        // mis-classified a control-flow node.
+        .Branch => unreachable,
     }
 }
 
@@ -1895,7 +2162,12 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // `Output`. Skipped by `discardUnconsumedResult`. `ClearVariable`
         // is a command (RFC-FLOW-VOCABULARY §4) — it writes the bare
         // `null` keyword into the variable and binds no value.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable => "",
+        // `Branch` is a control-flow command (flow-codegen#8) — it routes
+        // execution through its `then`/`else` exec outputs, producing no
+        // *data* value. Empty primary pin (no `n<id>_…` binding); the
+        // `if`/else wrapper is emitted by the scope walker, not the flat
+        // `discardUnconsumedResult` path.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch => "",
     };
 }
 
@@ -1948,6 +2220,11 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // truth for arity at compile time of the generated `.zig` —
         // Zig's type-checker catches mismatches against the call site.
         .CustomNode => isCallArgPin(pin),
+        // `Branch` consumes a single `cond` data input pin (a `bool`)
+        // — flow-codegen#8. Its `then`/`else` are exec *outputs* wired
+        // via `Flow.exec_edges`, not data input pins, so they never
+        // appear here.
+        .Branch => std.mem.eql(u8, pin, "cond"),
     };
 }
 
