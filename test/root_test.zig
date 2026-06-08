@@ -12,6 +12,21 @@ const flow_codegen_pkg = @import("flow_codegen");
 const flow_io = flow_codegen_pkg.flow_io;
 const flow_codegen = flow_codegen_pkg.codegen;
 
+/// Assert `src` is syntactically valid Zig — generated code must parse.
+/// Module-level twin of `CodegenValidationTests.expectParses`, reachable
+/// from every test struct (NOTE: `Ast.parse` checks SYNTAX only — it does
+/// not run AstGen, so unused/never-mutated-local lints are NOT caught
+/// here; those are verified out-of-band with `zig ast-check`).
+fn expectParsesZig(allocator: std.mem.Allocator, src: []const u8) !void {
+    const z = try allocator.allocSentinel(u8, src.len, 0);
+    defer allocator.free(z);
+    @memcpy(z[0..src.len], src);
+    var ast = try std.zig.Ast.parse(allocator, z, .zig);
+    defer ast.deinit(allocator);
+    if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{src});
+    try expect.equal(ast.errors.len, @as(usize, 0));
+}
+
 /// Golden-file tests for the Call → CustomNode converter
 /// (flow-codegen#18). Lives in its own file under `test/` for
 /// readability; re-exported here so `zspec.runAll` picks it up.
@@ -2005,6 +2020,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         .event = flow_io.Event{ .OnCall = {} },
         .params = &.{},
         .variables = &.{},
+        .locals = &.{},
         .nodes = &.{},
         .edges = &.{},
         .exec_edges = &.{},
@@ -2475,6 +2491,227 @@ pub const FlowVocabularyTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var count: i32 = 0;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = count;") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "count = n3_result;") != null);
+    }
+
+    // =====================================================================
+    // issue #23 — flow-local (temporary) variables. `locals` lowers to a
+    // function-scoped `var` at the top of the handler body, NOT a
+    // module-level `pub var`. Mirrors the `variables` tests above.
+    // =====================================================================
+
+    test "codegen emits a function-local var for declared locals (not pub var)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "counter",
+            \\  "locals": [
+            \\    { "name": "tmp", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "tmp", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 3, "type": "BinOp", "op": "add", "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "tmp", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "counter" });
+        defer allocator.free(out);
+
+        // A function-local `var` (with the never-mutated suppressor) —
+        // NOT a module-level `pub var`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var tmp: i32 = 0;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = &tmp;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var tmp") == null);
+
+        // Get reads / Set writes the in-scope local by its bare name.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = tmp;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "tmp = n3_result;") != null);
+
+        try expectParsesZig(allocator, out);
+    }
+
+    test "a local that is only Get compiles (never-mutated suppressed)" {
+        // bugbot-class regression: a function-local `var` touched only by
+        // `GetVariable` (never `SetVariable`/`ChangeVariable`) would trip
+        // Zig's "local variable is never mutated, use const" — a real
+        // semantic-analysis error `Ast.parse` does NOT catch. The trailing
+        // `_ = &<name>;` takes the variable's address, defeating the lint.
+        // We assert the suppressor is present (verified out-of-band to
+        // pass `zig ast-check`, i.e. AstGen, not merely `Ast.parse`).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "reader",
+            \\  "locals": [
+            \\    { "name": "tmp", "type": "i32", "default": 7 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetVariable", "name": "tmp", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "reader" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var tmp: i32 = 7;") != null);
+        // The never-mutated suppressor immediately follows the decl.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var tmp: i32 = 7;\n    _ = &tmp;") != null);
+        // It is a function-local, never a module global.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var tmp") == null);
+
+        try expectParsesZig(allocator, out);
+    }
+
+    test "file-scope variables still emit as pub var while locals stay in-body" {
+        // A flow declaring BOTH a file var and a local: the file var is a
+        // module-level `pub var`; the local is a function-body `var`.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "mixed",
+            \\  "variables": [
+            \\    { "name": "total", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "locals": [
+            \\    { "name": "scratch", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ChangeVariable", "name": "total", "by": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "ChangeVariable", "name": "scratch", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "mixed" });
+        defer allocator.free(out);
+
+        // File var: module-level `pub var`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var total: i32 = 0;") != null);
+        // Local: function-body `var`, never `pub var`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var scratch: i32 = 0;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var scratch") == null);
+
+        try expectParsesZig(allocator, out);
+    }
+
+    test "rejects a local whose name collides with a file variable" {
+        // A function-local shadowing a module global is ambiguous (both
+        // resolve to a bare `<name>` reference); reject it.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "clash",
+            \\  "variables": [
+            \\    { "name": "x", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "locals": [
+            \\    { "name": "x", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.DuplicateVariableName,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "rejects duplicate local names" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "dup_local",
+            \\  "locals": [
+            \\    { "name": "y", "type": "i32", "default": 0 },
+            \\    { "name": "y", "type": "f32", "default": 1.0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(
+            error.DuplicateVariableName,
+            flow_io.parseFlow(allocator, src),
+        );
+    }
+
+    test "round-trips a flow with locals through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "with_locals",
+            \\  "locals": [
+            \\    { "name": "tmp", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ChangeVariable", "name": "tmp", "by": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        try expect.equal(l1.flow.locals.len, @as(usize, 1));
+        try expect.toBeTrue(std.mem.eql(u8, l1.flow.locals[0].name, "tmp"));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+        // The `locals` block is written back.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"locals\":") != null);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(l2.flow.locals.len, @as(usize, 1));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "a flow without locals emits no locals key" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "no_locals",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        try expect.equal(l1.flow.locals.len, @as(usize, 0));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+        // Absence is preserved — no `locals` key.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"locals\":") == null);
     }
 
     // =====================================================================

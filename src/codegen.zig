@@ -1370,6 +1370,32 @@ fn emitBody(
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
+    // Flow-local (temporary) variables (issue #23). Each `locals` entry
+    // lowers to a function-scoped `var <name>: <type> = <default>;` at
+    // the TOP of the handler body — re-initialized on every invocation,
+    // NOT a module-level `pub var` (those come from `flow.variables` and
+    // are emitted at module scope in `generate`). The variable nodes
+    // (`GetVariable` / `SetVariable` / …) resolve a bare `<name>`, which
+    // now binds to this in-scope local; collisions with a file-scope
+    // `variables` name are rejected in `flow_io.validate`, so no routing
+    // is needed.
+    //
+    // Never-mutated lint: a function-local `var` that is never written
+    // (a local touched only by `GetVariable`) trips Zig's "local
+    // variable is never mutated, use const"; one never read trips
+    // "unused local variable". A trailing `_ = &<name>;` takes the
+    // variable's address, which both counts as a use AND defeats the
+    // never-mutated lint (the address could escape and be written
+    // through), so a single suppressor handles the read-only,
+    // write-only, and never-touched cases uniformly — and is a harmless
+    // no-op when the local IS mutated by a `SetVariable`/`ChangeVariable`
+    // downstream. (Module-level `pub var`s don't get either lint, so
+    // this is new to the function-local path.)
+    for (ctx.flow.locals) |v| {
+        try w.print("    var {s}: {s} = {s};\n", .{ v.name, v.type, v.default.zig_text });
+        try w.print("    _ = &{s};\n", .{v.name});
+    }
+
     // Control flow (flow-codegen#8). With zero `Branch` nodes / empty
     // `exec_edges` every node's scope is the top-level (empty) path and
     // `emitScope(top)` walks the topo `order` exactly as the old flat

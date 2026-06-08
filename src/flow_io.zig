@@ -361,6 +361,16 @@ pub const Flow = struct {
     /// none — the default. Optional in the source file; absence is
     /// indistinguishable from `"variables": []`.
     variables: []Variable = &.{},
+    /// Per-flow local (temporary) variables (issue #23). Each entry
+    /// lowers to a `var <name>: <type> = <default>;` at the TOP of the
+    /// generated handler function body — function-scoped, re-initialized
+    /// on every handler invocation, NOT a module-level `pub var`. Shares
+    /// the `Variable` shape and the variable-node name resolution with
+    /// `variables`; a local name may not collide with a file-scope
+    /// `variables` name (`DuplicateVariableName`). Empty for flows that
+    /// declare none — the default. Optional in the source file; absence
+    /// is indistinguishable from `"locals": []`.
+    locals: []Variable = &.{},
     nodes: []Node,
     /// Renamed from `links` per RFC §2; the field keeps the name
     /// `edges` to match the on-disk schema.
@@ -490,6 +500,7 @@ fn buildFlow(
 
     const params = try buildParams(a, obj.get("params"));
     const variables = try buildVariables(a, obj.get("variables"));
+    const locals = try buildVariables(a, obj.get("locals"));
     const nodes = try buildNodes(a, obj.get("nodes") orelse return error.MalformedFlow);
     // `links` was the pre-rename (RFC §2) name for `edges`. A file
     // still using it would otherwise load with zero connections and
@@ -537,6 +548,7 @@ fn buildFlow(
         .event = event,
         .params = params,
         .variables = variables,
+        .locals = locals,
         .nodes = nodes,
         .edges = edges,
         .exec_edges = exec_edges,
@@ -926,6 +938,17 @@ fn validate(flow: Flow) ParseError!void {
         }
     }
 
+    // Unique local names (issue #23), and no local may collide with a
+    // file-scope `variables` name — a function-local shadowing a module
+    // global is ambiguous (both resolve to a bare `<name>` in the same
+    // scope), so reject it rather than silently shadow.
+    for (flow.locals, 0..) |v, i| {
+        for (flow.locals[i + 1 ..]) |w| {
+            if (std.mem.eql(u8, v.name, w.name)) return error.DuplicateVariableName;
+        }
+        if (hasVariable(flow.variables, v.name)) return error.DuplicateVariableName;
+    }
+
     // Every edge endpoint resolves to a real node.
     for (flow.edges) |e| {
         if (!hasNode(flow.nodes, e.from.node)) return error.DanglingLink;
@@ -988,14 +1011,17 @@ fn validate(flow: Flow) ParseError!void {
                         return error.DuplicateOutputName;
                 }
             },
+            // Variable-touching nodes resolve by name against EITHER the
+            // file-scope `variables` or the flow `locals` (issue #23);
+            // both lower to the same bare `<name>` reference.
             .GetVariable => |b| {
-                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+                if (!hasVariable(flow.variables, b.name) and !hasVariable(flow.locals, b.name)) return error.UnknownVariable;
             },
             .SetVariable => |b| {
-                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+                if (!hasVariable(flow.variables, b.name) and !hasVariable(flow.locals, b.name)) return error.UnknownVariable;
             },
             .ChangeVariable => |b| {
-                if (!hasVariable(flow.variables, b.name)) return error.UnknownVariable;
+                if (!hasVariable(flow.variables, b.name) and !hasVariable(flow.locals, b.name)) return error.UnknownVariable;
             },
             // `ClearVariable` / `HasValueVariable` are the nullable-only
             // operations (RFC-FLOW-VOCABULARY §4). The named variable
@@ -1006,11 +1032,13 @@ fn validate(flow: Flow) ParseError!void {
             // (the loader stores it as the raw Zig source), so the
             // check is a literal first-byte sniff.
             .ClearVariable => |b| {
-                const v = findVariable(flow.variables, b.name) orelse return error.UnknownVariable;
+                const v = findVariable(flow.variables, b.name) orelse
+                    findVariable(flow.locals, b.name) orelse return error.UnknownVariable;
                 if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
             },
             .HasValueVariable => |b| {
-                const v = findVariable(flow.variables, b.name) orelse return error.UnknownVariable;
+                const v = findVariable(flow.variables, b.name) orelse
+                    findVariable(flow.locals, b.name) orelse return error.UnknownVariable;
                 if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
             },
             else => {},
@@ -1109,6 +1137,24 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
             try writeVariableDefault(w, allocator, v.default.zig_text);
             try w.writeAll(" }");
             if (i + 1 < flow.variables.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("  ],\n");
+    }
+
+    // Locals block (issue #23). Omitted when empty, mirroring the
+    // `variables` block's formatting and ordering exactly.
+    if (flow.locals.len != 0) {
+        try w.writeAll("  \"locals\": [\n");
+        for (flow.locals, 0..) |v, i| {
+            try w.writeAll("    { \"name\": ");
+            try writeJsonString(w, v.name);
+            try w.writeAll(", \"type\": ");
+            try writeJsonString(w, v.type);
+            try w.writeAll(", \"default\": ");
+            try writeVariableDefault(w, allocator, v.default.zig_text);
+            try w.writeAll(" }");
+            if (i + 1 < flow.locals.len) try w.writeAll(",");
             try w.writeAll("\n");
         }
         try w.writeAll("  ],\n");
