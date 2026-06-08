@@ -258,6 +258,29 @@ pub const NodeKind = union(enum) {
     /// reference would freeze the once-bound value — see codegen's
     /// `deepInlineExpr`). Carries no per-kind payload.
     While: struct {},
+    /// `Select` — pure-expression multi-way value picker (flow-codegen#22).
+    /// The dataflow analogue of a `switch` *expression*: it consumes a
+    /// `selector` **data** input (an integer) plus positional `case<N>`
+    /// **data** value inputs (`case0`, `case1`, … — counted like `Call`'s
+    /// `arg<N>`) and a `default` **data** value input, and binds a single
+    /// `result` output. No exec edges — it lowers inline to a Zig `switch`
+    /// EXPRESSION (`switch (<selector>) { 0 => <case0>, …, else =>
+    /// <default> }`). Unwired `selector` defaults to `0`; unwired `default`
+    /// falls back to a sensible compiling value (the last wired case, or
+    /// `0`). Carries no per-kind payload — every input is a data edge.
+    Select: struct {},
+    /// `Switch` — control-flow N-way branch (flow-codegen#22). The
+    /// multi-way generalisation of `Branch`: it consumes a single
+    /// `selector` **data** input (an integer) and exposes N labeled **exec**
+    /// outputs `case0`, `case1`, … plus a `default` exec output, wired
+    /// through `Flow.exec_edges` exactly like a `Branch`'s `then`/`else`
+    /// sides. Codegen lowers it to a Zig `switch` STATEMENT, one block per
+    /// wired case side plus an `else` from the `default` side (emitting an
+    /// empty `else => {}` when `default` is unwired, so the switch stays
+    /// exhaustive). The case count is derived from the distinct `case<N>`
+    /// exec pins wired. Carries no per-kind payload — the `selector` source
+    /// is a data edge and the side targets are exec edges.
+    Switch: struct {},
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -760,6 +783,15 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         // Condition loop (flow-codegen#21). No per-kind payload — `cond`
         // is a data edge and the `body` target is an exec edge.
         return .{ .While = .{} };
+    } else if (std.mem.eql(u8, type_name, "Select")) {
+        // Pure-expression multi-way picker (flow-codegen#22). No per-kind
+        // payload — `selector`, `case<N>`, and `default` are all data edges.
+        return .{ .Select = .{} };
+    } else if (std.mem.eql(u8, type_name, "Switch")) {
+        // N-way control-flow branch (flow-codegen#22). No per-kind payload —
+        // the `selector` source is a data edge and the `case<N>`/`default`
+        // targets are exec edges.
+        return .{ .Switch = .{} };
     }
     return error.UnknownNodeType;
 }
@@ -914,6 +946,10 @@ fn validate(flow: Flow) ParseError!void {
             .Branch => std.mem.eql(u8, x.from.pin, "then") or
                 std.mem.eql(u8, x.from.pin, "else"),
             .ForRange, .While => std.mem.eql(u8, x.from.pin, "body"),
+            // A `Switch` routes through its `default` exec output or any
+            // `case<N>` exec output (flow-codegen#22) — the N-way analogue
+            // of a `Branch`'s `then`/`else`.
+            .Switch => std.mem.eql(u8, x.from.pin, "default") or isCaseExecPin(x.from.pin),
             else => false,
         };
         if (!ok) return error.MalformedFlow;
@@ -1003,6 +1039,20 @@ fn hasNode(nodes: []const Node, id: u32) bool {
 fn findNode(nodes: []const Node, id: u32) ?*const Node {
     for (nodes) |*n| if (n.id == id) return n;
     return null;
+}
+
+/// True for a `Switch` exec output pin named `case<N>` (`case0`, `case1`,
+/// …) — the N-way analogue of a `Branch`'s `then`/`else` (flow-codegen#22).
+/// Mirrors codegen's `isCallArgPin` shape: the `case` prefix followed by
+/// one-or-more decimal digits.
+fn isCaseExecPin(pin: []const u8) bool {
+    if (!std.mem.startsWith(u8, pin, "case")) return false;
+    const tail = pin[4..];
+    if (tail.len == 0) return false;
+    for (tail) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 fn hasParam(params: []const Param, name: []const u8) bool {
@@ -1316,7 +1366,11 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // (flow-codegen#21) are the same shape: their `start`/`end`/`step`
         // / `cond` inputs are data edges and their `body` target is an
         // exec edge, so they carry no on-node payload either.
-        .Branch, .ForRange, .While => {},
+        // `Select`/`Switch` (flow-codegen#22) are payload-free too: a
+        // `Select`'s `selector`/`case<N>`/`default` inputs are data edges,
+        // and a `Switch`'s `selector` is a data edge while its
+        // `case<N>`/`default` targets are exec edges.
+        .Branch, .ForRange, .While, .Select, .Switch => {},
     }
 }
 

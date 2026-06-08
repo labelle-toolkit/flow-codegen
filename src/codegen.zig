@@ -1444,6 +1444,14 @@ fn emitScope(
             continue;
         }
 
+        // `Switch` (flow-codegen#22) expands to a `switch` statement with a
+        // block per case side, mirroring how a `Branch` expands to nested
+        // `if`/`else` blocks (see `emitSwitch`).
+        if (node.kind == .Switch) {
+            try emitSwitch(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
+            continue;
+        }
+
         if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
         try writeNodeBody(w, node, ctx, scratch);
         try discardUnconsumedResult(w, node, ctx);
@@ -1495,6 +1503,85 @@ fn emitBranch(
         // ready for the next `} else {` / closing `}`.
         if (body.len != 0) try indentBlock(w, body, "    ");
     }
+    try w.writeAll("    }\n");
+}
+
+/// Lower a `Switch` node at `scope` to a Zig `switch` STATEMENT
+/// (flow-codegen#22) — the N-way analogue of `emitBranch`. The `selector`
+/// data input resolves through the normal pin machinery; unwired it
+/// defaults to `0`. Each wired `case<N>` exec output becomes a prong
+/// `N => { <emitScope(case<N>)> }`, and the `default` exec output becomes
+/// the `else => { … }` prong (an empty `else => {}` when `default` is
+/// unwired, so the lowered switch is exhaustive valid Zig). Each side's
+/// body is the recursive `emitScope` of `scope ++ (switch id, "case<N>")`
+/// (or `"default"`), buffered and re-indented one level with `indentBlock`
+/// exactly like `emitBranch`'s sides.
+fn emitSwitch(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    suppressed: *const std.AutoHashMap(u32, void),
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    const sel_expr = (try ctx.resolveInput(scratch, node, "selector")) orelse
+        try scratch.dupe(u8, "0");
+
+    try w.print("    switch ({s}) {{\n", .{sel_expr});
+
+    // One prong per wired `case<N>` exec output. The side string `"case<N>"`
+    // is the `ScopeFrame.side` `execScopeOf` produced for nodes reached by
+    // that exec edge — `scopeEql` matches on the bytes, so formatting a
+    // fresh `case<N>` here keys the same scope. Allocated on `scratch` so it
+    // outlives the child scope's use within this iteration.
+    const ncases = countSwitchCases(ctx.flow, node.id);
+    var i: usize = 0;
+    while (i < ncases) : (i += 1) {
+        const side = try std.fmt.allocPrint(scratch, "case{d}", .{i});
+
+        var side_aw: std.Io.Writer.Allocating = .init(allocator);
+        defer side_aw.deinit();
+        const child = try appendFrame(allocator, scope, node.id, side);
+        defer allocator.free(child);
+        try emitScope(allocator, &side_aw.writer, ctx, flow_name, emit_preview, scopes, suppressed, child, scratch);
+        const body = side_aw.written();
+
+        if (body.len == 0) {
+            // A prong wired to no body still needs a block to keep the
+            // switch exhaustive over its label.
+            try w.print("        {d} => {{}},\n", .{i});
+        } else {
+            try w.print("        {d} => {{\n", .{i});
+            try indentBlock(w, body, "        ");
+            try w.writeAll("        },\n");
+        }
+    }
+
+    // The `else` prong from the `default` exec output. An unwired `default`
+    // still emits `else => {}` so the switch is exhaustive valid Zig.
+    {
+        var def_aw: std.Io.Writer.Allocating = .init(allocator);
+        defer def_aw.deinit();
+        const child = try appendFrame(allocator, scope, node.id, "default");
+        defer allocator.free(child);
+        try emitScope(allocator, &def_aw.writer, ctx, flow_name, emit_preview, scopes, suppressed, child, scratch);
+        const body = def_aw.written();
+
+        if (body.len == 0) {
+            try w.writeAll("        else => {},\n");
+        } else {
+            try w.writeAll("        else => {\n");
+            try indentBlock(w, body, "        ");
+            try w.writeAll("        },\n");
+        }
+    }
+
     try w.writeAll("    }\n");
 }
 
@@ -2501,6 +2588,48 @@ fn writeNodeBody(
         // header + recursively emits the body scope (see `emitLoop`). This
         // arm is unreachable in a well-formed walk.
         .ForRange, .While => unreachable,
+        // `Select` (flow-codegen#22) is a pure-expression reporter — it
+        // lowers to an inline Zig `switch` EXPRESSION bound to
+        // `n<id>_result`. Each prong `N => <case<N>>` reads the positional
+        // `case<N>` value input; the `else` prong reads the `default` value
+        // input. Unwired pins default to compiling values: an unwired
+        // `selector` → `0`; an unwired `case<N>` → `0`; an unwired `default`
+        // → the last wired case's expression (so the `else` prong matches a
+        // real value), or `0` when there are no cases.
+        .Select => {
+            const arity = countSelectCases(ctx.flow, node.id);
+            const sel_expr = (try ctx.resolveInput(scratch, node, "selector")) orelse
+                try scratch.dupe(u8, "0");
+
+            try w.print("    const n{d}_result = switch ({s}) {{\n", .{ node.id, sel_expr });
+
+            // Each wired (or defaulted) case prong. `last_case` is kept so
+            // an unwired `default` can fall back to a real case value rather
+            // than a bare `0` of an unknown type.
+            var last_case: ?[]const u8 = null;
+            var i: usize = 0;
+            while (i < arity) : (i += 1) {
+                var buf: [16]u8 = undefined;
+                const pin = std.fmt.bufPrint(&buf, "case{d}", .{i}) catch unreachable;
+                const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                    try scratch.dupe(u8, "0");
+                last_case = expr;
+                try w.print("        {d} => {s},\n", .{ i, expr });
+            }
+
+            // The `else` prong from the `default` value input. Required for
+            // an exhaustive Zig `switch`; when unwired, fall back to the
+            // last case's expression (or `0` when there are no cases).
+            const default_expr = (try ctx.resolveInput(scratch, node, "default")) orelse
+                (last_case orelse try scratch.dupe(u8, "0"));
+            try w.print("        else => {s},\n", .{default_expr});
+            try w.writeAll("    };\n");
+        },
+        // `Switch` (flow-codegen#22) is a control-flow node — like `Branch`,
+        // `emitScope` intercepts it and emits a `switch` STATEMENT with a
+        // block per case side (see `emitSwitch`). Unreachable in a
+        // well-formed walk.
+        .Switch => unreachable,
     }
 }
 
@@ -2547,6 +2676,12 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // graph trigger and is dropped from the body entirely (see
         // `emitBody`).
         .GetVariable => "value",
+        // `Select` is a pure-expression reporter (flow-codegen#22) — it
+        // binds an `n<id>_result` from an inline `switch` expression, the
+        // same `result` naming as `BinOp` / `Compare`. `Switch` is a
+        // control-flow command (no value binding — see the empty-pin arm
+        // below).
+        .Select => "result",
         // `HasValueVariable` is a reporter (RFC-FLOW-VOCABULARY §4 —
         // nullable variable operations) — single output pin `value` of
         // type `bool`, the same naming as `GetVariable`.
@@ -2582,7 +2717,12 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // is not a primary value binding — `resolveInput` handles it
         // directly. The loop nodes are expanded by the scope walker
         // (`emitScope`), never reaching the flat `discardUnconsumedResult`.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While => "",
+        // `Switch` (flow-codegen#22) is a control-flow command — like
+        // `Branch`, it routes execution through its `case<N>`/`default`
+        // exec outputs, producing no data value. The scope walker
+        // (`emitScope`) expands it to a `switch` statement (`emitSwitch`);
+        // it never reaches the flat `discardUnconsumedResult` path.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch => "",
     };
 }
 
@@ -2650,7 +2790,32 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // `While` consumes a single `cond` data input (a `bool`); its
         // `body` is an exec output, wired via `exec_edges` (flow-codegen#21).
         .While => std.mem.eql(u8, pin, "cond"),
+        // `Select` (flow-codegen#22) consumes a `selector` data input, a
+        // `default` value input, and positional `case<N>` value inputs
+        // (mirroring `Call`'s `arg<N>`). All are data edges — `Select` has
+        // no exec wiring.
+        .Select => std.mem.eql(u8, pin, "selector") or
+            std.mem.eql(u8, pin, "default") or
+            isSelectCasePin(pin),
+        // `Switch` (flow-codegen#22) consumes a single `selector` data
+        // input. Its `case<N>`/`default` are exec *outputs* wired via
+        // `Flow.exec_edges`, not data input pins, so they never appear here.
+        .Switch => std.mem.eql(u8, pin, "selector"),
     };
+}
+
+/// True for a `Select` value-input pin named `case<N>` (`case0`, `case1`,
+/// …) — the positional case inputs of the pure-expression picker
+/// (flow-codegen#22). Same shape as `isCallArgPin`, keyed on the `case`
+/// prefix.
+fn isSelectCasePin(pin: []const u8) bool {
+    if (!std.mem.startsWith(u8, pin, "case")) return false;
+    const tail = pin[4..];
+    if (tail.len == 0) return false;
+    for (tail) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 fn isCallArgPin(pin: []const u8) bool {
@@ -2669,6 +2834,36 @@ fn countCallArgs(flow: flow_io.Flow, node_id: u32) usize {
         if (e.to.node != node_id) continue;
         if (!std.mem.startsWith(u8, e.to.pin, "arg")) continue;
         const idx = std.fmt.parseInt(usize, e.to.pin[3..], 10) catch continue;
+        if (max_idx == null or idx > max_idx.?) max_idx = idx;
+    }
+    return if (max_idx) |m| m + 1 else 0;
+}
+
+/// Count a `Select` node's wired `case<N>` value inputs (flow-codegen#22) —
+/// the case-prong count of the inline `switch` expression. Returns
+/// `max(N)+1` over the wired `case<N>` **data** edges into `node_id`, or
+/// `0` when none are wired. Same counting shape as `countCallArgs`.
+fn countSelectCases(flow: flow_io.Flow, node_id: u32) usize {
+    var max_idx: ?usize = null;
+    for (flow.edges) |e| {
+        if (e.to.node != node_id) continue;
+        if (!std.mem.startsWith(u8, e.to.pin, "case")) continue;
+        const idx = std.fmt.parseInt(usize, e.to.pin[4..], 10) catch continue;
+        if (max_idx == null or idx > max_idx.?) max_idx = idx;
+    }
+    return if (max_idx) |m| m + 1 else 0;
+}
+
+/// Count a `Switch` node's wired `case<N>` exec outputs (flow-codegen#22) —
+/// the prong count of the lowered `switch` statement. Returns `max(N)+1`
+/// over the wired `case<N>` **exec** edges FROM `node_id`, or `0` when none
+/// are wired. Unlike the data-edge counters this scans `exec_edges`.
+fn countSwitchCases(flow: flow_io.Flow, node_id: u32) usize {
+    var max_idx: ?usize = null;
+    for (flow.exec_edges) |x| {
+        if (x.from.node != node_id) continue;
+        if (!std.mem.startsWith(u8, x.from.pin, "case")) continue;
+        const idx = std.fmt.parseInt(usize, x.from.pin[4..], 10) catch continue;
         if (max_idx == null or idx > max_idx.?) max_idx = idx;
     }
     return if (max_idx) |m| m + 1 else 0;

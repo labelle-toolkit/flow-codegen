@@ -338,6 +338,9 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .Branch => .{ .Branch = .{} },
         .ForRange => .{ .ForRange = .{} },
         .While => .{ .While = .{} },
+        // `Select`/`Switch` carry no payload (flow-codegen#22).
+        .Select => .{ .Select = .{} },
+        .Switch => .{ .Switch = .{} },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }
