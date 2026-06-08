@@ -461,6 +461,16 @@ fn emitScope(
             continue;
         }
 
+        // `Once`/`Cooldown` (flow-codegen#47) are exec-gates: they expand to
+        // a single guarded `if` wrapping the recursively-emitted body scope
+        // (no `else`), the single-output analogue of `emitBranch` (see
+        // `emitGate`). Their gate state is a per-node module-level `pub var`
+        // emitted by `entry.zig`.
+        if (node.kind == .Once or node.kind == .Cooldown) {
+            try emitGate(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
+            continue;
+        }
+
         // `Switch` (flow-codegen#22) expands to a `switch` statement with a
         // block per case side, mirroring how a `Branch` expands to nested
         // `if`/`else` blocks (see `emitSwitch`).
@@ -688,6 +698,81 @@ fn emitLoop(
             const cond_expr = (try deepInlineExpr(scratch, ctx, node, "cond")) orelse
                 try scratch.dupe(u8, "false");
             try w.print("    while ({s}) {{\n", .{cond_expr});
+            if (body.len != 0) try indentBlock(w, body, "    ");
+            try w.writeAll("    }\n");
+        },
+        else => unreachable,
+    }
+}
+
+/// Lower an `Once` / `Cooldown` exec-gate node at `scope` to a single
+/// guarded `if` wrapping the body scope (flow-codegen#47) — the
+/// single-output analogue of `emitBranch` (one guarded scope, no `else`).
+/// The body scope frame is `{ branch: <gate id>, side: "body" }`, so
+/// `execScopeOf` already routes body-targeted nodes here, exactly like the
+/// loop family.
+///
+/// `Once` flips a per-node `pub var __once_<flow_fn>_n<id>: bool` (emitted
+/// by `entry.zig`) and runs the body the first time only:
+/// `if (!__once_<flow_fn>_n<id>) { __once_<flow_fn>_n<id> = true; <body> }`.
+/// The `<flow_fn>` prefix (`ctx.flow_fn` — the flow's sanitized function
+/// name) namespaces the var per-flow, since node ids are only unique
+/// WITHIN a flow (flow-codegen#47).
+///
+/// `Cooldown` compares the host game clock against a per-node `pub var
+/// __cd_<flow_fn>_n<id>: f64` last-fired timestamp and re-blocks for `seconds`:
+/// `if (game.elapsedSeconds() - __cd_<flow_fn>_n<id> >= <seconds>) {`
+/// `    __cd_<flow_fn>_n<id> = game.elapsedSeconds(); <body> }`. `game.elapsedSeconds()`
+/// is a host accessor provided by labelle-engine. The body is buffered and
+/// re-indented one level with `indentBlock`, the same mechanism
+/// `emitBranch`/`emitLoop` use, so nested gate bodies indent cleanly.
+fn emitGate(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    suppressed: *const std.AutoHashMap(u32, void),
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    // Render the body scope to a buffer, then re-indent it under the guard
+    // — same buffer+indent mechanism `emitBranch`/`emitLoop` use. The body
+    // scope frame is `{ branch: <gate id>, side: "body" }`.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer body_aw.deinit();
+    const child = try appendFrame(allocator, scope, node.id, "body");
+    defer allocator.free(child);
+    try emitScope(allocator, &body_aw.writer, ctx, flow_name, emit_preview, scopes, suppressed, child, scratch);
+    const body = body_aw.written();
+
+    switch (node.kind) {
+        .Once => {
+            // First-time-only gate: guard on the per-node bool, then set it
+            // before running the body so re-entry is blocked forever. The
+            // var is namespaced by the flow's function name (`ctx.flow_fn`)
+            // so a gate at node id N in a subflow doesn't share state with a
+            // gate at node id N in the entry flow (flow-codegen#47).
+            try w.print("    if (!__once_{s}_n{d}) {{\n", .{ ctx.flow_fn, node.id });
+            try w.print("        __once_{s}_n{d} = true;\n", .{ ctx.flow_fn, node.id });
+            if (body.len != 0) try indentBlock(w, body, "    ");
+            try w.writeAll("    }\n");
+        },
+        .Cooldown => {
+            // Cooldown gate: open when at least `seconds` have elapsed since
+            // the last firing, then stamp the clock before running the body.
+            // `ctx.flow_fn` namespaces the per-node timestamp var the same
+            // way `Once` namespaces its bool (flow-codegen#47).
+            const seconds = node.kind.Cooldown.seconds;
+            try w.print(
+                "    if (game.elapsedSeconds() - __cd_{s}_n{d} >= {d}) {{\n",
+                .{ ctx.flow_fn, node.id, seconds },
+            );
+            try w.print("        __cd_{s}_n{d} = game.elapsedSeconds();\n", .{ ctx.flow_fn, node.id });
             if (body.len != 0) try indentBlock(w, body, "    ");
             try w.writeAll("    }\n");
         },

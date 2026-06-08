@@ -225,6 +225,37 @@ pub const NodeKind = union(enum) {
     /// reference would freeze the once-bound value — see codegen's
     /// `deepInlineExpr`). Carries no per-kind payload.
     While: struct {},
+    /// `Once` — exec-gate that passes control the FIRST time only, ever
+    /// (flow-codegen#47). The single-output analogue of `Branch`: it sits on
+    /// an exec edge, runs synchronously, and exposes a single **exec** output
+    /// pin `body` wired through `Flow.exec_edges` exactly like a `ForRange`
+    /// side — there is no `else`. It consumes NO data inputs; its gate is a
+    /// per-node persistent bool emitted at module scope by codegen as
+    /// `pub var __once_<flowfn>_n<id>: bool = false;` (the `__` prefix is
+    /// RESERVED for generated state; `<flowfn>` is the flow's function name,
+    /// so the same node id in two flows gets distinct slots — node ids are
+    /// only unique within a flow). Codegen lowers it to a guarded scope that
+    /// flips the flag and runs the body exactly once:
+    /// `if (!__once_<flowfn>_n<id>) { __once_<flowfn>_n<id> = true; <body> }`.
+    /// Carries no per-kind payload — the body target is an exec edge and the
+    /// state is keyed by (flow, node id).
+    Once: struct {},
+    /// `Cooldown` — exec-gate that passes control, then blocks re-entry for
+    /// `seconds` (flow-codegen#47). Like `Once`, it is the single-output
+    /// analogue of `Branch`: an exec edge feeds it, it runs synchronously,
+    /// and it routes control through a single **exec** output pin `body`
+    /// (wired in `Flow.exec_edges`, no `else`). Its gate is a per-node
+    /// persistent `f64` last-fired timestamp emitted at module scope as
+    /// `pub var __cd_<flowfn>_n<id>: f64 = -1e18;` (the `__` prefix is RESERVED
+    /// for generated state; `<flowfn>` is the flow's function name so the same
+    /// node id in two flows gets distinct slots; the sentinel guarantees the
+    /// gate opens on first entry). Codegen compares the host game clock against
+    /// it and lowers to:
+    /// `if (game.elapsedSeconds() - __cd_<flowfn>_n<id> >= <seconds>) {`
+    /// `    __cd_<flowfn>_n<id> = game.elapsedSeconds(); <body> }`. The `seconds`
+    /// field is emitted as an `f64` literal; `game.elapsedSeconds()` is a
+    /// host accessor provided by labelle-engine.
+    Cooldown: struct { seconds: f64 = 0 },
     /// `Select` — pure-expression multi-way value picker (flow-codegen#22).
     /// The dataflow analogue of a `switch` *expression*: it consumes a
     /// `selector` **data** input (an integer) plus positional `case<N>`

@@ -373,7 +373,17 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // payload-free string reporters: their value inputs (`arg<N>` for
         // `Concat`, `value` for the to-string nodes) are all data edges, so
         // they carry no on-node fields — same as `Branch`/`Select` above.
-        .Branch, .ForRange, .While, .Select, .Switch, .Concat, .IntToString, .FloatToString => {},
+        // `Once` (flow-codegen#47) is payload-free like `Branch`: its `body`
+        // target is an exec edge and its gate is a per-node `pub var` emitted
+        // by codegen, not on-node state — so nothing to write here.
+        .Branch, .ForRange, .While, .Select, .Switch, .Concat, .IntToString, .FloatToString, .Once => {},
+        // `Cooldown` (flow-codegen#47) carries only its inline `seconds`
+        // duration (an `f64`); its `body` target is an exec edge. Emit
+        // `seconds` with `{d}` so the round-trip stays byte-deterministic
+        // (matches how node `pos` floats are written).
+        .Cooldown => |b| {
+            try w.print(", \"seconds\": {d}", .{b.seconds});
+        },
         // `Format` (flow-codegen#26) carries only its inline `template`
         // (printf-style `std.fmt` syntax); its typed `arg<N>` value inputs
         // are data edges. Emit `template` like `Log`'s `label` so the

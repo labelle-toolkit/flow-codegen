@@ -150,6 +150,50 @@ pub fn renderFlowFile(
         try w.writeAll("\n");
     }
 
+    // Per-node persistent gate state for `Once`/`Cooldown` exec-gates
+    // (flow-codegen#47). One module-level `pub var` per gate node, keyed by
+    // (flow, node id) — the single-output exec-gates carry their state at
+    // module scope (persistent across handler invocations) exactly like the
+    // `variables`/`collections` blocks above, NOT as on-node payload:
+    //   `Once`     → `pub var __once_<flowfn>_n<id>: bool = false;`
+    //   `Cooldown` → `pub var __cd_<flowfn>_n<id>: f64 = -1e18;` (sentinel so
+    //                the gate opens on first entry).
+    // The `__` prefix is RESERVED for generated state. Node ids are unique
+    // only WITHIN a flow (every flow's ids start at 1), so the var name is
+    // namespaced by `<flowfn>` — the flow's sanitized function-name
+    // identifier (entry → `entryFunctionName`, subgraph → `sanitizeSymbol`),
+    // which `assertNoSymbolCollision` already guarantees is unique across the
+    // entry function and every subgraph function. With the `<flowfn>` prefix
+    // the names are collision-free WITHOUT cross-flow dedup: distinct flows
+    // get distinct prefixes, and ids don't repeat within one flow. The
+    // lowering side (`emitGate` in `scope.zig`) reads the SAME `<flowfn>` off
+    // `ctx.flow_fn`, so the two sites produce byte-identical names. Gates can
+    // live in the entry flow OR any referenced subgraph (both render through
+    // `emitBody`), so the pass scans both.
+    {
+        var emitted_any = false;
+        var flow_idx: usize = 0;
+        while (flow_idx <= subgraphs.items.len) : (flow_idx += 1) {
+            const f = if (flow_idx == 0) entry else subgraphs.items[flow_idx - 1];
+            const flow_fn = try gateFlowFn(allocator, f, flow_idx == 0);
+            defer allocator.free(flow_fn);
+            for (f.nodes) |n| {
+                switch (n.kind) {
+                    .Once => {
+                        try w.print("pub var __once_{s}_n{d}: bool = false;\n", .{ flow_fn, n.id });
+                        emitted_any = true;
+                    },
+                    .Cooldown => {
+                        try w.print("pub var __cd_{s}_n{d}: f64 = -1e18;\n", .{ flow_fn, n.id });
+                        emitted_any = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        if (emitted_any) try w.writeAll("\n");
+    }
+
     // Entry flow → its event `pub fn`.
     try renderEntryFunction(allocator, w, entry, registry, options.custom_nodes, options.flow_name);
 
@@ -203,6 +247,9 @@ fn renderEntryFunction(
 
     var ctx = try GraphContext.init(allocator, flow, registry, custom_nodes);
     defer ctx.deinit();
+    // Gate-state vars in this entry flow are namespaced by the entry
+    // function name (`onCall`/`setup`) — see `gateFlowFn` / `emitGate`.
+    ctx.flow_fn = entryFunctionName(flow.event);
 
     // An `OnCall` entry is a subgraph in its own right (RFC §3/§6) —
     // it has no `entity` in scope, only declared `params`. An
@@ -310,6 +357,9 @@ fn renderEventEntry(
 ) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
     var ctx = try GraphContext.init(allocator, flow, registry, custom_nodes);
     defer ctx.deinit();
+    // Gate-state vars in an OnEvent entry flow are namespaced by its entry
+    // function name (`setup`) — see `gateFlowFn` / `emitGate`.
+    ctx.flow_fn = entryFunctionName(flow.event);
 
     // `name` is `?[]const u8` (RFC-FLOW-VOCABULARY §3 — the field is
     // optional so an `Event` *node* can carry the trigger name; the
@@ -559,6 +609,11 @@ fn renderSubgraphFunction(
     // checks yet emits uncompilable `fn _(...)` — reject it up front.
     if (std.mem.eql(u8, symbol, "_")) return error.InvalidFlowName;
 
+    // Gate-state vars in this subgraph are namespaced by its function name
+    // (`symbol` == `sanitizeSymbol(flow.name)`), matching `gateFlowFn`'s
+    // subgraph branch in the emission pass — see `emitGate`.
+    ctx.flow_fn = symbol;
+
     const outputs = try collectOutputs(allocator, flow);
     defer allocator.free(outputs);
 
@@ -682,6 +737,23 @@ fn entryFunctionName(event: flow_io.Event) []const u8 {
         // registrar the script-runner calls (see `renderEventEntry`).
         .OnEvent => "setup",
     };
+}
+
+/// The `<flowfn>` prefix used to namespace a flow's per-node gate state
+/// `pub var`s (flow-codegen#47). It is exactly the flow's emitted
+/// function-name identifier — `entryFunctionName(event)` for the file
+/// entry flow, `sanitizeSymbol(name)` for a subgraph — i.e. the same
+/// identifiers `assertNoSymbolCollision` proves unique across the file.
+/// `emitGate` reads the same value off `ctx.flow_fn`, so the emission and
+/// lowering sites produce byte-identical var names. Caller owns the
+/// returned bytes.
+fn gateFlowFn(
+    allocator: std.mem.Allocator,
+    flow: flow_io.Flow,
+    is_entry: bool,
+) std.mem.Allocator.Error![]u8 {
+    if (is_entry) return allocator.dupe(u8, entryFunctionName(flow.event));
+    return sanitizeSymbol(allocator, flow.name);
 }
 
 /// Reject the case where two file-level symbols with distinct effective

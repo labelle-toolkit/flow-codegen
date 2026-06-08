@@ -94,7 +94,12 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // walker, like `ForRange`) — none bind a data value
         // (flow-codegen#24). Likewise `MapSet`/`MapRemove`/`MapClear` are
         // command map ops and `MapForEach` is a control-flow loop node.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach, .MapSet, .MapRemove, .MapClear, .MapForEach => "",
+        // `Once`/`Cooldown` (flow-codegen#47) are exec-gate control-flow
+        // commands — like `Branch`, they route execution through their
+        // single `body` exec output, producing no data value. The scope
+        // walker (`emitScope`) expands them to a guarded `if` (`emitGate`);
+        // they never reach the flat `discardUnconsumedResult` path.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach, .MapSet, .MapRemove, .MapClear, .MapForEach, .Once, .Cooldown => "",
     };
 }
 
@@ -202,6 +207,10 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // input (the number to render).
         .Format, .Concat => isCallArgPin(pin),
         .IntToString, .FloatToString => std.mem.eql(u8, pin, "value"),
+        // `Once`/`Cooldown` (flow-codegen#47) consume NO data inputs — their
+        // `body` is an exec output wired via `exec_edges`, and their gate
+        // state is a per-node `pub var`, not a wired pin.
+        .Once, .Cooldown => false,
     };
 }
 

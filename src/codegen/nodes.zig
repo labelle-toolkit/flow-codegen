@@ -512,6 +512,11 @@ pub fn writeNodeBody(
         // header + recursively emits the body scope (see `emitLoop`). This
         // arm is unreachable in a well-formed walk.
         .ForRange, .While => unreachable,
+        // `Once` / `Cooldown` (flow-codegen#47) are exec-gate control nodes
+        // — like `Branch`, `emitScope` intercepts them and emits a guarded
+        // `if` wrapper + recursively emits the body scope (see `emitGate`).
+        // This arm is unreachable in a well-formed walk.
+        .Once, .Cooldown => unreachable,
         // `Select` (flow-codegen#22) is a pure-expression reporter — it
         // lowers to an inline Zig `switch` EXPRESSION bound to
         // `n<id>_result`. Each prong `N => <case<N>>` reads the positional

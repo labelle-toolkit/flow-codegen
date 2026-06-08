@@ -342,6 +342,15 @@ pub fn buildPos(maybe: ?std.json.Value) !Pos {
     };
 }
 
+pub fn jsonNumberF64(v: std.json.Value) !f64 {
+    return switch (v) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch error.MalformedFlow,
+        else => error.MalformedFlow,
+    };
+}
+
 pub fn jsonNumber(v: std.json.Value) !f32 {
     return switch (v) {
         .integer => |n| @floatFromInt(n),
@@ -447,6 +456,22 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
         // Condition loop (flow-codegen#21). No per-kind payload — `cond`
         // is a data edge and the `body` target is an exec edge.
         return .{ .While = .{} };
+    } else if (std.mem.eql(u8, type_name, "Once")) {
+        // Exec-gate that passes control the first time only (flow-codegen#47).
+        // No per-kind payload — the `body` target is an exec edge and the
+        // gate state is a per-node `pub var` emitted by codegen.
+        return .{ .Once = .{} };
+    } else if (std.mem.eql(u8, type_name, "Cooldown")) {
+        // Exec-gate that re-blocks for `seconds` after firing
+        // (flow-codegen#47). The `body` target is an exec edge; only the
+        // inline `seconds` duration lives on the node. Absent `seconds`
+        // defaults to `0` (a gate that never blocks).
+        return .{ .Cooldown = .{
+            .seconds = if (o.get("seconds")) |sv|
+                try jsonNumberF64(sv)
+            else
+                0,
+        } };
     } else if (std.mem.eql(u8, type_name, "Select")) {
         // Pure-expression multi-way picker (flow-codegen#22). No per-kind
         // payload — `selector`, `case<N>`, and `default` are all data edges.
