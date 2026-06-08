@@ -281,6 +281,19 @@ pub const NodeKind = union(enum) {
     /// exec pins wired. Carries no per-kind payload — the `selector` source
     /// is a data edge and the side targets are exec edges.
     Switch: struct {},
+    /// `Log` — debug-print command (flow-codegen#20). The first-class
+    /// promotion of the `log_i32` CustomNode: prints a labeled value to
+    /// the console in Debug builds. Consumes a single optional `value`
+    /// **data** input pin and carries an inline `label` string. Codegen
+    /// lowers it to a Debug-gated `std.debug.print`, mirroring
+    /// `ChangeVariable`'s hard-wired debug side effect:
+    /// `if (@import("builtin").mode == .Debug) std.debug.print("<label>:
+    /// {any}\n", .{<value>});` when `value` is wired, or the label-only
+    /// form (`"<label>\n"`, no args) when it is not. The `label` is
+    /// author-controlled text — codegen escapes it into the Zig format
+    /// string via `std.zig.fmtString` so quotes / newlines / braces can't
+    /// break the generated source. Defaults to `""` when omitted.
+    Log: struct { label: []const u8 = "" },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -804,6 +817,16 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
         // the `selector` source is a data edge and the `case<N>`/`default`
         // targets are exec edges.
         return .{ .Switch = .{} };
+    } else if (std.mem.eql(u8, type_name, "Log")) {
+        // Debug-print command (flow-codegen#20). `value` is an optional
+        // data edge; only the inline `label` lives on the node. Absent
+        // `label` defaults to `""`.
+        return .{ .Log = .{
+            .label = if (o.get("label")) |lv|
+                (if (lv == .string) try a.dupe(u8, lv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
     }
     return error.UnknownNodeType;
 }
@@ -1417,6 +1440,13 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // and a `Switch`'s `selector` is a data edge while its
         // `case<N>`/`default` targets are exec edges.
         .Branch, .ForRange, .While, .Select, .Switch => {},
+        // `Log` (flow-codegen#20) carries only its inline `label`; the
+        // `value` input is a data edge. Emit `label` like other node
+        // payload fields so the round-trip stays byte-deterministic.
+        .Log => |b| {
+            try w.writeAll(", \"label\": ");
+            try writeJsonString(w, b.label);
+        },
     }
 }
 

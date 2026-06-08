@@ -2994,6 +2994,155 @@ pub const FlowVocabularyTests = struct {
         // No per-event-aliased payload.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "__EvPayload_") == null);
     }
+
+    // =================================================================
+    // Log node (flow-codegen#20) — builtin debug-print command.
+    // =================================================================
+
+    test "Log with a wired value + label lowers to a Debug-gated print with {any}" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "logger",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": "42", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Log", "label": "mylabel", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "logger" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "if (@import(\"builtin\").mode == .Debug) std.debug.print(\"mylabel: {any}\\n\", .{n2_value});",
+        ) != null);
+        try expectParsesZig(allocator, out);
+    }
+
+    test "Log with no wired value emits a label-only print" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "logger",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Log", "label": "ping", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "logger" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "if (@import(\"builtin\").mode == .Debug) std.debug.print(\"ping\\n\", .{});",
+        ) != null);
+        // No stray `{any}` placeholder when the value pin is unwired.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "ping: {any}") == null);
+        try expectParsesZig(allocator, out);
+    }
+
+    test "Log label with a quote and a brace escapes into a valid format string" {
+        const allocator = std.testing.allocator;
+        // The label `say "{x}"` exercises both escaping hazards: the
+        // double-quote must become `\"` (Zig string-literal escaping) and
+        // the `{`/`}` must be doubled (`{{`/`}}`) so std.fmt reads them as
+        // literal braces rather than a (broken) `{x}` placeholder.
+        const src =
+            \\{
+            \\  "name": "logger",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Log", "label": "say \"{x}\"", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "logger" });
+        defer allocator.free(out);
+
+        // Escaped quote + doubled braces appear in the emitted format
+        // string, and the `\n` we append survives intact.
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "std.debug.print(\"say \\\"{{x}}\\\"\\n\", .{});",
+        ) != null);
+        // A bare `{x}` placeholder must NOT survive — that would be an
+        // invalid std.fmt specifier and fail compilation.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "say \\\"{x}\\\"") == null);
+        try expectParsesZig(allocator, out);
+    }
+
+    test "Log label survives a parse -> write -> parse round trip" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "logger",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Log", "label": "score = {n}", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), l1.flow.nodes[1].kind), .Log);
+        try expect.toBeTrue(std.mem.eql(u8, l1.flow.nodes[1].kind.Log.label, "score = {n}"));
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), l2.flow.nodes[1].kind), .Log);
+        try expect.toBeTrue(std.mem.eql(u8, l2.flow.nodes[1].kind.Log.label, "score = {n}"));
+
+        // Deterministic writer — a second render is byte-identical.
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "Log with an omitted label defaults to the empty string" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "logger",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Event", "name": "engine.tick", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Log", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, loaded.flow.nodes[1].kind.Log.label, ""));
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "logger" });
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "if (@import(\"builtin\").mode == .Debug) std.debug.print(\"\\n\", .{});",
+        ) != null);
+        try expectParsesZig(allocator, out);
+    }
 };
 
 // =====================================================================

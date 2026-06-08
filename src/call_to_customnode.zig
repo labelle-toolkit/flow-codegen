@@ -341,6 +341,9 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // `Select`/`Switch` carry no payload (flow-codegen#22).
         .Select => .{ .Select = .{} },
         .Switch => .{ .Switch = .{} },
+        // `Log` carries only its inline `label` (flow-codegen#20); the
+        // `value` input is a data edge.
+        .Log => |b| .{ .Log = .{ .label = try a.dupe(u8, b.label) } },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }
