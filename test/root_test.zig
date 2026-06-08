@@ -4008,4 +4008,315 @@ pub const CoercionTests = struct {
             flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "fr_oos" }),
         );
     }
+
+    // =====================================================================
+    // Select — pure-expression multi-way picker (flow-codegen#22)
+    // =====================================================================
+
+    test "Select lowers to an inline switch expression with wired cases" {
+        // `selector` picks among `case0`/`case1` value inputs, falling back
+        // to `default` for the `else` prong. The whole thing is a pure
+        // expression bound to `n<id>_result` — no exec edges.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sel_basic",
+            \\  "variables": [ { "name": "picked", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 20, "pos": [0, 0] },
+            \\    { "id": 4, "type": "Literal", "value": 99, "pos": [0, 0] },
+            \\    { "id": 5, "type": "Select", "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "picked", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 5, "pin": "selector" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 5, "pin": "case0" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 5, "pin": "case1" } },
+            \\    { "from": { "node": 4, "pin": "value" }, "to": { "node": 5, "pin": "default" } },
+            \\    { "from": { "node": 5, "pin": "result" }, "to": { "node": 6, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sel_basic" });
+        defer allocator.free(out);
+
+        // The inline switch expression, bound to the reporter's result.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n5_result = switch (n1_value) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "0 => n2_value,") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "1 => n3_value,") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "else => n4_value,") != null);
+        // The result is consumed downstream — no orphan binding.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "picked = n5_result;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Select with unwired selector/default falls back to compiling values" {
+        // Unwired `selector` → `0`; unwired `default` → the last wired
+        // case's expression (so the `else` prong matches a real value).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sel_defaults",
+            \\  "variables": [ { "name": "picked", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Select", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "picked", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "case0" } },
+            \\    { "from": { "node": 2, "pin": "result" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sel_defaults" });
+        defer allocator.free(out);
+
+        // Unwired selector defaults to 0; the lone case0 is also the else
+        // fallback (last wired case), so no bare `0` of unknown type.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_result = switch (0) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "0 => n1_value,") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "else => n1_value,") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    // =====================================================================
+    // Switch — N-way control-flow branch (flow-codegen#22)
+    // =====================================================================
+
+    test "Switch lowers to a switch statement with each case's command nested" {
+        // `selector` gates an N-way `switch` statement; each `case<N>` exec
+        // output nests its commands in a `N => { … }` prong, and `default`
+        // becomes the `else => { … }` prong.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sw_basic",
+            \\  "variables": [
+            \\    { "name": "a", "type": "i32", "default": 0 },
+            \\    { "name": "b", "type": "i32", "default": 0 },
+            \\    { "name": "c", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 11, "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "a", "pos": [0, 0] },
+            \\    { "id": 5, "type": "Literal", "value": 22, "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "b", "pos": [0, 0] },
+            \\    { "id": 7, "type": "Literal", "value": 33, "pos": [0, 0] },
+            \\    { "id": 8, "type": "SetVariable", "name": "c", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "selector" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "value" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 6, "pin": "value" } },
+            \\    { "from": { "node": 7, "pin": "value" }, "to": { "node": 8, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "case0" }, "to": { "node": 4 } },
+            \\    { "from": { "node": 2, "pin": "case1" }, "to": { "node": 6 } },
+            \\    { "from": { "node": 2, "pin": "default" }, "to": { "node": 8 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sw_basic" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "switch (n1_value) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "0 => {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "1 => {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "else => {") != null);
+        // Each side's command nests one level deeper than the switch
+        // (8-space indent under the entry fn's 4).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            a = n3_value;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            b = n5_value;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            c = n7_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Switch with unwired default emits an exhaustive empty else prong" {
+        // No `default` exec edge → an empty `else => {}` so the lowered Zig
+        // switch stays exhaustive.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sw_noelse",
+            \\  "variables": [ { "name": "a", "type": "i32", "default": 0 } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "a", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "selector" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "case0" }, "to": { "node": 4 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sw_noelse" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "0 => {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "else => {},") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Switch sinks a reporter used only inside one case into that prong" {
+        // A reporter (GetVariable) read only by a command in `case0` must
+        // sink into that prong, after the write — mirroring the Branch
+        // reporter-sinking test.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sw_sink",
+            \\  "variables": [
+            \\    { "name": "count", "type": "i32", "default": 0 },
+            \\    { "name": "mirror", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "count", "pos": [0, 0] },
+            \\    { "id": 5, "type": "GetVariable", "name": "count", "pos": [0, 0] },
+            \\    { "id": 6, "type": "SetVariable", "name": "mirror", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "selector" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "value" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 6, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "case0" }, "to": { "node": 4 } },
+            \\    { "from": { "node": 2, "pin": "case0" }, "to": { "node": 6 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sw_sink" });
+        defer allocator.free(out);
+
+        const switch_at = std.mem.indexOf(u8, out, "switch (n1_value) {");
+        const write_at = std.mem.indexOf(u8, out, "count = n3_value;");
+        const read_at = std.mem.indexOf(u8, out, "const n5_value = count;");
+        try expect.toBeTrue(switch_at != null);
+        try expect.toBeTrue(write_at != null);
+        try expect.toBeTrue(read_at != null);
+        // The read sinks into the prong, after both the switch header and
+        // the write (read-after-write preserved).
+        try expect.toBeTrue(read_at.? > switch_at.?);
+        try expect.toBeTrue(read_at.? > write_at.?);
+        // Sunk one level deep — 12-space indent (switch prong block).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "            const n5_value = count;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "Switch is a valid exec source (pin case0 / default)" {
+        // A `Switch`'s `case<N>` and `default` are valid exec-edge sources
+        // — the loader accepts them like a Branch's then/else.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sw_validsrc",
+            \\  "variables": [
+            \\    { "name": "a", "type": "i32", "default": 0 },
+            \\    { "name": "x", "type": "?i32", "default": null }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ClearVariable", "name": "x", "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "a", "pos": [0, 0] },
+            \\    { "id": 5, "type": "Literal", "value": 1, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "selector" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 4, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "case0" }, "to": { "node": 3 } },
+            \\    { "from": { "node": 2, "pin": "default" }, "to": { "node": 4 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "sw_validsrc" });
+        defer allocator.free(out);
+        try expectParses(allocator, out);
+    }
+
+    test "Switch with an invalid exec pin is rejected" {
+        // A `Switch` exec edge from a non-case/non-default pin is malformed
+        // — only `case<N>` / `default` are valid exec sources.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sw_badpin",
+            \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ClearVariable", "name": "x", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "selector" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "then" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "non-control node is not a valid exec source (Select rejected)" {
+        // A pure reporter like `Select` has no exec outputs — an exec edge
+        // originating from it is malformed.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "sel_notexec",
+            \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Select", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ClearVariable", "name": "x", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "case0" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
 };
