@@ -1559,6 +1559,38 @@ pub const CoercionTests = struct {
         try std.testing.expectError(error.UnknownCollection, flow_io.parseFlow(allocator, src));
     }
 
+    test "a list node on a map collection is rejected (kind mismatch, bugbot)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "kind_mismatch",
+            \\  "event": { "type": "OnCall" },
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedCollection, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a map node on a list collection is rejected (kind mismatch, bugbot)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "kind_mismatch2",
+            \\  "event": { "type": "OnCall" },
+            \\  "collections": [ { "name": "xs", "element": "u32" } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapClear", "collection": "xs", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedCollection, flow_io.parseFlow(allocator, src));
+    }
+
     test "ForEach item consumed outside the body scope is rejected" {
         // Mirrors the ForRange.index out-of-scope test: a top-level
         // SetVariable reads ForEach.item but is NOT wired to the loop's

@@ -10,6 +10,7 @@ const Node = model.Node;
 const Param = model.Param;
 const Variable = model.Variable;
 const Collection = model.Collection;
+const CollectionKind = model.CollectionKind;
 const ParseError = model.ParseError;
 
 pub fn validate(flow: Flow) ParseError!void {
@@ -160,52 +161,24 @@ pub fn validate(flow: Flow) ParseError!void {
                 if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
             },
             // List operation nodes (flow-codegen#24) resolve their
-            // `collection` field by name against the top-level
-            // `collections` block; an unknown list is `UnknownCollection`.
-            .ListAppend => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListLength => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListGet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListSet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListContains => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListClear => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ForEach => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            // Map operation nodes (flow-codegen#24, MAPS) resolve the same
-            // way — an unknown map is `UnknownCollection`.
-            .MapSet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapGet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapHas => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapRemove => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapClear => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapLength => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .MapForEach => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
+            // `collection` field by name AND require it to be a LIST — a
+            // list op on a `.map` would lower to the wrong API (bugbot).
+            .ListAppend => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListLength => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListGet => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListSet => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListContains => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListClear => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ForEach => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            // Map operation nodes (flow-codegen#24, MAPS) — require a
+            // MAP-kind collection (a map op on a `.list` is wrong; bugbot).
+            .MapSet => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapGet => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapHas => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapRemove => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapClear => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapLength => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapForEach => |b| try requireCollectionKind(flow.collections, b.collection, .map),
             else => {},
         }
     }
@@ -227,6 +200,19 @@ pub fn findVariable(variables: []const Variable, name: []const u8) ?Variable {
 pub fn hasCollection(collections: []const Collection, name: []const u8) bool {
     for (collections) |c| if (std.mem.eql(u8, c.name, name)) return true;
     return false;
+}
+
+pub fn findCollection(collections: []const Collection, name: []const u8) ?Collection {
+    for (collections) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    return null;
+}
+
+/// A collection-op node must name a collection of the matching kind:
+/// unknown name → `UnknownCollection`; right name, wrong kind (a list op
+/// on a map or vice versa) → `MalformedCollection` (flow-codegen#24).
+fn requireCollectionKind(collections: []const Collection, name: []const u8, kind: CollectionKind) ParseError!void {
+    const c = findCollection(collections, name) orelse return error.UnknownCollection;
+    if (c.kind != kind) return error.MalformedCollection;
 }
 
 pub fn hasNode(nodes: []const Node, id: u32) bool {
