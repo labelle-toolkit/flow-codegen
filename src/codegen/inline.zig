@@ -51,6 +51,13 @@ fn deepInlineNode(
         .GetVariable => |b| return try alloc.dupe(u8, b.name),
         .Literal => |b| return try alloc.dupe(u8, b.value),
         .Identifier => |b| return try alloc.dupe(u8, b.name),
+        // A `Param` is a pure leaf: it lowers to the containing flow's
+        // sanitized fn-arg identifier (same as `nodes.zig`'s `.Param`
+        // arm), which is in scope wherever the flow body — or a `Delay`
+        // snapshot taken in it (flow-codegen#48, bugbot) — is emitted.
+        // Inlining it (vs the frozen `n<id>_…` binding) is what lets a
+        // Delay deferring a subflow wired from a param capture the param.
+        .Param => |b| return try pins.sanitizeSymbol(alloc, b.param),
         .HasValueVariable => |b| return try std.fmt.allocPrint(alloc, "({s} != null)", .{b.name}),
         // Binary/unary combinators — recurse into each operand so the
         // whole subtree recomputes. Unwired operands fall back to the
@@ -123,7 +130,7 @@ fn deepInlineOperand(
 /// versa (flow-codegen#21, bugbot "While cond leaves unused bindings").
 pub fn isInlinableKind(k: flow_io.NodeKind) bool {
     return switch (k) {
-        .GetVariable, .Literal, .Identifier, .HasValueVariable, .BinOp, .Compare, .Logic => true,
+        .GetVariable, .Literal, .Identifier, .Param, .HasValueVariable, .BinOp, .Compare, .Logic => true,
         // String reporters (`Format`/`Concat`/`IntToString`/`FloatToString`,
         // flow-codegen#26) are intentionally absent from this set: they
         // ALLOCATE via `game.allocator`, so they must bind to an

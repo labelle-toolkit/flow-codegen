@@ -45,6 +45,9 @@ pub const StringNodeTests = @import("string_nodes_test.zig").StringNodeTests;
 /// Time exec-gate nodes (flow-codegen#47): `Once` / `Cooldown`.
 pub const TimeGateTests = @import("time_gate_test.zig").TimeGateTests;
 
+/// Deferred-subflow exec node (flow-codegen#48, Stage 2 of #25): `Delay`.
+pub const DelayTests = @import("delay_test.zig").DelayTests;
+
 // =====================================================================
 // Codegen validation — flows that parse cleanly but would otherwise
 // emit Zig that fails to compile (PR #6 review follow-up)

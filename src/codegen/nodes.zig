@@ -517,6 +517,11 @@ pub fn writeNodeBody(
         // `if` wrapper + recursively emits the body scope (see `emitGate`).
         // This arm is unreachable in a well-formed walk.
         .Once, .Cooldown => unreachable,
+        // `Delay` (flow-codegen#48) is a deferred-subflow exec node —
+        // `emitScope` intercepts it and emits the capture-snapshot +
+        // `scheduler.after` call site (see `emitDelay`); its body does NOT
+        // lower inline. Unreachable in a well-formed walk.
+        .Delay => unreachable,
         // `Select` (flow-codegen#22) is a pure-expression reporter — it
         // lowers to an inline Zig `switch` EXPRESSION bound to
         // `n<id>_result`. Each prong `N => <case<N>>` reads the positional

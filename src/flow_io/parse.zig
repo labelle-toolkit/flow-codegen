@@ -472,6 +472,18 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
             else
                 0,
         } };
+    } else if (std.mem.eql(u8, type_name, "Delay")) {
+        // Deferred-subflow exec node (flow-codegen#48). The `body` target
+        // is an exec edge into the single Subflow it defers; only the
+        // inline `seconds` duration lives on the node. Absent `seconds`
+        // defaults to `0` (fires on the next scheduler tick). Same
+        // `f64`-from-JSON shape as `Cooldown`.
+        return .{ .Delay = .{
+            .seconds = if (o.get("seconds")) |sv|
+                try jsonNumberF64(sv)
+            else
+                0,
+        } };
     } else if (std.mem.eql(u8, type_name, "Select")) {
         // Pure-expression multi-way picker (flow-codegen#22). No per-kind
         // payload — `selector`, `case<N>`, and `default` are all data edges.

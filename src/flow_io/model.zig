@@ -256,6 +256,43 @@ pub const NodeKind = union(enum) {
     /// field is emitted as an `f64` literal; `game.elapsedSeconds()` is a
     /// host accessor provided by labelle-engine.
     Cooldown: struct { seconds: f64 = 0 },
+    /// `Delay` — deferred-subflow exec node (flow-codegen#48, Stage 2 of
+    /// #25). Like the other exec-gates (`Once`/`Cooldown`) it sits on an
+    /// exec edge and routes control through a single **exec** output pin
+    /// `body` (wired in `Flow.exec_edges`, no `else`). UNLIKE them, `Delay`
+    /// does NOT run its body synchronously: it SNAPSHOTS the body's input
+    /// arguments into a heap capture struct, registers a (scaled,
+    /// pause-aware) timer on the engine's runtime `Scheduler`, and lets the
+    /// body run later, off a generated trampoline (labelle-engine#605).
+    ///
+    /// Its `body` exec output MUST connect to exactly ONE node, and that
+    /// node MUST be a `Subflow` (validated in `flow_io.validate` —
+    /// `MalformedFlow` otherwise). The Subflow's wired input pins are
+    /// resolved at the Delay site (the normal data-edge path) and
+    /// snapshotted into the capture struct, whose FIELDS are the referenced
+    /// flow's declared input params (names + types). The capture is
+    /// `game.allocator.create`'d at the Delay site; the scheduler OWNS and
+    /// frees it exactly once after firing/skip/deinit, so the trampoline
+    /// must not free it.
+    ///
+    /// Codegen emits, per Delay node (namespaced by the flow's function
+    /// name `<flowfn>`, exactly like the `Once`/`Cooldown` gate state, since
+    /// node ids are unique only WITHIN a flow):
+    ///   - a module-level capture struct
+    ///     `const __DelayCap_<flowfn>_n<id> = struct { <arg>: <type>, … };`
+    ///   - a module-level trampoline
+    ///     `fn __delay_tramp_<flowfn>_n<id>(game_ctx: *anyopaque, ctx:
+    ///     *anyopaque) void { … <subflow>(game, cap.<arg>, …); }`
+    ///   - at the Delay site, a `game.allocator.create` + field snapshot +
+    ///     `game.scheduler.after(<seconds>, <entity-or-null>, __cap_n<id>,
+    ///     &__delay_tramp_<flowfn>_n<id>);`.
+    ///
+    /// The `seconds` field is emitted as an `f64` literal. The `entity`
+    /// argument binds the flow's in-scope entity when the flow has one
+    /// (a Delay bound to an entity is auto-cancelled if that entity dies
+    /// before firing); post-Phase 6 flows have no lifecycle `entity`
+    /// identifier in scope, so it is `null` there (see `emitDelay`).
+    Delay: struct { seconds: f64 = 0 },
     /// `Select` — pure-expression multi-way value picker (flow-codegen#22).
     /// The dataflow analogue of a `switch` *expression*: it consumes a
     /// `selector` **data** input (an integer) plus positional `case<N>`

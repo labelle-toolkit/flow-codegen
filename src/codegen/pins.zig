@@ -99,7 +99,12 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // single `body` exec output, producing no data value. The scope
         // walker (`emitScope`) expands them to a guarded `if` (`emitGate`);
         // they never reach the flat `discardUnconsumedResult` path.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach, .MapSet, .MapRemove, .MapClear, .MapForEach, .Once, .Cooldown => "",
+        // `Delay` (flow-codegen#48) is an exec node like `Once`/`Cooldown`:
+        // it routes execution through its single `body` exec output and
+        // binds no top-level `n<id>_…` data value. The scope walker
+        // (`emitScope`) intercepts it (`emitDelay`); it never reaches the
+        // flat `discardUnconsumedResult` path.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach, .MapSet, .MapRemove, .MapClear, .MapForEach, .Once, .Cooldown, .Delay => "",
     };
 }
 
@@ -210,7 +215,11 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // `Once`/`Cooldown` (flow-codegen#47) consume NO data inputs — their
         // `body` is an exec output wired via `exec_edges`, and their gate
         // state is a per-node `pub var`, not a wired pin.
-        .Once, .Cooldown => false,
+        // `Delay` (flow-codegen#48) likewise consumes NO data inputs on its
+        // own pins — its only data is the DEFERRED Subflow's input pins,
+        // which are resolved against the Subflow node, not the Delay. Its
+        // `body` is an exec output wired via `exec_edges`.
+        .Once, .Cooldown, .Delay => false,
     };
 }
 
@@ -282,6 +291,25 @@ pub fn countSwitchCases(flow: flow_io.Flow, node_id: u32) usize {
 // =====================================================================
 // Shape helpers
 // =====================================================================
+
+/// Find the single `Subflow` node a `Delay`'s `body` exec output targets
+/// (flow-codegen#48). `flow_io.validate` guarantees a Delay's `body` edge
+/// targets exactly one node and that node is a `Subflow`, so this returns
+/// the target node on a well-formed flow; `null` only if the (already
+/// validated) invariant is somehow absent — both `entry.zig`'s state
+/// emission and `scope.zig`'s call-site emission treat that as a malformed
+/// flow. Lives here (not on either emitter) so both reach it without an
+/// `entry.zig` ⇄ `scope.zig` import cycle.
+pub fn delaySubflowNode(flow: flow_io.Flow, delay_id: u32) ?*const flow_io.Node {
+    for (flow.exec_edges) |x| {
+        if (x.from.node != delay_id) continue;
+        if (!std.mem.eql(u8, x.from.pin, "body")) continue;
+        for (flow.nodes) |*n| {
+            if (n.id == x.to_node and n.kind == .Subflow) return n;
+        }
+    }
+    return null;
+}
 
 pub fn hasParam(params: []const flow_io.Param, name: []const u8) bool {
     for (params) |p| if (std.mem.eql(u8, p.name, name)) return true;

@@ -368,6 +368,9 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // `seconds` f64 (a plain copy, no allocation) (flow-codegen#47).
         .Once => .{ .Once = .{} },
         .Cooldown => |b| .{ .Cooldown = .{ .seconds = b.seconds } },
+        // `Delay` carries only its inline `seconds` f64 (a plain copy, no
+        // allocation) (flow-codegen#48).
+        .Delay => |b| .{ .Delay = .{ .seconds = b.seconds } },
         // `Select`/`Switch` carry no payload (flow-codegen#22).
         .Select => .{ .Select = .{} },
         .Switch => .{ .Switch = .{} },

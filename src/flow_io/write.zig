@@ -384,6 +384,13 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         .Cooldown => |b| {
             try w.print(", \"seconds\": {d}", .{b.seconds});
         },
+        // `Delay` (flow-codegen#48) carries only its inline `seconds`
+        // duration (an `f64`); its `body` target is an exec edge into the
+        // deferred Subflow. Emit `seconds` with `{d}` so the round-trip
+        // stays byte-deterministic, exactly like `Cooldown`.
+        .Delay => |b| {
+            try w.print(", \"seconds\": {d}", .{b.seconds});
+        },
         // `Format` (flow-codegen#26) carries only its inline `template`
         // (printf-style `std.fmt` syntax); its typed `arg<N>` value inputs
         // are data edges. Emit `template` like `Log`'s `label` so the
