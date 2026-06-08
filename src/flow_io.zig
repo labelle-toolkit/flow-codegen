@@ -290,9 +290,12 @@ pub const NodeKind = union(enum) {
     /// `if (@import("builtin").mode == .Debug) std.debug.print("<label>:
     /// {any}\n", .{<value>});` when `value` is wired, or the label-only
     /// form (`"<label>\n"`, no args) when it is not. The `label` is
-    /// author-controlled text — codegen escapes it into the Zig format
-    /// string via `std.zig.fmtString` so quotes / newlines / braces can't
-    /// break the generated source. Defaults to `""` when omitted.
+    /// author-controlled text — codegen escapes it in two steps so it
+    /// can't break the generated source: `std.zig.fmtString` for Zig
+    /// string-literal escaping (quotes / newlines), then a `{`→`{{` /
+    /// `}`→`}}` doubling pass so a brace in the label prints literally
+    /// instead of being read as a `std.fmt` placeholder. Defaults to
+    /// `""` when omitted.
     Log: struct { label: []const u8 = "" },
 };
 

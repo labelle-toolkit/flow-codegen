@@ -2700,8 +2700,9 @@ fn writeNodeBody(
 ///     so the real placeholder is never doubled.
 fn escapeLogLabel(alloc: std.mem.Allocator, label: []const u8) ![]const u8 {
     const lit_escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.zig.fmtString(label)});
-    // Doubling can at most double the length.
-    var out = try std.ArrayList(u8).initCapacity(alloc, lit_escaped.len);
+    // Brace-doubling can at most double the length — preallocate for the
+    // worst case so a label with braces needs no realloc.
+    var out = try std.ArrayList(u8).initCapacity(alloc, lit_escaped.len * 2);
     for (lit_escaped) |c| {
         switch (c) {
             '{' => try out.appendSlice(alloc, "{{"),
