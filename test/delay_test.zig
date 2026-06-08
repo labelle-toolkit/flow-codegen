@@ -364,6 +364,88 @@ pub const DelayTests = struct {
     // Round-trip — the inline `seconds` survives write.
     // -----------------------------------------------------------------
 
+    test "Delay in a value-returning flow bails with `return undefined`" {
+        // An OnCall entry with an `Output` lowers to a non-`void` fn, so the
+        // OOM `catch return` MUST carry a value or it's a type error (gemini
+        // #50). A bare `catch return` would fail Sema (`expected i32, found
+        // void`) — AstGen can't see it, so this pins the text.
+        const allocator = std.testing.allocator;
+        const entry_src =
+            \\{
+            \\  "name": "delay_out",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Delay", "seconds": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 4, "type": "Output", "name": "result", "value_type": "i32", "pos": [0, 0] },
+            \\    { "id": 5, "type": "Literal", "value": 42, "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 2, "pin": "amount" } },
+            \\    { "from": { "node": 5, "pin": "value" }, "to": { "node": 4, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+        var sub = try flow_io.parseFlow(allocator, callee_sub);
+        defer sub.deinit();
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(entry.flow);
+        try reg.add(sub.flow);
+        const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "delay_out" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "catch return undefined;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "create(__DelayCap_onCall_n1) catch return;") == null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "Delay snapshots a param-wired subflow arg by inlining the param" {
+        // A deferred subflow input wired from a `Param` of the CONTAINING
+        // flow must snapshot the param's fn-arg identifier — NOT a frozen
+        // `n<id>_value` binding that `emitDelay` never emits (bugbot #50).
+        const allocator = std.testing.allocator;
+        const entry_src =
+            \\{
+            \\  "name": "delay_param",
+            \\  "event": { "type": "OnCall" },
+            \\  "params": [ { "name": "delay_amt", "type": "i32", "default": 0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Delay", "seconds": 1, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Param", "param": "delay_amt", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 2, "pin": "amount" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var entry = try flow_io.parseFlow(allocator, entry_src);
+        defer entry.deinit();
+        var sub = try flow_io.parseFlow(allocator, callee_sub);
+        defer sub.deinit();
+        var reg = flow_codegen.FlowRegistry.init(allocator);
+        defer reg.deinit();
+        try reg.add(entry.flow);
+        try reg.add(sub.flow);
+        const out = try flow_codegen.renderFlowFile(allocator, entry.flow, &reg, .{ .flow_name = "delay_param" });
+        defer allocator.free(out);
+
+        // The snapshot inlines the param identifier; no dangling n<id>_value.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".amount = delay_amt") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, ".amount = n3_value") == null);
+        try expectAstGenOk(allocator, out);
+    }
+
     test "Delay round-trips through write preserving seconds" {
         const allocator = std.testing.allocator;
         // The body edge is required for a VALID flow, but the round-trip

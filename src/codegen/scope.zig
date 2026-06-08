@@ -859,10 +859,14 @@ fn emitDelay(
 
     // 1. Allocate the capture on the game allocator. `catch return` on OOM
     //    is the accepted v1 behaviour (mirrors collections' `catch {}`
-    //    swallow philosophy) — the deferred call is simply dropped.
+    //    swallow philosophy) — the deferred call is simply dropped. In a
+    //    value-returning flow (one with `Output` nodes → a non-`void` fn) a
+    //    bare `return` is a type error, so bail with `return undefined`
+    //    there (gemini #50).
+    const has_output = pins.anyOutput(ctx.flow.nodes);
     try w.print(
-        "    const __cap_n{d} = game.allocator.create(__DelayCap_{s}_n{d}) catch return;\n",
-        .{ node.id, ctx.flow_fn, node.id },
+        "    const __cap_n{d} = game.allocator.create(__DelayCap_{s}_n{d}) catch return{s};\n",
+        .{ node.id, ctx.flow_fn, node.id, if (has_output) " undefined" else "" },
     );
 
     // 2. Snapshot the subflow's inputs NOW — one field per declared param,
