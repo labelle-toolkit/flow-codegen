@@ -2656,7 +2656,60 @@ fn writeNodeBody(
         // block per case side (see `emitSwitch`). Unreachable in a
         // well-formed walk.
         .Switch => unreachable,
+        // `Log` (flow-codegen#20) — Debug-gated `std.debug.print`, the
+        // first-class promotion of the `log_i32` CustomNode. Mirrors
+        // `ChangeVariable`'s `if (@import("builtin").mode == .Debug)
+        // std.debug.print(...)` style. The author-controlled `label` is
+        // escaped into the Zig format string by `escapeLogLabel` (Zig
+        // string-literal escaping via `std.zig.fmtString`, plus
+        // `{`/`}` doubling so braces in the label can't be read as
+        // format placeholders). The `{any}` / `\n` we append are NOT
+        // part of the label, so they stay as real format syntax.
+        .Log => |b| {
+            const safe_label = try escapeLogLabel(scratch, b.label);
+            if (try ctx.resolveInput(scratch, node, "value")) |value_expr| {
+                try w.print(
+                    "    if (@import(\"builtin\").mode == .Debug) std.debug.print(\"{s}: {{any}}\\n\", .{{{s}}});\n",
+                    .{ safe_label, value_expr },
+                );
+            } else {
+                try w.print(
+                    "    if (@import(\"builtin\").mode == .Debug) std.debug.print(\"{s}\\n\", .{{}});\n",
+                    .{safe_label},
+                );
+            }
+        },
     }
+}
+
+/// Escape an author-controlled `Log` label into a fragment that is safe
+/// to splice into a Zig `std.debug.print` format-string literal
+/// (flow-codegen#20). Two hazards are handled:
+///
+///  1. Zig string-literal syntax — quotes, backslashes, newlines, and
+///     other control bytes. Handled by `std.zig.fmtString`, which emits a
+///     literal *body* (no surrounding quotes), using `\"`, `\n`, `\xNN`,
+///     etc. `fmtString` never emits a brace of its own (control bytes
+///     become `\xNN`, not `\u{…}`), so every `{`/`}` in its output came
+///     verbatim from the label.
+///  2. `std.fmt` placeholder syntax — a `{` or `}` in the label would be
+///     read as (the start of) a format argument and break compilation.
+///     We double each brace (`{` → `{{`, `}` → `}}`) so it prints
+///     literally. This runs AFTER `fmtString`, and only over the label
+///     text — the caller appends its own single-brace `{any}` separately,
+///     so the real placeholder is never doubled.
+fn escapeLogLabel(alloc: std.mem.Allocator, label: []const u8) ![]const u8 {
+    const lit_escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.zig.fmtString(label)});
+    // Doubling can at most double the length.
+    var out = try std.ArrayList(u8).initCapacity(alloc, lit_escaped.len);
+    for (lit_escaped) |c| {
+        switch (c) {
+            '{' => try out.appendSlice(alloc, "{{"),
+            '}' => try out.appendSlice(alloc, "}}"),
+            else => try out.append(alloc, c),
+        }
+    }
+    return out.items;
 }
 
 /// Resolve the value supplied for `param` at a `Subflow` call site,
@@ -2748,7 +2801,10 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // exec outputs, producing no data value. The scope walker
         // (`emitScope`) expands it to a `switch` statement (`emitSwitch`);
         // it never reaches the flat `discardUnconsumedResult` path.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch => "",
+        // `Log` (flow-codegen#20) is a debug-print command — it lowers to
+        // a `std.debug.print` statement and binds no data value, same as
+        // `SetField` / `Emit` / `SetVariable`.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log => "",
     };
 }
 
@@ -2827,6 +2883,9 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // input. Its `case<N>`/`default` are exec *outputs* wired via
         // `Flow.exec_edges`, not data input pins, so they never appear here.
         .Switch => std.mem.eql(u8, pin, "selector"),
+        // `Log` (flow-codegen#20) consumes a single optional `value` data
+        // input — the thing to print. Unwired is valid (label-only print).
+        .Log => std.mem.eql(u8, pin, "value"),
     };
 }
 
