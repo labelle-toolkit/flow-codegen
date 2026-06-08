@@ -28,6 +28,15 @@ pub const GraphContext = struct {
     custom_nodes: ?*const CustomNodeRegistry,
     index: Index,
     order: []u32,
+    /// Sanitized function-name identifier of the flow this context
+    /// renders — `entryFunctionName(event)` for the file entry,
+    /// `sanitizeSymbol(name)` for a subgraph. It namespaces per-node gate
+    /// state (`__once_<flow_fn>_n<id>` / `__cd_<flow_fn>_n<id>`) so two
+    /// gates with the same node id in different flows get distinct module
+    /// `pub var`s (flow-codegen#47). Set by the caller after `init` (the
+    /// entry-vs-subgraph distinction is not visible from `flow` alone);
+    /// empty until set, which is fine for gate-free flows.
+    flow_fn: []const u8 = "",
 
     pub fn init(
         allocator: std.mem.Allocator,

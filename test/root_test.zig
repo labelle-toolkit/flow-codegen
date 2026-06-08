@@ -42,6 +42,9 @@ pub const CoercionTests = @import("coercion_test.zig").CoercionTests;
 /// `Format` / `Concat` / `IntToString` / `FloatToString`.
 pub const StringNodeTests = @import("string_nodes_test.zig").StringNodeTests;
 
+/// Time exec-gate nodes (flow-codegen#47): `Once` / `Cooldown`.
+pub const TimeGateTests = @import("time_gate_test.zig").TimeGateTests;
+
 // =====================================================================
 // Codegen validation — flows that parse cleanly but would otherwise
 // emit Zig that fails to compile (PR #6 review follow-up)

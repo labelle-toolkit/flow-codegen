@@ -86,8 +86,10 @@ pub fn validate(flow: Flow) ParseError!void {
             .Branch => std.mem.eql(u8, x.from.pin, "then") or
                 std.mem.eql(u8, x.from.pin, "else"),
             // `ForRange`/`While`/`ForEach`/`MapForEach` (flow-codegen#21,
-            // #24) route their single `body` exec output.
-            .ForRange, .While, .ForEach, .MapForEach => std.mem.eql(u8, x.from.pin, "body"),
+            // #24) route their single `body` exec output. `Once`/`Cooldown`
+            // (flow-codegen#47) are exec-gates that likewise route their
+            // single `body` exec output (no `else`).
+            .ForRange, .While, .ForEach, .MapForEach, .Once, .Cooldown => std.mem.eql(u8, x.from.pin, "body"),
             // A `Switch` routes through its `default` exec output or any
             // `case<N>` exec output (flow-codegen#22) — the N-way analogue
             // of a `Branch`'s `then`/`else`.
