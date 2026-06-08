@@ -344,6 +344,15 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // `Log` carries only its inline `label` (flow-codegen#20); the
         // `value` input is a data edge.
         .Log => |b| .{ .Log = .{ .label = try a.dupe(u8, b.label) } },
+        // List operation nodes (flow-codegen#24) carry only the list
+        // `collection` name — dupe it like other string payloads.
+        .ListAppend => |b| .{ .ListAppend = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListLength => |b| .{ .ListLength = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListGet => |b| .{ .ListGet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListSet => |b| .{ .ListSet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListContains => |b| .{ .ListContains = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListClear => |b| .{ .ListClear = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ForEach => |b| .{ .ForEach = .{ .collection = try a.dupe(u8, b.collection) } },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }
