@@ -297,6 +297,42 @@ pub const NodeKind = union(enum) {
     /// instead of being read as a `std.fmt` placeholder. Defaults to
     /// `""` when omitted.
     Log: struct { label: []const u8 = "" },
+    /// `ListAppend` — command (flow-codegen#24). Appends the wired
+    /// `value` data input to the named growable list. Lowers to
+    /// `<name>.append(game.allocator, <value>) catch {};`.
+    ListAppend: struct { collection: []const u8 },
+    /// `ListLength` — reporter (flow-codegen#24). Binds the list's
+    /// current length (`usize`) to its `value` output pin —
+    /// `const n<id>_value = <name>.items.len;`.
+    ListLength: struct { collection: []const u8 },
+    /// `ListGet` — reporter (flow-codegen#24). Reads the element at the
+    /// wired `index` data input — `const n<id>_value =
+    /// <name>.items[<index>];`. Direct index: an out-of-range read
+    /// panics in safe builds (a bounds-checked variant is a follow-up).
+    ListGet: struct { collection: []const u8 },
+    /// `ListSet` — command (flow-codegen#24). Writes the wired `value`
+    /// into the element at the wired `index` —
+    /// `<name>.items[<index>] = <value>;`. Same direct-index caveat as
+    /// `ListGet`.
+    ListSet: struct { collection: []const u8 },
+    /// `ListContains` — reporter (flow-codegen#24). Binds a `bool` —
+    /// whether any element equals the wired `value`. Lowered with a
+    /// Zig for-else: `const n<id>_value = for (<name>.items) |__e| { if
+    /// (__e == <value>) break true; } else false;`.
+    ListContains: struct { collection: []const u8 },
+    /// `ListClear` — command (flow-codegen#24). Empties the list while
+    /// keeping its capacity — `<name>.clearRetainingCapacity();`.
+    ListClear: struct { collection: []const u8 },
+    /// `ForEach` — control-flow loop over a list (flow-codegen#24,
+    /// pairs with flow-codegen#21's loop family). Exposes a single
+    /// **exec** output pin `body` (wired through `Flow.exec_edges` like
+    /// a `ForRange`'s `body`) plus two data **output** pins — `item`
+    /// (the element) and `index` (the 0-based `usize` position) —
+    /// readable only by body nodes (codegen special-cases the read in
+    /// `resolveInput`, mirroring `ForRange.index`). Lowers to
+    /// `for (<name>.items, 0..) |item_<id>, idx_<id>| { <body> }`.
+    /// Carries no per-kind payload beyond the list `collection` name.
+    ForEach: struct { collection: []const u8 },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -358,6 +394,22 @@ pub const Variable = struct {
     default: Literal,
 };
 
+/// A top-level declared growable LIST collection (flow-codegen#24, v1 —
+/// MAPS deferred to a follow-up). Lowers to a file-scope
+/// `pub var <name>: std.ArrayList(<element>) = .empty;` in the generated
+/// `.zig` module — game-allocator-backed, game-lifetime. Operations
+/// (`ListAppend`/`ListGet`/… and `ForEach`) reference it by `name` and
+/// allocate on demand through `game.allocator`. There is NO auto-deinit in
+/// v1: lists live for the game's lifetime and are reclaimed by the OS at
+/// exit; proper deinit-on-teardown is a follow-up.
+pub const Collection = struct {
+    /// Zig identifier — the collection's symbol in the generated module.
+    name: []const u8,
+    /// Zig source text of the list's ELEMENT type — e.g. `"u32"`,
+    /// `"i32"`, `"f32"`. Emitted verbatim as `std.ArrayList(<element>)`.
+    element: []const u8,
+};
+
 /// A fully parsed flow. Every slice is owned by the surrounding
 /// `LoadedFlow.arena`. `name` is the effective registry key (RFC §5).
 pub const Flow = struct {
@@ -387,6 +439,16 @@ pub const Flow = struct {
     /// declare none — the default. Optional in the source file; absence
     /// is indistinguishable from `"locals": []`.
     locals: []Variable = &.{},
+    /// Top-level declared growable LIST collections (flow-codegen#24, v1).
+    /// Each entry lowers to a file-scope
+    /// `pub var <name>: std.ArrayList(<element>) = .empty;` in the
+    /// generated `.zig` module (parallel to `variables`). A collection
+    /// name may not collide with another collection, a `variables`, or a
+    /// `locals` name (`DuplicateVariableName`). Empty for flows that
+    /// declare none — the default. Optional in the source file; absence is
+    /// indistinguishable from `"collections": []`. MAPS are deferred to a
+    /// follow-up.
+    collections: []Collection = &.{},
     nodes: []Node,
     /// Renamed from `links` per RFC §2; the field keeps the name
     /// `edges` to match the on-disk schema.
@@ -451,6 +513,10 @@ pub const ParseError = error{
     /// A `GetVariable` / `SetVariable` / `ChangeVariable` names a
     /// variable not in the top-level `variables` block.
     UnknownVariable,
+    /// A list operation node (`ListAppend` / `ListGet` / … / `ForEach`)
+    /// names a `collection` not in the top-level `collections` block
+    /// (flow-codegen#24).
+    UnknownCollection,
 };
 
 /// Read `path` as JSONC and parse it into a `LoadedFlow`. The flow's
@@ -517,6 +583,7 @@ fn buildFlow(
     const params = try buildParams(a, obj.get("params"));
     const variables = try buildVariables(a, obj.get("variables"));
     const locals = try buildVariables(a, obj.get("locals"));
+    const collections = try buildCollections(a, obj.get("collections"));
     const nodes = try buildNodes(a, obj.get("nodes") orelse return error.MalformedFlow);
     // `links` was the pre-rename (RFC §2) name for `edges`. A file
     // still using it would otherwise load with zero connections and
@@ -565,6 +632,7 @@ fn buildFlow(
         .params = params,
         .variables = variables,
         .locals = locals,
+        .collections = collections,
         .nodes = nodes,
         .edges = edges,
         .exec_edges = exec_edges,
@@ -607,6 +675,28 @@ fn buildVariables(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Variable {
             .name = try a.dupe(u8, vname.string),
             .type = try a.dupe(u8, vtype.string),
             .default = .{ .zig_text = try parseVariableDefault(a, vdefault) },
+        };
+    }
+    return out;
+}
+
+/// Parse the optional `collections` array (flow-codegen#24). Absent →
+/// empty slice (every pre-collections file). Each entry is `{ "name":
+/// "<ident>", "element": "<zig type text>" }`.
+fn buildCollections(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Collection {
+    const v = maybe orelse return &.{};
+    if (v != .array) return error.MalformedFlow;
+    const items = v.array.items;
+    const out = try a.alloc(Collection, items.len);
+    for (items, 0..) |it, i| {
+        if (it != .object) return error.MalformedFlow;
+        const o = it.object;
+        const cname = o.get("name") orelse return error.MalformedFlow;
+        const celement = o.get("element") orelse return error.MalformedFlow;
+        if (cname != .string or celement != .string) return error.MalformedFlow;
+        out[i] = .{
+            .name = try a.dupe(u8, cname.string),
+            .element = try a.dupe(u8, celement.string),
         };
     }
     return out;
@@ -830,6 +920,25 @@ fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Object
             else
                 "",
         } };
+    } else if (std.mem.eql(u8, type_name, "ListAppend")) {
+        // List ops (flow-codegen#24) reference a list by `collection`
+        // name; their data inputs (`value`/`index`) are edges.
+        return .{ .ListAppend = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ListLength")) {
+        return .{ .ListLength = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ListGet")) {
+        return .{ .ListGet = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ListSet")) {
+        return .{ .ListSet = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ListContains")) {
+        return .{ .ListContains = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ListClear")) {
+        return .{ .ListClear = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "ForEach")) {
+        // ForEach (flow-codegen#24) — its `body` is an exec output and
+        // `item`/`index` are data outputs; only the list `collection`
+        // name lives on the node.
+        return .{ .ForEach = .{ .collection = try reqStr(a, o, "collection") } };
     }
     return error.UnknownNodeType;
 }
@@ -975,6 +1084,18 @@ fn validate(flow: Flow) ParseError!void {
         if (hasVariable(flow.variables, v.name)) return error.DuplicateVariableName;
     }
 
+    // Unique collection names (flow-codegen#24), and no collection may
+    // collide with a file-scope `variables` or a `locals` name — all four
+    // lower to a bare `<name>` in the same module/function scope, so a
+    // collision is ambiguous (reuse the `DuplicateVariableName` error).
+    for (flow.collections, 0..) |c, i| {
+        for (flow.collections[i + 1 ..]) |d| {
+            if (std.mem.eql(u8, c.name, d.name)) return error.DuplicateVariableName;
+        }
+        if (hasVariable(flow.variables, c.name)) return error.DuplicateVariableName;
+        if (hasVariable(flow.locals, c.name)) return error.DuplicateVariableName;
+    }
+
     // Every edge endpoint resolves to a real node.
     for (flow.edges) |e| {
         if (!hasNode(flow.nodes, e.from.node)) return error.DanglingLink;
@@ -994,7 +1115,9 @@ fn validate(flow: Flow) ParseError!void {
         const ok = switch (src.kind) {
             .Branch => std.mem.eql(u8, x.from.pin, "then") or
                 std.mem.eql(u8, x.from.pin, "else"),
-            .ForRange, .While => std.mem.eql(u8, x.from.pin, "body"),
+            // `ForRange`/`While`/`ForEach` (flow-codegen#21, #24) route
+            // their single `body` exec output.
+            .ForRange, .While, .ForEach => std.mem.eql(u8, x.from.pin, "body"),
             // A `Switch` routes through its `default` exec output or any
             // `case<N>` exec output (flow-codegen#22) — the N-way analogue
             // of a `Branch`'s `then`/`else`.
@@ -1067,6 +1190,30 @@ fn validate(flow: Flow) ParseError!void {
                     findVariable(flow.locals, b.name) orelse return error.UnknownVariable;
                 if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
             },
+            // List operation nodes (flow-codegen#24) resolve their
+            // `collection` field by name against the top-level
+            // `collections` block; an unknown list is `UnknownCollection`.
+            .ListAppend => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ListLength => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ListGet => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ListSet => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ListContains => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ListClear => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .ForEach => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
             else => {},
         }
     }
@@ -1083,6 +1230,11 @@ fn hasVariable(variables: []const Variable, name: []const u8) bool {
 fn findVariable(variables: []const Variable, name: []const u8) ?Variable {
     for (variables) |v| if (std.mem.eql(u8, v.name, name)) return v;
     return null;
+}
+
+fn hasCollection(collections: []const Collection, name: []const u8) bool {
+    for (collections) |c| if (std.mem.eql(u8, c.name, name)) return true;
+    return false;
 }
 
 fn hasNode(nodes: []const Node, id: u32) bool {
@@ -1181,6 +1333,23 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
             try writeVariableDefault(w, allocator, v.default.zig_text);
             try w.writeAll(" }");
             if (i + 1 < flow.locals.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("  ],\n");
+    }
+
+    // Collections block (flow-codegen#24). Omitted when empty, mirroring
+    // the `variables`/`locals` blocks' formatting. Deterministic order:
+    // the in-memory order (source order), like `variables`.
+    if (flow.collections.len != 0) {
+        try w.writeAll("  \"collections\": [\n");
+        for (flow.collections, 0..) |c, i| {
+            try w.writeAll("    { \"name\": ");
+            try writeJsonString(w, c.name);
+            try w.writeAll(", \"element\": ");
+            try writeJsonString(w, c.element);
+            try w.writeAll(" }");
+            if (i + 1 < flow.collections.len) try w.writeAll(",");
             try w.writeAll("\n");
         }
         try w.writeAll("  ],\n");
@@ -1449,6 +1618,30 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         .Log => |b| {
             try w.writeAll(", \"label\": ");
             try writeJsonString(w, b.label);
+        },
+        // List operation nodes (flow-codegen#24) carry only the list
+        // `collection` name; their data inputs (`value`/`index`) and the
+        // `ForEach` `body`/`item`/`index` pins are edges, not payload.
+        .ListAppend,
+        .ListLength,
+        .ListGet,
+        .ListSet,
+        .ListContains,
+        .ListClear,
+        .ForEach,
+        => {
+            const collection = switch (k) {
+                .ListAppend => |b| b.collection,
+                .ListLength => |b| b.collection,
+                .ListGet => |b| b.collection,
+                .ListSet => |b| b.collection,
+                .ListContains => |b| b.collection,
+                .ListClear => |b| b.collection,
+                .ForEach => |b| b.collection,
+                else => unreachable,
+            };
+            try w.writeAll(", \"collection\": ");
+            try writeJsonString(w, collection);
         },
     }
 }

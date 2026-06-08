@@ -2021,6 +2021,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         .params = &.{},
         .variables = &.{},
         .locals = &.{},
+        .collections = &.{},
         .nodes = &.{},
         .edges = &.{},
         .exec_edges = &.{},
@@ -4704,5 +4705,422 @@ pub const CoercionTests = struct {
             \\}
         ;
         try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    // =====================================================================
+    // Collections — growable LIST ops + ForEach (flow-codegen#24)
+    // =====================================================================
+
+    test "collections block emits a module-level std.ArrayList pub var" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_decl",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_decl" });
+        defer allocator.free(out);
+
+        // Game-allocator-backed, `.empty`-init module `pub var`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var scores: std.ArrayList(u32) = .empty;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListAppend lowers to append(game.allocator, value) catch {}" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_append",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 2, "type": "ListAppend", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_append" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "scores.append(game.allocator, n1_value) catch {};") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListLength binds .items.len and is consumed downstream" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_len",
+            \\  "variables": [ { "name": "n", "type": "usize", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ListLength", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "n", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_len" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = scores.items.len;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n = n1_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListGet reads items[index] directly" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_get",
+            \\  "variables": [ { "name": "v", "type": "u32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "ListGet", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "v", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "index" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_get" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value = scores.items[n1_value];") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListSet writes items[index] = value" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_set",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
+            \\    { "id": 3, "type": "ListSet", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "index" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_set" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "scores.items[n1_value] = n2_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListContains lowers to a for-else membership scan binding a bool" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_contains",
+            \\  "variables": [ { "name": "has", "type": "bool", "default": false } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 2, "type": "ListContains", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "has", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_contains" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value = for (scores.items) |__e| { if (__e == n1_value) break true; } else false;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ListClear lowers to clearRetainingCapacity" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_clear",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "list_clear" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "scores.clearRetainingCapacity();") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForEach lowers to a for over items with item/index captures and nested body" {
+        const allocator = std.testing.allocator;
+        // Body reads BOTH `item` and `index`, so both captures are live.
+        const src =
+            \\{
+            \\  "name": "foreach_basic",
+            \\  "variables": [
+            \\    { "name": "sum", "type": "u32", "default": 0 },
+            \\    { "name": "last", "type": "usize", "default": 0 }
+            \\  ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "sum", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "last", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "item" }, "to": { "node": 2, "pin": "value" } },
+            \\    { "from": { "node": 1, "pin": "index" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } },
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "foreach_basic" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "for (scores.items, 0..) |item_1, idx_1| {") != null);
+        // Body nodes reference the captures, NOT n<id>_ bindings.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "sum = item_1;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "last = idx_1;") != null);
+        // Body nested one level under the entry fn → 8-space indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        sum = item_1;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForEach uses _ for an unread capture (no unused-capture error)" {
+        const allocator = std.testing.allocator;
+        // Body reads only `item` — the `index` capture must become `_`.
+        const src =
+            \\{
+            \\  "name": "foreach_item_only",
+            \\  "variables": [ { "name": "sum", "type": "u32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "sum", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "item" }, "to": { "node": 2, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "foreach_item_only" });
+        defer allocator.free(out);
+
+        // The unread `index` capture is `_`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "for (scores.items, 0..) |item_1, _| {") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "ForEach with a body that reads neither capture emits both as _" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "foreach_neither",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "foreach_neither" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "for (scores.items, 0..) |_, _| {") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "a collection name colliding with a variable is rejected" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_clash_var",
+            \\  "variables": [ { "name": "scores", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.DuplicateVariableName, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a collection name colliding with a local is rejected" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_clash_local",
+            \\  "locals": [ { "name": "scores", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.DuplicateVariableName, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a list node naming an undeclared collection is rejected" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_unknown",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ListClear", "collection": "ghost", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.UnknownCollection, flow_io.parseFlow(allocator, src));
+    }
+
+    test "ForEach item consumed outside the body scope is rejected" {
+        // Mirrors the ForRange.index out-of-scope test: a top-level
+        // SetVariable reads ForEach.item but is NOT wired to the loop's
+        // `body` exec edge, so its scope is top-level → out-of-scope read.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "foreach_oos",
+            \\  "variables": [ { "name": "out", "type": "u32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "item" }, "to": { "node": 2, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "foreach_oos" }),
+        );
+    }
+
+    test "round-trips collections + list/ForEach nodes through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_roundtrip",
+            \\  "collections": [ { "name": "scores", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        // The `collections` block and the `collection` field survive.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"collections\": [") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"name\": \"scores\", \"element\": \"u32\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"type\": \"ForEach\", \"collection\": \"scores\"") != null);
+
+        // Re-parse → re-render is byte-stable.
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "absence of a collections block is preserved on round-trip" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "no_collections",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+        // No `collections` block emitted when none declared.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"collections\"") == null);
     }
 };

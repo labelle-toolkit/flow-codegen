@@ -593,6 +593,20 @@ pub fn renderFlowFile(
         try w.writeAll("\n");
     }
 
+    // File-scope growable LIST collections (flow-codegen#24). One
+    // `pub var <name>: std.ArrayList(<element>) = .empty;` per declared
+    // entry — game-allocator-backed, game-lifetime. `.empty` is the
+    // zero-init (no allocator needed); ops allocate on demand through
+    // `game.allocator`. There is NO auto-deinit in v1: lists live for the
+    // game's lifetime and are reclaimed by the OS at exit (proper
+    // deinit-on-teardown is a follow-up). MAPS are deferred.
+    if (entry.collections.len != 0) {
+        for (entry.collections) |c| {
+            try w.print("pub var {s}: std.ArrayList({s}) = .empty;\n", .{ c.name, c.element });
+        }
+        try w.writeAll("\n");
+    }
+
     // Entry flow → its event `pub fn`.
     try renderEntryFunction(allocator, w, entry, registry, options.custom_nodes, options.flow_name);
 
@@ -1324,6 +1338,36 @@ fn validateForRangeIndexScopes(
     }
 }
 
+/// Validate that every consumer of a `ForEach` node's `item` / `index`
+/// output is within that loop's body scope (flow-codegen#24) — the
+/// direct analogue of `validateForRangeIndexScopes`. The `item_<id>` /
+/// `idx_<id>` captures are declared only inside the `for` body block; a
+/// consumer computed OUTSIDE that scope would emit an out-of-scope read,
+/// so the flow is `error.MalformedFlow`.
+fn validateForEachCaptureScopes(
+    allocator: std.mem.Allocator,
+    ctx: *GraphContext,
+    scopes: *const ScopeMap,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    for (ctx.flow.nodes) |*n| {
+        if (n.kind != .ForEach) continue;
+        const own_scope = scopes.get(n.id);
+        const body_scope = try appendFrame(allocator, own_scope, n.id, "body");
+        defer allocator.free(body_scope);
+
+        for (ctx.flow.edges) |e| {
+            if (e.from.node != n.id) continue;
+            // Only the `item`/`index` data outputs are scope-bound captures.
+            if (!std.mem.eql(u8, e.from.pin, "item") and
+                !std.mem.eql(u8, e.from.pin, "index")) continue;
+            const consumer_scope = scopes.get(e.to.node);
+            if (!scopePrefix(body_scope, consumer_scope)) {
+                return error.MalformedFlow;
+            }
+        }
+    }
+}
+
 /// Resolve a command/`Branch` node's scope from the exec edge targeting
 /// it. `depth` guards against an exec-edge cycle in a malformed graph —
 /// beyond the node count there must be a loop, so bail to top-level.
@@ -1414,6 +1458,13 @@ fn emitBody(
     // flow up front rather than emit uncompilable code.
     try validateForRangeIndexScopes(allocator, ctx, &scopes);
 
+    // ForEach `item`/`index` scope validation (flow-codegen#24): same
+    // shape as `ForRange.index` — the `item_<id>` / `idx_<id>` captures
+    // are declared only inside the `for` body block, so every consumer of
+    // a `ForEach.item`/`ForEach.index` output must compute within that
+    // body scope (or a descendant). Reject an out-of-scope read up front.
+    try validateForEachCaptureScopes(allocator, ctx, &scopes);
+
     // Suppression pre-pass (flow-codegen#21, bugbot "While cond leaves
     // unused bindings"): a reporter wired ONLY into `While.cond` pins
     // (transitively, through other inlined reporters) is inlined into the
@@ -1467,6 +1518,14 @@ fn emitScope(
         // `Branch` expands to nested `if`/`else` blocks (see `emitLoop`).
         if (node.kind == .ForRange or node.kind == .While) {
             try emitLoop(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
+            continue;
+        }
+
+        // `ForEach` (flow-codegen#24) joins the loop family — it expands to
+        // a `for (<list>.items, 0..) |item_<id>, idx_<id>|` header wrapping
+        // the recursively-emitted body scope (see `emitForEach`).
+        if (node.kind == .ForEach) {
+            try emitForEach(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
             continue;
         }
 
@@ -1702,6 +1761,75 @@ fn emitLoop(
         },
         else => unreachable,
     }
+}
+
+/// Lower a `ForEach` node at `scope` to a Zig `for` over the named list
+/// (flow-codegen#24). Joins the loop family: like `emitLoop`, the body
+/// scope frame is `{ branch: <foreach id>, side: "body" }`, so
+/// `execScopeOf` already routes body-targeted nodes here, and reporters
+/// whose LCA scope sinks into the body recompute each pass.
+///
+/// Lowers to `for (<list>.items, 0..) |item_<id>, idx_<id>| { <body> }`.
+/// The body reads the `item`/`index` output pins through `resolveInput`,
+/// which maps them to `item_<id>` / `idx_<id>` (NOT `n<id>_…` bindings) —
+/// mirroring `ForRange.index`.
+///
+/// Unused-capture handling: Zig errors on an unused `for` capture. We
+/// detect whether the body wires the `item` / `index` output pins and
+/// substitute `_` for an unread capture (e.g. a ForEach whose body never
+/// reads `index` emits `|item_<id>, _|`). When NEITHER is read, both
+/// become `_` and the loop runs purely for its body's side effects.
+fn emitForEach(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    suppressed: *const std.AutoHashMap(u32, void),
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    // Render the body scope to a buffer, then re-indent it under the `for`
+    // header — same buffer+indent mechanism `emitLoop`/`emitBranch` use.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer body_aw.deinit();
+    const child = try appendFrame(allocator, scope, node.id, "body");
+    defer allocator.free(child);
+    try emitScope(allocator, &body_aw.writer, ctx, flow_name, emit_preview, scopes, suppressed, child, scratch);
+    const body = body_aw.written();
+
+    // A `for` capture that is never read is a Zig "unused capture" error.
+    // Substitute `_` for an unread `item` / `index` output pin. The list
+    // is referenced by name (the module-level `pub var std.ArrayList`).
+    const collection = node.kind.ForEach.collection;
+    const item_cap = if (anyConsumerOf(ctx, node.id, "item"))
+        try std.fmt.allocPrint(scratch, "item_{d}", .{node.id})
+    else
+        try scratch.dupe(u8, "_");
+    const idx_cap = if (anyConsumerOf(ctx, node.id, "index"))
+        try std.fmt.allocPrint(scratch, "idx_{d}", .{node.id})
+    else
+        try scratch.dupe(u8, "_");
+
+    try w.print(
+        "    for ({s}.items, 0..) |{s}, {s}| {{\n",
+        .{ collection, item_cap, idx_cap },
+    );
+    if (body.len != 0) try indentBlock(w, body, "    ");
+    try w.writeAll("    }\n");
+}
+
+/// True when any data edge reads the `pin` output of node `id` — used by
+/// `emitForEach` to decide whether a `for` capture is live (flow-codegen#24).
+fn anyConsumerOf(ctx: *GraphContext, id: u32, pin: []const u8) bool {
+    for (ctx.flow.edges) |e| {
+        if (e.from.node == id and std.mem.eql(u8, e.from.pin, pin)) return true;
+    }
+    return false;
 }
 
 /// Recursively expand the pure reporter subtree feeding `pin` on
@@ -2024,6 +2152,18 @@ const GraphContext = struct {
         // scope. (`ForRange` exposes no other output pin.)
         if (producer.kind == .ForRange and std.mem.eql(u8, edge.from.pin, "index")) {
             return try std.fmt.allocPrint(alloc, "i_{d}", .{producer.id});
+        }
+
+        // A `ForEach`'s `item` / `index` output pins ARE the `for` loop
+        // captures (flow-codegen#24) — they resolve to the `item_<id>` /
+        // `idx_<id>` names declared by the loop header, NOT `n<id>_…`
+        // bindings. Body nodes that read them emit inside the `for` block,
+        // where the captures are in scope (mirrors `ForRange.index`).
+        if (producer.kind == .ForEach and std.mem.eql(u8, edge.from.pin, "item")) {
+            return try std.fmt.allocPrint(alloc, "item_{d}", .{producer.id});
+        }
+        if (producer.kind == .ForEach and std.mem.eql(u8, edge.from.pin, "index")) {
+            return try std.fmt.allocPrint(alloc, "idx_{d}", .{producer.id});
         }
 
         const primary = primaryOutputPin(producer.kind);
@@ -2602,6 +2742,65 @@ fn writeNodeBody(
             }
             try w.writeAll(");\n");
         },
+        // List operations (flow-codegen#24). Each references its growable
+        // list by `collection` name (the module-level `pub var
+        // std.ArrayList(...)`). Commands allocate on demand through
+        // `game.allocator` (always in scope here — `bodyImpl`/handlers all
+        // bind a `game: *Game`).
+        //
+        // `ListAppend` — append the wired `value`; `catch {}` swallows the
+        // OOM error so the lowering is a statement (v1: best-effort).
+        .ListAppend => |b| {
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    {s}.append(game.allocator, {s}) catch {{}};\n",
+                .{ b.collection, value_expr },
+            );
+        },
+        // `ListLength` — reporter binding the list length (`usize`).
+        .ListLength => |b| try w.print(
+            "    const n{d}_value = {s}.items.len;\n",
+            .{ node.id, b.collection },
+        ),
+        // `ListGet` — reporter reading `items[<index>]` directly. An
+        // out-of-range index panics in safe builds (bounds-checked variant
+        // is a follow-up).
+        .ListGet => |b| {
+            const index_expr = (try ctx.resolveInput(scratch, node, "index")) orelse return error.DanglingPin;
+            try w.print(
+                "    const n{d}_value = {s}.items[{s}];\n",
+                .{ node.id, b.collection, index_expr },
+            );
+        },
+        // `ListSet` — command writing `items[<index>] = <value>`.
+        .ListSet => |b| {
+            const index_expr = (try ctx.resolveInput(scratch, node, "index")) orelse return error.DanglingPin;
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    {s}.items[{s}] = {s};\n",
+                .{ b.collection, index_expr, value_expr },
+            );
+        },
+        // `ListContains` — reporter binding a `bool` via a Zig for-else
+        // membership scan. `__e` is the loop capture; the `break true`
+        // short-circuits and the `else false` is the no-match result.
+        .ListContains => |b| {
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    const n{d}_value = for ({s}.items) |__e| {{ if (__e == {s}) break true; }} else false;\n",
+                .{ node.id, b.collection, value_expr },
+            );
+        },
+        // `ListClear` — command emptying the list, keeping capacity.
+        .ListClear => |b| try w.print(
+            "    {s}.clearRetainingCapacity();\n",
+            .{b.collection},
+        ),
+        // `ForEach` (flow-codegen#24) is a control-flow loop node — like
+        // `Branch`/`ForRange`, `emitScope` intercepts it and emits the
+        // `for` header + recursively emits the body scope (see
+        // `emitForEach`). Unreachable in a well-formed walk.
+        .ForEach => unreachable,
         // `Branch` (flow-codegen#8) is never emitted through this flat
         // path — `emitScope` intercepts a `Branch` node and expands it
         // to an `if`/`else` wrapper (see `emitBranch`), recursing into
@@ -2766,6 +2965,11 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // nullable variable operations) — single output pin `value` of
         // type `bool`, the same naming as `GetVariable`.
         .HasValueVariable => "value",
+        // List reporters (flow-codegen#24) — `ListLength`/`ListGet`/
+        // `ListContains` bind an `n<id>_value`. The command list ops
+        // (`ListAppend`/`ListSet`/`ListClear`) and the `ForEach` loop
+        // node bind no value (empty-pin arm below).
+        .ListLength, .ListGet, .ListContains => "value",
         // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
         // §1 + §5). When the impl returns a value, the binding name is
         // `n<id>_value` (matching the reporter naming convention shared
@@ -2805,7 +3009,11 @@ fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // `Log` (flow-codegen#20) is a debug-print command — it lowers to
         // a `std.debug.print` statement and binds no data value, same as
         // `SetField` / `Emit` / `SetVariable`.
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log => "",
+        // `ListAppend`/`ListSet`/`ListClear` are command list ops, and
+        // `ForEach` is a control-flow loop node (expanded by the scope
+        // walker, like `ForRange`) — none bind a data value
+        // (flow-codegen#24).
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach => "",
     };
 }
 
@@ -2887,6 +3095,16 @@ fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // `Log` (flow-codegen#20) consumes a single optional `value` data
         // input — the thing to print. Unwired is valid (label-only print).
         .Log => std.mem.eql(u8, pin, "value"),
+        // List operation data inputs (flow-codegen#24). The list itself is
+        // referenced by `collection` name, not a pin.
+        //   ListAppend → `value`; ListSet → `index`, `value`;
+        //   ListGet → `index`; ListContains → `value`.
+        // ListLength/ListClear take no data input; ForEach takes none (its
+        // `body` is an exec output and `item`/`index` are data outputs).
+        .ListAppend, .ListContains => std.mem.eql(u8, pin, "value"),
+        .ListGet => std.mem.eql(u8, pin, "index"),
+        .ListSet => std.mem.eql(u8, pin, "index") or std.mem.eql(u8, pin, "value"),
+        .ListLength, .ListClear, .ForEach => false,
     };
 }
 

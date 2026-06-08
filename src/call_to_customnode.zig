@@ -270,6 +270,27 @@ pub fn convertFlow(
         };
     }
 
+    // Locals (flow-codegen#23) and collections (#24) must be carried
+    // through the Call→CustomNode conversion too — both default to empty
+    // on `Flow`, so omitting them here silently drops the flow's local
+    // vars / lists (bugbot, #24).
+    const new_locals = try a.alloc(flow_io.Variable, flow.locals.len);
+    for (flow.locals, 0..) |v, i| {
+        new_locals[i] = .{
+            .name = try a.dupe(u8, v.name),
+            .type = try a.dupe(u8, v.type),
+            .default = .{ .zig_text = try a.dupe(u8, v.default.zig_text) },
+        };
+    }
+
+    const new_collections = try a.alloc(flow_io.Collection, flow.collections.len);
+    for (flow.collections, 0..) |c, i| {
+        new_collections[i] = .{
+            .name = try a.dupe(u8, c.name),
+            .element = try a.dupe(u8, c.element),
+        };
+    }
+
     const new_event: flow_io.Event = switch (flow.event) {
         .OnCall => .OnCall,
         .OnEvent => |b| .{ .OnEvent = .{
@@ -283,6 +304,8 @@ pub fn convertFlow(
         .event = new_event,
         .params = new_params,
         .variables = new_variables,
+        .locals = new_locals,
+        .collections = new_collections,
         .nodes = new_nodes,
         .edges = new_edges,
         .exec_edges = new_exec_edges,
@@ -344,6 +367,15 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // `Log` carries only its inline `label` (flow-codegen#20); the
         // `value` input is a data edge.
         .Log => |b| .{ .Log = .{ .label = try a.dupe(u8, b.label) } },
+        // List operation nodes (flow-codegen#24) carry only the list
+        // `collection` name — dupe it like other string payloads.
+        .ListAppend => |b| .{ .ListAppend = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListLength => |b| .{ .ListLength = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListGet => |b| .{ .ListGet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListSet => |b| .{ .ListSet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListContains => |b| .{ .ListContains = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ListClear => |b| .{ .ListClear = .{ .collection = try a.dupe(u8, b.collection) } },
+        .ForEach => |b| .{ .ForEach = .{ .collection = try a.dupe(u8, b.collection) } },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }

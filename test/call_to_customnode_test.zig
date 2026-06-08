@@ -70,6 +70,33 @@ pub const CallToCustomNodeTests = struct {
         return .{ .rendered = rendered };
     }
 
+    test "convertFlow carries locals + collections through (flow-codegen#24 bugbot)" {
+        const allocator = std.testing.allocator;
+        const input =
+            \\{
+            \\  "name": "f",
+            \\  "event": { "type": "OnCall" },
+            \\  "locals": [ { "name": "tmp", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "xs", "element": "u32" } ],
+            \\  "nodes": [ { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, input);
+        defer loaded.deinit();
+        var catalog = try call_to_customnode.parseCatalog(allocator, simple_catalog);
+        defer catalog.deinit();
+        var result = try call_to_customnode.convertFlow(allocator, loaded.flow, catalog);
+        defer result.deinit();
+        // Both blocks survive the conversion (they default to empty on
+        // Flow, so a missing copy silently drops them).
+        try expect.toBeTrue(result.loaded.flow.locals.len == 1);
+        try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.locals[0].name, "tmp"));
+        try expect.toBeTrue(result.loaded.flow.collections.len == 1);
+        try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.collections[0].name, "xs"));
+        try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.collections[0].element, "u32"));
+    }
+
     test "simple match: Call applyImpulse -> CustomNode apply_impulse" {
         const allocator = std.testing.allocator;
         const out = try runFixture(allocator, simple_input, simple_catalog, simple_expected);
