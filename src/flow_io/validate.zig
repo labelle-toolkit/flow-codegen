@@ -89,7 +89,10 @@ pub fn validate(flow: Flow) ParseError!void {
             // #24) route their single `body` exec output. `Once`/`Cooldown`
             // (flow-codegen#47) are exec-gates that likewise route their
             // single `body` exec output (no `else`).
-            .ForRange, .While, .ForEach, .MapForEach, .Once, .Cooldown => std.mem.eql(u8, x.from.pin, "body"),
+            // `Delay` (flow-codegen#48) is also a single-`body` exec source,
+            // but its target is constrained further below (it must be exactly
+            // one `Subflow`).
+            .ForRange, .While, .ForEach, .MapForEach, .Once, .Cooldown, .Delay => std.mem.eql(u8, x.from.pin, "body"),
             // A `Switch` routes through its `default` exec output or any
             // `case<N>` exec output (flow-codegen#22) — the N-way analogue
             // of a `Branch`'s `then`/`else`.
@@ -109,6 +112,29 @@ pub fn validate(flow: Flow) ParseError!void {
         for (flow.exec_edges[i + 1 ..]) |y| {
             if (x.to_node == y.to_node) return error.MalformedFlow;
         }
+    }
+
+    // A `Delay` node's `body` exec output must target EXACTLY ONE node,
+    // and that node must be a `Subflow` (flow-codegen#48). A Delay defers
+    // its downstream by snapshotting a subflow's input arguments and
+    // scheduling the subflow to run later (see codegen's `emitDelay`) —
+    // there is no general "deferred block", only a deferred subflow call,
+    // so a `body` wired to zero nodes, multiple nodes, or a non-`Subflow`
+    // node is malformed. (The "at most one exec target per node" check
+    // above already rejects a body fanned out to two DISTINCT targets; this
+    // also rejects zero targets and a single non-`Subflow` target.)
+    for (flow.nodes) |n| {
+        if (n.kind != .Delay) continue;
+        var body_target: ?u32 = null;
+        for (flow.exec_edges) |x| {
+            if (x.from.node != n.id) continue;
+            if (!std.mem.eql(u8, x.from.pin, "body")) continue;
+            if (body_target != null) return error.MalformedFlow; // >1 body edge
+            body_target = x.to_node;
+        }
+        const target = body_target orelse return error.MalformedFlow; // 0 body edges
+        const target_node = findNode(flow.nodes, target) orelse return error.DanglingLink;
+        if (target_node.kind != .Subflow) return error.MalformedFlow;
     }
 
     // `Param` nodes must name a declared parameter (RFC §3); `Output`

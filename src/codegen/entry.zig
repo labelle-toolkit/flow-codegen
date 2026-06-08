@@ -23,6 +23,8 @@ const CustomNodeRegistry = registries.CustomNodeRegistry;
 const GraphContext = graph.GraphContext;
 const sanitizeSymbol = pins.sanitizeSymbol;
 const collectOutputs = pins.collectOutputs;
+const anyOutput = pins.anyOutput;
+const delaySubflowNode = pins.delaySubflowNode;
 const assertNoOutputCollision = pins.assertNoOutputCollision;
 const detectReferenceCycleFlow = cycles.detectReferenceCycleFlow;
 const emitBody = scope.emitBody;
@@ -189,6 +191,36 @@ pub fn renderFlowFile(
                     },
                     else => {},
                 }
+            }
+        }
+        if (emitted_any) try w.writeAll("\n");
+    }
+
+    // Per-Delay deferred-subflow state for `Delay` exec nodes
+    // (flow-codegen#48). One capture struct + one trampoline `fn` per Delay
+    // node, namespaced by `<flowfn>` exactly like the gate state above —
+    // node ids are unique only WITHIN a flow, so the `<flowfn>` prefix keeps
+    // the names collision-free across the entry function and every subgraph
+    // (the same guarantee `assertNoSymbolCollision` proves). A Delay's
+    // capture struct FIELDS are the deferred Subflow's declared input params
+    // (names + types, read from the registry); its trampoline casts the
+    // type-erased game/ctx pointers back to `*Game` / the typed capture and
+    // calls the subflow with the snapshotted args. Gates and Delays can live
+    // in the entry flow OR any referenced subgraph (both render through
+    // `emitBody`), so the pass scans both. The lowering side (`emitDelay` in
+    // `scope.zig`) reads the SAME `<flowfn>` off `ctx.flow_fn`, so the
+    // emission and call sites produce byte-identical names.
+    {
+        var emitted_any = false;
+        var flow_idx: usize = 0;
+        while (flow_idx <= subgraphs.items.len) : (flow_idx += 1) {
+            const f = if (flow_idx == 0) entry else subgraphs.items[flow_idx - 1];
+            const flow_fn = try gateFlowFn(allocator, f, flow_idx == 0);
+            defer allocator.free(flow_fn);
+            for (f.nodes) |n| {
+                if (n.kind != .Delay) continue;
+                try emitDelayState(allocator, w, f, registry, flow_fn, n);
+                emitted_any = true;
             }
         }
         if (emitted_any) try w.writeAll("\n");
@@ -754,6 +786,87 @@ fn gateFlowFn(
 ) std.mem.Allocator.Error![]u8 {
     if (is_entry) return allocator.dupe(u8, entryFunctionName(flow.event));
     return sanitizeSymbol(allocator, flow.name);
+}
+
+/// Emit the module-level deferred-subflow state for one `Delay` node
+/// (flow-codegen#48): a capture struct holding a snapshot of the deferred
+/// Subflow's input arguments, plus a trampoline `fn` the scheduler invokes
+/// when the timer fires.
+///
+/// Shape (namespaced by `<flowfn>` — the flow's function name — so two
+/// Delays at the same node id in different flows get distinct decls):
+///   const __DelayCap_<flowfn>_n<id> = struct { <arg0>: <type0>, … };
+///   fn __delay_tramp_<flowfn>_n<id>(game_ctx: *anyopaque, ctx: *anyopaque) void {
+///       const game: *Game = @ptrCast(@alignCast(game_ctx));
+///       const cap: *__DelayCap_<flowfn>_n<id> = @ptrCast(@alignCast(ctx));
+///       _ = <subflow_symbol>(game, cap.<arg0>, …);  // `_ =` only if it returns
+///   }
+/// The capture FIELDS are the referenced flow's declared input params
+/// (names sanitized to valid Zig identifiers, in declared order); the
+/// trampoline forwards them positionally to the subflow function. The
+/// scheduler OWNS and frees the capture (labelle-engine#605), so the
+/// trampoline never frees `ctx`. `game` is the concrete `*Game` already in
+/// scope via the module's `@import("game")` shim — the subflow takes
+/// `game: anytype` and is called with that `*Game`-shaped value.
+fn emitDelayState(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    flow: flow_io.Flow,
+    registry: *const FlowRegistry,
+    flow_fn: []const u8,
+    node: flow_io.Node,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    const target = delaySubflowNode(flow, node.id) orelse return error.MalformedFlow;
+    const ref = registry.get(target.kind.Subflow.flow) orelse return error.UnknownFlowRef;
+    const symbol = try sanitizeSymbol(allocator, ref.name);
+    defer allocator.free(symbol);
+
+    // Capture struct — one field per declared input param of the deferred
+    // subflow, names sanitized so a param like `hit-points` still emits a
+    // valid Zig field identifier. A subflow with no params yields an empty
+    // struct (a valid zero-field capture).
+    try w.print("const __DelayCap_{s}_n{d} = struct {{", .{ flow_fn, node.id });
+    for (ref.params, 0..) |p, i| {
+        const field = try sanitizeSymbol(allocator, p.name);
+        defer allocator.free(field);
+        if (i != 0) try w.writeAll(",");
+        try w.print(" {s}: {s}", .{ field, p.type });
+    }
+    if (ref.params.len != 0) try w.writeAll(" ");
+    try w.writeAll("};\n");
+
+    // Trampoline — cast both type-erased pointers back, then forward the
+    // snapshotted args to the subflow. A void subgraph (no `Output` nodes)
+    // is a bare call statement; a value-producing one is discarded with
+    // `_ =` so the trampoline stays `void`-returning.
+    try w.print(
+        "fn __delay_tramp_{s}_n{d}(game_ctx: *anyopaque, ctx: *anyopaque) void {{\n",
+        .{ flow_fn, node.id },
+    );
+    try w.writeAll("    const game: *Game = @ptrCast(@alignCast(game_ctx));\n");
+    try w.print(
+        "    const cap: *__DelayCap_{s}_n{d} = @ptrCast(@alignCast(ctx));\n",
+        .{ flow_fn, node.id },
+    );
+    // Silence "unused" when the capture is empty / the subflow takes no
+    // params and discards nothing readable: `cap` is still referenced via
+    // its field reads below when params exist; for the zero-param case it
+    // would be unused, so discard it explicitly.
+    if (ref.params.len == 0) try w.writeAll("    _ = cap;\n");
+
+    const ref_void = !anyOutput(ref.nodes);
+    if (ref_void) {
+        try w.print("    {s}(game", .{symbol});
+    } else {
+        try w.print("    _ = {s}(game", .{symbol});
+    }
+    for (ref.params) |p| {
+        const field = try sanitizeSymbol(allocator, p.name);
+        defer allocator.free(field);
+        try w.print(", cap.{s}", .{field});
+    }
+    try w.writeAll(");\n");
+    try w.writeAll("}\n");
 }
 
 /// Reject the case where two file-level symbols with distinct effective

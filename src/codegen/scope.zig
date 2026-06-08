@@ -18,6 +18,7 @@ const CodegenError = errors.CodegenError;
 const GraphContext = graph.GraphContext;
 const primaryOutputPin = pins.primaryOutputPin;
 const countSwitchCases = pins.countSwitchCases;
+const sanitizeSymbol = pins.sanitizeSymbol;
 const writePreviewPulse = nodes.writePreviewPulse;
 const writeNodeBody = nodes.writeNodeBody;
 const discardUnconsumedResult = graph.discardUnconsumedResult;
@@ -471,6 +472,17 @@ fn emitScope(
             continue;
         }
 
+        // `Delay` (flow-codegen#48) is a deferred-subflow exec node: instead
+        // of running its body inline, it snapshots the deferred Subflow's
+        // input args into a heap capture struct and registers a scheduler
+        // timer to run the subflow later (see `emitDelay`). The capture
+        // struct + trampoline live at module scope (emitted by `entry.zig`);
+        // this only emits the per-call create + snapshot + `scheduler.after`.
+        if (node.kind == .Delay) {
+            try emitDelay(w, ctx, flow_name, emit_preview, node, scratch);
+            continue;
+        }
+
         // `Switch` (flow-codegen#22) expands to a `switch` statement with a
         // block per case side, mirroring how a `Branch` expands to nested
         // `if`/`else` blocks (see `emitSwitch`).
@@ -778,6 +790,135 @@ fn emitGate(
         },
         else => unreachable,
     }
+}
+
+/// Lower a `Delay` node at `scope` to a deferred-subflow scheduler
+/// registration (flow-codegen#48). Unlike the gates, `Delay` does NOT run
+/// its body inline: it SNAPSHOTS the deferred Subflow's input args into a
+/// heap capture struct (the module-level `__DelayCap_<flow_fn>_n<id>`
+/// emitted by `entry.zig`) and registers a (scaled, pause-aware) timer on
+/// the engine's runtime `Scheduler`. The subflow runs later off the
+/// generated trampoline `__delay_tramp_<flow_fn>_n<id>`.
+///
+/// Lowers (with `<flow_fn>` = `ctx.flow_fn`, the per-flow namespace):
+///   const __cap_n<id> = game.allocator.create(__DelayCap_<flow_fn>_n<id>) catch return;
+///   __cap_n<id>.* = .{ .<arg0> = <expr0>, … };   // snapshot subflow inputs NOW
+///   game.scheduler.after(<seconds>, <entity-or-null>, __cap_n<id>, &__delay_tramp_<flow_fn>_n<id>);
+///
+/// CONTRACT (labelle-engine#605): `ctx` MUST be the typed `*__DelayCap…`
+/// pointer just `create`'d — the scheduler captures `T` at comptime to free
+/// it with correct alignment, so a pre-cast `*anyopaque` would panic. The
+/// scheduler OWNS and frees the capture exactly once after firing/skip/
+/// deinit; the trampoline never frees it. The `entity` argument is `?EntityId`
+/// — bound to the flow's in-scope entity when it has one (so the Delay
+/// auto-cancels if that entity dies before firing). Post-Phase 6 flows have
+/// NO lifecycle `entity` identifier in scope (`OnCall`/`OnEvent`/subgraph all
+/// reach entities only through wired pins), so it is `null` here; an
+/// entity-bound Delay is a future enhancement once a flow surfaces "the
+/// entity" again.
+///
+/// The capture FIELDS are the deferred Subflow's declared input params; the
+/// snapshot EXPRS are the Subflow node's wired input pins (RFC §3
+/// precedence: wired pin → binding literal → declared default), resolved at
+/// the Delay site. Wired pins are DEEP-INLINED (`deepInlineExpr`) so the
+/// snapshot is self-contained — the wired reporter subtree sinks into the
+/// Delay's body scope (which is never emitted inline here), so a frozen
+/// `n<id>_…` binding reference would dangle. Deep-inline also matches the
+/// "snapshot NOW" semantics: the value is captured at the Delay site, not
+/// re-read when the timer fires. (A wired side-effecting producer —
+/// `Call`/`GetComponent`/`Subflow` — falls back to its `n<id>_…` binding,
+/// which can dangle; that mirrors `While`'s documented deep-inline
+/// limitation and is left for a follow-up.)
+fn emitDelay(
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    const target = pins.delaySubflowNode(ctx.flow, node.id) orelse return error.MalformedFlow;
+    const ref = ctx.registry.get(target.kind.Subflow.flow) orelse return error.UnknownFlowRef;
+    const bindings = target.kind.Subflow.bindings;
+
+    // Reject bindings / wired pins naming a param the ref doesn't declare —
+    // the same checks the inline `Subflow` lowering runs, so a typo on a
+    // deferred subflow's arg surfaces as an error here too rather than
+    // silently dropping the value.
+    for (bindings) |bd| {
+        if (!pins.hasParam(ref.params, bd.param)) return error.UnknownFlowParam;
+    }
+    for (ctx.flow.edges) |e| {
+        if (e.to.node != target.id) continue;
+        if (!pins.hasParam(ref.params, e.to.pin)) return error.UnknownFlowParam;
+    }
+
+    const seconds = node.kind.Delay.seconds;
+
+    // 1. Allocate the capture on the game allocator. `catch return` on OOM
+    //    is the accepted v1 behaviour (mirrors collections' `catch {}`
+    //    swallow philosophy) — the deferred call is simply dropped.
+    try w.print(
+        "    const __cap_n{d} = game.allocator.create(__DelayCap_{s}_n{d}) catch return;\n",
+        .{ node.id, ctx.flow_fn, node.id },
+    );
+
+    // 2. Snapshot the subflow's inputs NOW — one field per declared param,
+    //    field name sanitized to match the capture struct's fields
+    //    (`entry.zig`). A param subtree that is purely literal/variable
+    //    deep-inlines to a self-contained expression.
+    if (ref.params.len == 0) {
+        try w.print("    __cap_n{d}.* = .{{}};\n", .{node.id});
+    } else {
+        try w.print("    __cap_n{d}.* = .{{", .{node.id});
+        for (ref.params, 0..) |p, i| {
+            const field = try sanitizeSymbol(scratch, p.name);
+            const arg = try resolveDelaySubflowArg(scratch, ctx, target, p, bindings);
+            if (i != 0) try w.writeAll(",");
+            try w.print(" .{s} = {s}", .{ field, arg });
+        }
+        try w.writeAll(" };\n");
+    }
+
+    // 3. Register the timer. The typed `*__DelayCap…` is passed straight
+    //    through (NOT pre-cast to `*anyopaque`) so the scheduler can free it
+    //    with the correct alignment. `entity` is `null` (see doc comment).
+    try w.print(
+        "    game.scheduler.after({d}, null, __cap_n{d}, &__delay_tramp_{s}_n{d});\n",
+        .{ seconds, node.id, ctx.flow_fn, node.id },
+    );
+}
+
+/// Resolve the value snapshotted for `param` at a `Delay`'s deferred
+/// `Subflow` (flow-codegen#48). Same RFC §3 precedence as
+/// `nodes.resolveSubflowArg` — wired pin → binding literal → declared
+/// default — but a WIRED pin is DEEP-INLINED (`deepInlineExpr`) rather than
+/// resolved to its `n<id>_…` binding, because the wired reporter sinks into
+/// the Delay's body scope (never emitted inline), so a binding reference
+/// would dangle. The snapshot is taken at the Delay site, so inlining also
+/// gives the correct "capture NOW" semantics. Returns Zig source text on
+/// `alloc`.
+fn resolveDelaySubflowArg(
+    alloc: std.mem.Allocator,
+    ctx: *GraphContext,
+    subflow_node: *const flow_io.Node,
+    param: flow_io.Param,
+    bindings: []const flow_io.Binding,
+) (CodegenError || std.mem.Allocator.Error)![]const u8 {
+    // 1. Wired — deep-inline the param-named input pin's subtree.
+    if (try deepInlineExpr(alloc, ctx, subflow_node, param.name)) |expr| return expr;
+    // 2. Binding literal.
+    for (bindings) |bd| {
+        if (std.mem.eql(u8, bd.param, param.name)) {
+            return try alloc.dupe(u8, bd.value.zig_text);
+        }
+    }
+    // 3. Declared default.
+    if (param.default) |d| return try alloc.dupe(u8, d.zig_text);
+    // Neither wired, bound, nor defaulted (RFC §3 rule 3).
+    return error.MissingFlowArg;
 }
 
 /// Lower a `ForEach` node at `scope` to a Zig `for` over the named list
