@@ -264,6 +264,58 @@ pub const NodeKind = union(enum) {
     /// instead of being read as a `std.fmt` placeholder. Defaults to
     /// `""` when omitted.
     Log: struct { label: []const u8 = "" },
+    /// `Format` — string-formatting reporter (flow-codegen#26). Renders a
+    /// printf-style `template` against ordered, typed value pins
+    /// (`arg0`, `arg1`, … — the same positional `arg<N>` convention as
+    /// `Call`) and binds the resulting `[]const u8` to its `value` output
+    /// pin. The `template` is VERBATIM Zig `std.fmt` syntax (`{d}`, `{s}`,
+    /// `{}`) — the same convention the `Log` node uses for its `label`.
+    /// Codegen escapes it with `escapeZigStringBody` (Zig string-literal
+    /// escaping for quotes/newlines/control bytes) but, unlike `Log`,
+    /// does NOT double its braces — they are real `std.fmt` placeholders
+    /// here. Defaults to `""` when omitted (a valid, argument-free
+    /// template).
+    ///
+    /// REPORTER allocation contract (flow-codegen#26): the result is
+    /// allocated via `game.allocator`, game-lifetime, with NO auto-free —
+    /// the flow author owns the string, exactly like the growable
+    /// collections (flow-codegen#24). On allocation failure codegen falls
+    /// back to a safe empty string (`catch ""`), mirroring collections'
+    /// `catch {}` swallow philosophy. Because it allocates, codegen emits
+    /// it EXACTLY ONCE bound to `n<id>_value` (like `Call`/`GetComponent`)
+    /// rather than inlining per consumer — it is deliberately NOT in
+    /// `inline.zig`'s pure-inlinable set.
+    /// Lowers to `const n<id>_value: []const u8 =
+    /// std.fmt.allocPrint(game.allocator, "<template>", .{ <arg0>, … })
+    /// catch "";`.
+    Format: struct { template: []const u8 = "" },
+    /// `Concat` — string-join reporter (flow-codegen#26). Joins N string
+    /// value pins (`arg0`, `arg1`, … — the positional `arg<N>` convention
+    /// shared with `Call`/`Format`) into a single `[]const u8` bound to
+    /// its `value` output pin. Carries no per-kind payload — every input
+    /// is a data edge. Same REPORTER allocation contract as `Format`
+    /// (game-lifetime via `game.allocator`, no auto-free, `catch ""` on
+    /// failure, bound-once). Lowers to `const n<id>_value: []const u8 =
+    /// std.mem.concat(game.allocator, u8, &.{ <a>, <b>, … }) catch "";`.
+    Concat: struct {},
+    /// `IntToString` — integer-stringify reporter (flow-codegen#26).
+    /// Renders the single wired integer `value` data input as decimal
+    /// text, binding the `[]const u8` result to its `value` output pin.
+    /// Carries no per-kind payload. Same REPORTER allocation contract as
+    /// `Format` (game-lifetime via `game.allocator`, no auto-free, `catch
+    /// ""` on failure, bound-once). Lowers to `const n<id>_value: []const
+    /// u8 = std.fmt.allocPrint(game.allocator, "{d}", .{<v>}) catch "";`.
+    IntToString: struct {},
+    /// `FloatToString` — float-stringify reporter (flow-codegen#26).
+    /// Renders the single wired float `value` data input as decimal text,
+    /// binding the `[]const u8` result to its `value` output pin. Carries
+    /// no per-kind payload. Same REPORTER allocation contract as `Format`
+    /// (game-lifetime via `game.allocator`, no auto-free, `catch ""` on
+    /// failure, bound-once). Lowers to the same `{d}` `allocPrint` form as
+    /// `IntToString` — Zig's `{d}` formats both ints and floats, so the
+    /// two share a template (the node kinds stay distinct for editor
+    /// clarity and future per-type precision controls).
+    FloatToString: struct {},
     /// `ListAppend` — command (flow-codegen#24). Appends the wired
     /// `value` data input to the named growable list. Lowers to
     /// `<name>.append(game.allocator, <value>) catch {};`.

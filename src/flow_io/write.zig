@@ -369,7 +369,19 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // `Select`'s `selector`/`case<N>`/`default` inputs are data edges,
         // and a `Switch`'s `selector` is a data edge while its
         // `case<N>`/`default` targets are exec edges.
-        .Branch, .ForRange, .While, .Select, .Switch => {},
+        // `Concat`/`IntToString`/`FloatToString` (flow-codegen#26) are
+        // payload-free string reporters: their value inputs (`arg<N>` for
+        // `Concat`, `value` for the to-string nodes) are all data edges, so
+        // they carry no on-node fields — same as `Branch`/`Select` above.
+        .Branch, .ForRange, .While, .Select, .Switch, .Concat, .IntToString, .FloatToString => {},
+        // `Format` (flow-codegen#26) carries only its inline `template`
+        // (printf-style `std.fmt` syntax); its typed `arg<N>` value inputs
+        // are data edges. Emit `template` like `Log`'s `label` so the
+        // round-trip stays byte-deterministic.
+        .Format => |b| {
+            try w.writeAll(", \"template\": ");
+            try writeJsonString(w, b.template);
+        },
         // `Log` (flow-codegen#20) carries only its inline `label`; the
         // `value` input is a data edge. Emit `label` like other node
         // payload fields so the round-trip stays byte-deterministic.

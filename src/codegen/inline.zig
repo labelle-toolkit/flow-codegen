@@ -124,6 +124,11 @@ fn deepInlineOperand(
 pub fn isInlinableKind(k: flow_io.NodeKind) bool {
     return switch (k) {
         .GetVariable, .Literal, .Identifier, .HasValueVariable, .BinOp, .Compare, .Logic => true,
+        // String reporters (`Format`/`Concat`/`IntToString`/`FloatToString`,
+        // flow-codegen#26) are intentionally absent from this set: they
+        // ALLOCATE via `game.allocator`, so they must bind to an
+        // `n<id>_value` local exactly once (like `Call`/`GetComponent`) —
+        // inlining them per consumer would reallocate / leak on every read.
         else => false,
     };
 }

@@ -27,3 +27,34 @@ pub fn expectParsesZig(allocator: std.mem.Allocator, src: []const u8) !void {
     if (ast.errors.len != 0) std.debug.print("emitted Zig didn't parse:\n{s}\n", .{src});
     try expect.equal(ast.errors.len, @as(usize, 0));
 }
+
+/// Assert `src` is valid Zig through AstGen — the SEMANTIC-lowering pass
+/// that `zig ast-check` runs, NOT merely `Ast.parse` (flow-codegen#26).
+/// This is the strongest in-process "generated code compiles" check: it
+/// catches AstGen-level errors that `expectParsesZig` silently lets
+/// through — most importantly the unused/never-mutated-local lint that a
+/// mis-emitted reporter binding would trip. AstGen does NOT run Sema, so
+/// undeclared cross-decl identifiers (the generated `game`/`game_mod`/
+/// `Game` surface, which resolve against the host game module) are
+/// tolerated — exactly the right scope for checking a generated fragment
+/// in isolation.
+pub fn expectAstGenOk(allocator: std.mem.Allocator, src: []const u8) !void {
+    const z = try allocator.allocSentinel(u8, src.len, 0);
+    defer allocator.free(z);
+    @memcpy(z[0..src.len], src);
+
+    var ast = try std.zig.Ast.parse(allocator, z, .zig);
+    defer ast.deinit(allocator);
+    if (ast.errors.len != 0) {
+        std.debug.print("emitted Zig didn't parse:\n{s}\n", .{src});
+        try expect.equal(ast.errors.len, @as(usize, 0));
+        return;
+    }
+
+    var zir = try std.zig.AstGen.generate(allocator, ast);
+    defer zir.deinit(allocator);
+    if (zir.hasCompileErrors()) {
+        std.debug.print("emitted Zig failed AstGen (ast-check):\n{s}\n", .{src});
+    }
+    try expect.toBeFalse(zir.hasCompileErrors());
+}

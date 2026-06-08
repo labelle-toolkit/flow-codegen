@@ -179,6 +179,15 @@ pub fn validate(flow: Flow) ParseError!void {
             .MapClear => |b| try requireCollectionKind(flow.collections, b.collection, .map),
             .MapLength => |b| try requireCollectionKind(flow.collections, b.collection, .map),
             .MapForEach => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            // String reporters (flow-codegen#26) carry no name-based
+            // payload to resolve against a registry, so there is no
+            // structural check here (mirrors `Call`/`Select`, which also
+            // validate purely through their data edges). An empty `Format`
+            // `template` is explicitly VALID — it is the default and lowers
+            // to an argument-free `allocPrint("", .{...})`; the `arg<N>` /
+            // `value` inputs are checked at codegen by `resolveInput`
+            // (`DanglingPin` for a missing required input).
+            .Format, .Concat, .IntToString, .FloatToString => {},
             else => {},
         }
     }
