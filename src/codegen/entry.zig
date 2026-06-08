@@ -132,16 +132,20 @@ pub fn renderFlowFile(
         try w.writeAll("\n");
     }
 
-    // File-scope growable LIST collections (flow-codegen#24). One
-    // `pub var <name>: std.ArrayList(<element>) = .empty;` per declared
-    // entry — game-allocator-backed, game-lifetime. `.empty` is the
+    // File-scope growable collections (flow-codegen#24). One `pub var`
+    // per declared entry — game-allocator-backed, game-lifetime. A LIST
+    // is `std.ArrayList(<element>)`; a MAP is
+    // `std.AutoHashMapUnmanaged(<key>, <value>)`. `.empty` is the
     // zero-init (no allocator needed); ops allocate on demand through
-    // `game.allocator`. There is NO auto-deinit in v1: lists live for the
-    // game's lifetime and are reclaimed by the OS at exit (proper
-    // deinit-on-teardown is a follow-up). MAPS are deferred.
+    // `game.allocator`. There is NO auto-deinit in v1: collections live
+    // for the game's lifetime and are reclaimed by the OS at exit (proper
+    // deinit-on-teardown is a follow-up).
     if (entry.collections.len != 0) {
         for (entry.collections) |c| {
-            try w.print("pub var {s}: std.ArrayList({s}) = .empty;\n", .{ c.name, c.element });
+            switch (c.kind) {
+                .list => try w.print("pub var {s}: std.ArrayList({s}) = .empty;\n", .{ c.name, c.element }),
+                .map => try w.print("pub var {s}: std.AutoHashMapUnmanaged({s}, {s}) = .empty;\n", .{ c.name, c.key, c.value }),
+            }
         }
         try w.writeAll("\n");
     }

@@ -91,8 +91,21 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
         for (flow.collections, 0..) |c, i| {
             try w.writeAll("    { \"name\": ");
             try writeJsonString(w, c.name);
-            try w.writeAll(", \"element\": ");
-            try writeJsonString(w, c.element);
+            // Lists round-trip exactly as before (no `kind` key emitted —
+            // it defaults to `.list` on re-parse). Maps emit `kind` + the
+            // `key`/`value` type fields (flow-codegen#24).
+            switch (c.kind) {
+                .list => {
+                    try w.writeAll(", \"element\": ");
+                    try writeJsonString(w, c.element);
+                },
+                .map => {
+                    try w.writeAll(", \"kind\": \"map\", \"key\": ");
+                    try writeJsonString(w, c.key);
+                    try w.writeAll(", \"value\": ");
+                    try writeJsonString(w, c.value);
+                },
+            }
             try w.writeAll(" }");
             if (i + 1 < flow.collections.len) try w.writeAll(",");
             try w.writeAll("\n");
@@ -367,6 +380,9 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // List operation nodes (flow-codegen#24) carry only the list
         // `collection` name; their data inputs (`value`/`index`) and the
         // `ForEach` `body`/`item`/`index` pins are edges, not payload.
+        // Map operation nodes (flow-codegen#24, MAPS) likewise carry only
+        // the map `collection` name; their data inputs and the
+        // `MapForEach` `body`/`key`/`value` pins are edges, not payload.
         .ListAppend,
         .ListLength,
         .ListGet,
@@ -374,6 +390,13 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         .ListContains,
         .ListClear,
         .ForEach,
+        .MapSet,
+        .MapGet,
+        .MapHas,
+        .MapRemove,
+        .MapClear,
+        .MapLength,
+        .MapForEach,
         => {
             const collection = switch (k) {
                 .ListAppend => |b| b.collection,
@@ -383,6 +406,13 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
                 .ListContains => |b| b.collection,
                 .ListClear => |b| b.collection,
                 .ForEach => |b| b.collection,
+                .MapSet => |b| b.collection,
+                .MapGet => |b| b.collection,
+                .MapHas => |b| b.collection,
+                .MapRemove => |b| b.collection,
+                .MapClear => |b| b.collection,
+                .MapLength => |b| b.collection,
+                .MapForEach => |b| b.collection,
                 else => unreachable,
             };
             try w.writeAll(", \"collection\": ");

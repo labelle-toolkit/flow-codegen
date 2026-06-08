@@ -442,6 +442,64 @@ pub fn writeNodeBody(
         // `for` header + recursively emits the body scope (see
         // `emitForEach`). Unreachable in a well-formed walk.
         .ForEach => unreachable,
+
+        // Map operations (flow-codegen#24, MAPS). Each references its
+        // `std.AutoHashMapUnmanaged` by `collection` name. Commands
+        // allocate on demand through `game.allocator` (always in scope).
+        //
+        // `MapSet` — `put(game.allocator, key, value)`; `catch {}` swallows
+        // OOM so the lowering is a statement (v1: best-effort).
+        .MapSet => |b| {
+            const key_expr = (try ctx.resolveInput(scratch, node, "key")) orelse return error.DanglingPin;
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    {s}.put(game.allocator, {s}, {s}) catch {{}};\n",
+                .{ b.collection, key_expr, value_expr },
+            );
+        },
+        // `MapGet` — reporter binding `get(key) orelse <default>`. The
+        // `default` input defaults to `0` when unwired (mirrors `ListGet`);
+        // author wires a real default for non-numeric value types.
+        .MapGet => |b| {
+            const key_expr = (try ctx.resolveInput(scratch, node, "key")) orelse return error.DanglingPin;
+            const default_expr = (try ctx.resolveInput(scratch, node, "default")) orelse try scratch.dupe(u8, "0");
+            try w.print(
+                "    const n{d}_value = {s}.get({s}) orelse {s};\n",
+                .{ node.id, b.collection, key_expr, default_expr },
+            );
+        },
+        // `MapHas` — reporter binding a `bool` membership test.
+        .MapHas => |b| {
+            const key_expr = (try ctx.resolveInput(scratch, node, "key")) orelse return error.DanglingPin;
+            try w.print(
+                "    const n{d}_value = {s}.contains({s});\n",
+                .{ node.id, b.collection, key_expr },
+            );
+        },
+        // `MapRemove` — command removing the wired `key`; the `bool`
+        // result is discarded.
+        .MapRemove => |b| {
+            const key_expr = (try ctx.resolveInput(scratch, node, "key")) orelse return error.DanglingPin;
+            try w.print(
+                "    _ = {s}.remove({s});\n",
+                .{ b.collection, key_expr },
+            );
+        },
+        // `MapClear` — command emptying the map, keeping capacity.
+        .MapClear => |b| try w.print(
+            "    {s}.clearRetainingCapacity();\n",
+            .{b.collection},
+        ),
+        // `MapLength` — reporter binding the entry count (`usize`).
+        .MapLength => |b| try w.print(
+            "    const n{d}_value = {s}.count();\n",
+            .{ node.id, b.collection },
+        ),
+        // `MapForEach` (flow-codegen#24, MAPS) is a control-flow loop node
+        // — like `ForEach`, `emitScope` intercepts it and emits the
+        // iterator `while` header + recursively emits the body scope (see
+        // `emitMapForEach`). Unreachable in a well-formed walk.
+        .MapForEach => unreachable,
         // `Branch` (flow-codegen#8) is never emitted through this flat
         // path — `emitScope` intercepts a `Branch` node and expands it
         // to an `if`/`else` wrapper (see `emitBranch`), recursing into

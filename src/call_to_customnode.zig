@@ -287,7 +287,10 @@ pub fn convertFlow(
     for (flow.collections, 0..) |c, i| {
         new_collections[i] = .{
             .name = try a.dupe(u8, c.name),
+            .kind = c.kind,
             .element = try a.dupe(u8, c.element),
+            .key = try a.dupe(u8, c.key),
+            .value = try a.dupe(u8, c.value),
         };
     }
 
@@ -376,6 +379,15 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .ListContains => |b| .{ .ListContains = .{ .collection = try a.dupe(u8, b.collection) } },
         .ListClear => |b| .{ .ListClear = .{ .collection = try a.dupe(u8, b.collection) } },
         .ForEach => |b| .{ .ForEach = .{ .collection = try a.dupe(u8, b.collection) } },
+        // Map operation nodes (flow-codegen#24, MAPS) carry only a
+        // `collection` name — dupe it like the list ops.
+        .MapSet => |b| .{ .MapSet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapGet => |b| .{ .MapGet = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapHas => |b| .{ .MapHas = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapRemove => |b| .{ .MapRemove = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapClear => |b| .{ .MapClear = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapLength => |b| .{ .MapLength = .{ .collection = try a.dupe(u8, b.collection) } },
+        .MapForEach => |b| .{ .MapForEach = .{ .collection = try a.dupe(u8, b.collection) } },
     };
     return .{ .id = n.id, .pos = n.pos, .kind = kind };
 }

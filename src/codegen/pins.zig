@@ -39,6 +39,11 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // (`ListAppend`/`ListSet`/`ListClear`) and the `ForEach` loop
         // node bind no value (empty-pin arm below).
         .ListLength, .ListGet, .ListContains => "value",
+        // Map reporters (flow-codegen#24, MAPS) — `MapGet`/`MapHas`/
+        // `MapLength` bind an `n<id>_value`. The command map ops
+        // (`MapSet`/`MapRemove`/`MapClear`) and the `MapForEach` loop node
+        // bind no value (empty-pin arm below).
+        .MapGet, .MapHas, .MapLength => "value",
         // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
         // §1 + §5). When the impl returns a value, the binding name is
         // `n<id>_value` (matching the reporter naming convention shared
@@ -81,8 +86,9 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // `ListAppend`/`ListSet`/`ListClear` are command list ops, and
         // `ForEach` is a control-flow loop node (expanded by the scope
         // walker, like `ForRange`) — none bind a data value
-        // (flow-codegen#24).
-        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach => "",
+        // (flow-codegen#24). Likewise `MapSet`/`MapRemove`/`MapClear` are
+        // command map ops and `MapForEach` is a control-flow loop node.
+        .SetField, .Output, .Emit, .Event, .SetVariable, .ChangeVariable, .ClearVariable, .Branch, .ForRange, .While, .Switch, .Log, .ListAppend, .ListSet, .ListClear, .ForEach, .MapSet, .MapRemove, .MapClear, .MapForEach => "",
     };
 }
 
@@ -174,6 +180,16 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         .ListGet => std.mem.eql(u8, pin, "index"),
         .ListSet => std.mem.eql(u8, pin, "index") or std.mem.eql(u8, pin, "value"),
         .ListLength, .ListClear, .ForEach => false,
+        // Map operation data inputs (flow-codegen#24, MAPS). The map itself
+        // is referenced by `collection` name, not a pin.
+        //   MapSet → `key`, `value`; MapGet → `key`, `default`;
+        //   MapHas/MapRemove → `key`.
+        // MapClear/MapLength take no data input; MapForEach takes none (its
+        // `body` is an exec output and `key`/`value` are data outputs).
+        .MapSet => std.mem.eql(u8, pin, "key") or std.mem.eql(u8, pin, "value"),
+        .MapGet => std.mem.eql(u8, pin, "key") or std.mem.eql(u8, pin, "default"),
+        .MapHas, .MapRemove => std.mem.eql(u8, pin, "key"),
+        .MapClear, .MapLength, .MapForEach => false,
     };
 }
 

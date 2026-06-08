@@ -1640,4 +1640,419 @@ pub const CoercionTests = struct {
         // No `collections` block emitted when none declared.
         try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"collections\"") == null);
     }
+
+    // =====================================================================
+    // Collections — MAP ops + MapForEach (flow-codegen#24, MAPS)
+    // =====================================================================
+
+    test "map collections block emits a module-level std.AutoHashMapUnmanaged pub var" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_decl",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_decl" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "pub var scores: std.AutoHashMapUnmanaged(u32, i32) = .empty;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapSet lowers to put(game.allocator, key, value) catch {}" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_set",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 3, "type": "MapSet", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "key" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_set" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "scores.put(game.allocator, n1_value, n2_value) catch {};") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapGet lowers to get(key) orelse default" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_get",
+            \\  "variables": [ { "name": "v", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": -1, "pos": [0, 0] },
+            \\    { "id": 3, "type": "MapGet", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 4, "type": "SetVariable", "name": "v", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "key" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "default" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_get" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = scores.get(n1_value) orelse n2_value;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapGet default defaults to 0 when the default input is unwired" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_get_nodef",
+            \\  "variables": [ { "name": "v", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 2, "type": "MapGet", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "v", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "key" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_get_nodef" });
+        defer allocator.free(out);
+
+        // Unwired `default` mirrors ListGet's convention → bare `0`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value = scores.get(n1_value) orelse 0;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapHas lowers to contains(key) binding a bool" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_has",
+            \\  "variables": [ { "name": "h", "type": "bool", "default": false } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 2, "type": "MapHas", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "h", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "key" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_has" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value = scores.contains(n1_value);") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapRemove lowers to _ = remove(key)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_remove",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
+            \\    { "id": 2, "type": "MapRemove", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "key" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_remove" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = scores.remove(n1_value);") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapLength lowers to count() and MapClear to clearRetainingCapacity" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_len_clear",
+            \\  "variables": [ { "name": "n", "type": "usize", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapLength", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "n", "pos": [0, 0] },
+            \\    { "id": 3, "type": "MapClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "map_len_clear" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = scores.count();") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "scores.clearRetainingCapacity();") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapForEach lowers to an iterator while-loop with key/value captures and nested body" {
+        const allocator = std.testing.allocator;
+        // Body reads BOTH `key` and `value` → entry is captured + read.
+        const src =
+            \\{
+            \\  "name": "mapforeach_basic",
+            \\  "variables": [
+            \\    { "name": "ksum", "type": "u32", "default": 0 },
+            \\    { "name": "vsum", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "ksum", "pos": [0, 0] },
+            \\    { "id": 3, "type": "SetVariable", "name": "vsum", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "key" }, "to": { "node": 2, "pin": "value" } },
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } },
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "mapforeach_basic" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "var it_1 = scores.iterator();") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (it_1.next()) |entry_1| {") != null);
+        // Body nodes read the entry's key_ptr/value_ptr, NOT n<id>_ bindings.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "ksum = entry_1.key_ptr.*;") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "vsum = entry_1.value_ptr.*;") != null);
+        // Body nested one level under the entry fn → 8-space indent.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "        ksum = entry_1.key_ptr.*;") != null);
+        // The entry is read, so no `_ = entry_1;` suppressor.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = entry_1;") == null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapForEach with a body that reads neither capture suppresses the unused entry" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "mapforeach_neither",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "MapClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "mapforeach_neither" });
+        defer allocator.free(out);
+
+        // The entry is captured (always) but unread → suppressed.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (it_1.next()) |entry_1| {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = entry_1;") != null);
+
+        try expectParses(allocator, out);
+    }
+
+    test "MapForEach key consumed outside the body scope is rejected" {
+        // A top-level SetVariable reads MapForEach.key but is NOT wired to
+        // the loop's `body` exec edge → out-of-scope read.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "mapforeach_oos",
+            \\  "variables": [ { "name": "out", "type": "u32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "key" }, "to": { "node": 2, "pin": "value" } }
+            \\  ],
+            \\  "exec_edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try std.testing.expectError(
+            error.MalformedFlow,
+            flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "mapforeach_oos" }),
+        );
+    }
+
+    test "a map collection name colliding with a variable is rejected" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_clash_var",
+            \\  "variables": [ { "name": "scores", "type": "i32", "default": 0 } ],
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.DuplicateVariableName, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a map missing key is rejected (MalformedCollection)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_no_key",
+            \\  "collections": [ { "name": "scores", "kind": "map", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedCollection, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a map missing value is rejected (MalformedCollection)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_no_value",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedCollection, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a list missing element is rejected (MalformedCollection)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_no_element",
+            \\  "collections": [ { "name": "xs" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedCollection, flow_io.parseFlow(allocator, src));
+    }
+
+    test "round-trips a map collection + map nodes through renderFlowJsonc" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "map_roundtrip",
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
+            \\    { "id": 2, "type": "MapClear", "collection": "scores", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        // The map `collections` entry carries kind/key/value; the node
+        // carries `collection`.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"name\": \"scores\", \"kind\": \"map\", \"key\": \"u32\", \"value\": \"i32\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"type\": \"MapForEach\", \"collection\": \"scores\"") != null);
+
+        // Re-parse → re-render is byte-stable.
+        var l2 = try flow_io.parseFlow(allocator, rendered);
+        defer l2.deinit();
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, l2);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "a list collection round-trip stays byte-identical (kind defaults to list)" {
+        // Back-compat: a pre-MAPS list file omits `kind`; the writer must
+        // NOT start emitting a `kind` key for lists.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "list_backcompat",
+            \\  "collections": [ { "name": "xs", "element": "u32" } ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [],
+            \\  "edges": []
+            \\}
+        ;
+        var l1 = try flow_io.parseFlow(allocator, src);
+        defer l1.deinit();
+        const rendered = try flow_io.renderFlowJsonc(allocator, l1);
+        defer allocator.free(rendered);
+
+        // List entry emits exactly `name` + `element`, no `kind`.
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"name\": \"xs\", \"element\": \"u32\"") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"kind\"") == null);
+    }
 };

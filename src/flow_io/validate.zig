@@ -56,6 +56,13 @@ pub fn validate(flow: Flow) ParseError!void {
         }
         if (hasVariable(flow.variables, c.name)) return error.DuplicateVariableName;
         if (hasVariable(flow.locals, c.name)) return error.DuplicateVariableName;
+        // Per-shape required type fields (flow-codegen#24): a `.list`
+        // needs `element`; a `.map` needs both `key` and `value`. Empty
+        // strings (absent on disk) are malformed.
+        switch (c.kind) {
+            .list => if (c.element.len == 0) return error.MalformedCollection,
+            .map => if (c.key.len == 0 or c.value.len == 0) return error.MalformedCollection,
+        }
     }
 
     // Every edge endpoint resolves to a real node.
@@ -77,9 +84,9 @@ pub fn validate(flow: Flow) ParseError!void {
         const ok = switch (src.kind) {
             .Branch => std.mem.eql(u8, x.from.pin, "then") or
                 std.mem.eql(u8, x.from.pin, "else"),
-            // `ForRange`/`While`/`ForEach` (flow-codegen#21, #24) route
-            // their single `body` exec output.
-            .ForRange, .While, .ForEach => std.mem.eql(u8, x.from.pin, "body"),
+            // `ForRange`/`While`/`ForEach`/`MapForEach` (flow-codegen#21,
+            // #24) route their single `body` exec output.
+            .ForRange, .While, .ForEach, .MapForEach => std.mem.eql(u8, x.from.pin, "body"),
             // A `Switch` routes through its `default` exec output or any
             // `case<N>` exec output (flow-codegen#22) — the N-way analogue
             // of a `Branch`'s `then`/`else`.
@@ -174,6 +181,29 @@ pub fn validate(flow: Flow) ParseError!void {
                 if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
             },
             .ForEach => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            // Map operation nodes (flow-codegen#24, MAPS) resolve the same
+            // way — an unknown map is `UnknownCollection`.
+            .MapSet => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapGet => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapHas => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapRemove => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapClear => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapLength => |b| {
+                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
+            },
+            .MapForEach => |b| {
                 if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
             },
             else => {},
