@@ -205,6 +205,75 @@ pub const StringNodeTests = struct {
         try expectAstGenOk(allocator, out);
     }
 
+    test "Concat with one arg lowers to a single dupe (not concat)" {
+        // Arity 1 skips `std.mem.concat`'s measure+alloc+copy for a plain
+        // `game.allocator.dupe`, keeping the game-allocated/author-owned
+        // lifetime the multi-arg path produces (gemini, #46).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "concat_one",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": "\"a\"", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Concat", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Output", "name": "out", "value_type": "[]const u8", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "concat_one" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "const n2_value: []const u8 = game.allocator.dupe(u8, n1_value) catch \"\";",
+        ) != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "std.mem.concat") == null);
+
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "Concat with no args lowers to the empty string (no concat / no &.{})" {
+        // Arity 0 binds `""` outright — `std.mem.concat(.., &.{})` would also
+        // demand an element-type annotation on the empty literal (gemini, #46).
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "concat_zero",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Concat", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "out", "value_type": "[]const u8", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "concat_zero" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(
+            u8,
+            out,
+            "const n1_value: []const u8 = \"\";",
+        ) != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "std.mem.concat") == null);
+
+        try expectAstGenOk(allocator, out);
+    }
+
     test "Concat round-trips through write (payload-free)" {
         const allocator = std.testing.allocator;
         const src =

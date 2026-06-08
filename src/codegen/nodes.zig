@@ -620,20 +620,36 @@ pub fn writeNodeBody(
         // pin at the generated call site (mirrors `Call`).
         .Concat => {
             const arity = countCallArgs(ctx.flow, node.id);
-            try w.print(
-                "    const n{d}_value: []const u8 = std.mem.concat(game.allocator, u8, &.{{",
-                .{node.id},
-            );
-            var i: usize = 0;
-            while (i < arity) : (i += 1) {
-                if (i > 0) try w.writeAll(", ");
-                var buf: [16]u8 = undefined;
-                const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
-                const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+            // Degenerate arities skip `std.mem.concat` (gemini): arity 0 is
+            // the empty string outright — `&.{}` would also force an
+            // element-type annotation; arity 1 is a single `dupe` (one copy
+            // vs concat's measure+alloc+copy), preserving the game-allocated,
+            // author-owned lifetime the multi-arg path produces.
+            if (arity == 0) {
+                try w.print("    const n{d}_value: []const u8 = \"\";\n", .{node.id});
+            } else if (arity == 1) {
+                const expr = (try ctx.resolveInput(scratch, node, "arg0")) orelse
                     try scratch.dupe(u8, "undefined");
-                try w.writeAll(expr);
+                try w.print(
+                    "    const n{d}_value: []const u8 = game.allocator.dupe(u8, {s}) catch \"\";\n",
+                    .{ node.id, expr },
+                );
+            } else {
+                try w.print(
+                    "    const n{d}_value: []const u8 = std.mem.concat(game.allocator, u8, &.{{",
+                    .{node.id},
+                );
+                var i: usize = 0;
+                while (i < arity) : (i += 1) {
+                    if (i > 0) try w.writeAll(", ");
+                    var buf: [16]u8 = undefined;
+                    const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
+                    const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                        try scratch.dupe(u8, "undefined");
+                    try w.writeAll(expr);
+                }
+                try w.writeAll("}) catch \"\";\n");
             }
-            try w.writeAll("}) catch \"\";\n");
         },
         // `IntToString` / `FloatToString` — render the single `value` data
         // input as decimal text. Zig's `{d}` formats both ints and floats,
