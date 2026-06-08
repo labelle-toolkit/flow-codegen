@@ -44,6 +44,12 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // (`MapSet`/`MapRemove`/`MapClear`) and the `MapForEach` loop node
         // bind no value (empty-pin arm below).
         .MapGet, .MapHas, .MapLength => "value",
+        // String reporters (flow-codegen#26) — `Format`/`Concat`/
+        // `IntToString`/`FloatToString` each bind a `[]const u8` to an
+        // `n<id>_value` (the same `value` naming as the other reporters).
+        // They are bound-once (NOT inlined) because they allocate — see
+        // `inline.zig`'s `isInlinableKind`.
+        .Format, .Concat, .IntToString, .FloatToString => "value",
         // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
         // §1 + §5). When the impl returns a value, the binding name is
         // `n<id>_value` (matching the reporter naming convention shared
@@ -190,6 +196,12 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         .MapGet => std.mem.eql(u8, pin, "key") or std.mem.eql(u8, pin, "default"),
         .MapHas, .MapRemove => std.mem.eql(u8, pin, "key"),
         .MapClear, .MapLength, .MapForEach => false,
+        // String reporters (flow-codegen#26). `Format`/`Concat` take
+        // positional `arg<N>` value inputs (the same convention as
+        // `Call`); `IntToString`/`FloatToString` take a single `value`
+        // input (the number to render).
+        .Format, .Concat => isCallArgPin(pin),
+        .IntToString, .FloatToString => std.mem.eql(u8, pin, "value"),
     };
 }
 

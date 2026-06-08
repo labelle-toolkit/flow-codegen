@@ -466,6 +466,29 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
             else
                 "",
         } };
+    } else if (std.mem.eql(u8, type_name, "Format")) {
+        // String-formatting reporter (flow-codegen#26). The printf-style
+        // `template` is the only inline field; the typed `arg<N>` value
+        // pins are data edges. Absent `template` defaults to `""` (a valid,
+        // argument-free template) — mirrors `Log`'s `label` default.
+        return .{ .Format = .{
+            .template = if (o.get("template")) |tv|
+                (if (tv == .string) try a.dupe(u8, tv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "Concat")) {
+        // String-join reporter (flow-codegen#26). No per-kind payload —
+        // its `arg<N>` string inputs are all data edges.
+        return .{ .Concat = .{} };
+    } else if (std.mem.eql(u8, type_name, "IntToString")) {
+        // Integer-stringify reporter (flow-codegen#26). No per-kind
+        // payload — its single `value` integer input is a data edge.
+        return .{ .IntToString = .{} };
+    } else if (std.mem.eql(u8, type_name, "FloatToString")) {
+        // Float-stringify reporter (flow-codegen#26). No per-kind payload —
+        // its single `value` float input is a data edge.
+        return .{ .FloatToString = .{} };
     } else if (std.mem.eql(u8, type_name, "ListAppend")) {
         // List ops (flow-codegen#24) reference a list by `collection`
         // name; their data inputs (`value`/`index`) are edges.

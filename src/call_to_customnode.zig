@@ -370,6 +370,13 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // `Log` carries only its inline `label` (flow-codegen#20); the
         // `value` input is a data edge.
         .Log => |b| .{ .Log = .{ .label = try a.dupe(u8, b.label) } },
+        // String reporters (flow-codegen#26): `Format` carries only its
+        // inline `template` (dupe it like `Log`'s label); the others are
+        // payload-free (their value inputs are data edges).
+        .Format => |b| .{ .Format = .{ .template = try a.dupe(u8, b.template) } },
+        .Concat => .{ .Concat = .{} },
+        .IntToString => .{ .IntToString = .{} },
+        .FloatToString => .{ .FloatToString = .{} },
         // List operation nodes (flow-codegen#24) carry only the list
         // `collection` name — dupe it like other string payloads.
         .ListAppend => |b| .{ .ListAppend = .{ .collection = try a.dupe(u8, b.collection) } },

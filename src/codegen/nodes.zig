@@ -577,6 +577,93 @@ pub fn writeNodeBody(
                 );
             }
         },
+        // String reporters (flow-codegen#26). Each ALLOCATES via
+        // `game.allocator` (always in scope — `bodyImpl`/handlers all bind
+        // a `game`) and binds the `[]const u8` result to `n<id>_value`,
+        // exactly once (these kinds are deliberately NOT in `inline.zig`'s
+        // pure-inlinable set — re-inlining per consumer would reallocate /
+        // leak). The result is game-lifetime with NO auto-free: the flow
+        // author owns it, the same ownership contract as the growable
+        // collections (flow-codegen#24). On allocation failure we fall back
+        // to a safe empty string (`catch ""`), mirroring collections'
+        // `catch {}` swallow philosophy.
+        //
+        // `Format` — printf-style `template` (VERBATIM `std.fmt` syntax)
+        // rendered against ordered, typed `arg<N>` value pins (the `Call`
+        // arg convention via `countCallArgs`). The author-controlled
+        // `template` is escaped by `escapeZigStringBody` (Zig string-literal
+        // escaping — quotes/newlines/control bytes) but NOT brace-doubled:
+        // its `{d}`/`{s}`/`{}` placeholders are REAL `std.fmt` syntax here
+        // and must survive verbatim (unlike a `Log` label, whose braces are
+        // doubled by `escapeLogLabel` to print literally).
+        .Format => |b| {
+            const safe_template = try escapeZigStringBody(scratch, b.template);
+            const arity = countCallArgs(ctx.flow, node.id);
+            try w.print(
+                "    const n{d}_value: []const u8 = std.fmt.allocPrint(game.allocator, \"{s}\", .{{",
+                .{ node.id, safe_template },
+            );
+            var i: usize = 0;
+            while (i < arity) : (i += 1) {
+                if (i > 0) try w.writeAll(", ");
+                var buf: [16]u8 = undefined;
+                const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
+                const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                    try scratch.dupe(u8, "undefined");
+                try w.writeAll(expr);
+            }
+            try w.writeAll("}) catch \"\";\n");
+        },
+        // `Concat` — join N string `arg<N>` value pins (same `Call` arg
+        // convention) via `std.mem.concat`. An unwired arg slot resolves
+        // to `undefined` — Zig's type-checker flags a genuinely missing
+        // pin at the generated call site (mirrors `Call`).
+        .Concat => {
+            const arity = countCallArgs(ctx.flow, node.id);
+            // Degenerate arities skip `std.mem.concat` (gemini): arity 0 is
+            // the empty string outright — `&.{}` would also force an
+            // element-type annotation; arity 1 is a single `dupe` (one copy
+            // vs concat's measure+alloc+copy), preserving the game-allocated,
+            // author-owned lifetime the multi-arg path produces.
+            if (arity == 0) {
+                try w.print("    const n{d}_value: []const u8 = \"\";\n", .{node.id});
+            } else if (arity == 1) {
+                const expr = (try ctx.resolveInput(scratch, node, "arg0")) orelse
+                    try scratch.dupe(u8, "undefined");
+                try w.print(
+                    "    const n{d}_value: []const u8 = game.allocator.dupe(u8, {s}) catch \"\";\n",
+                    .{ node.id, expr },
+                );
+            } else {
+                try w.print(
+                    "    const n{d}_value: []const u8 = std.mem.concat(game.allocator, u8, &.{{",
+                    .{node.id},
+                );
+                var i: usize = 0;
+                while (i < arity) : (i += 1) {
+                    if (i > 0) try w.writeAll(", ");
+                    var buf: [16]u8 = undefined;
+                    const pin = std.fmt.bufPrint(&buf, "arg{d}", .{i}) catch unreachable;
+                    const expr = (try ctx.resolveInput(scratch, node, pin)) orelse
+                        try scratch.dupe(u8, "undefined");
+                    try w.writeAll(expr);
+                }
+                try w.writeAll("}) catch \"\";\n");
+            }
+        },
+        // `IntToString` / `FloatToString` — render the single `value` data
+        // input as decimal text. Zig's `{d}` formats both ints and floats,
+        // so the two kinds share one lowering; they stay distinct kinds for
+        // editor clarity and future per-type precision controls. A missing
+        // `value` input is a `DanglingPin` (a to-string with nothing to
+        // render is malformed).
+        .IntToString, .FloatToString => {
+            const value_expr = (try ctx.resolveInput(scratch, node, "value")) orelse return error.DanglingPin;
+            try w.print(
+                "    const n{d}_value: []const u8 = std.fmt.allocPrint(game.allocator, \"{{d}}\", .{{{s}}}) catch \"\";\n",
+                .{ node.id, value_expr },
+            );
+        },
     }
 }
 
@@ -597,7 +684,7 @@ pub fn writeNodeBody(
 ///     text — the caller appends its own single-brace `{any}` separately,
 ///     so the real placeholder is never doubled.
 pub fn escapeLogLabel(alloc: std.mem.Allocator, label: []const u8) ![]const u8 {
-    const lit_escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.zig.fmtString(label)});
+    const lit_escaped = try escapeZigStringBody(alloc, label);
     // Brace-doubling can at most double the length — preallocate for the
     // worst case so a label with braces needs no realloc.
     var out = try std.ArrayList(u8).initCapacity(alloc, lit_escaped.len * 2);
@@ -609,6 +696,21 @@ pub fn escapeLogLabel(alloc: std.mem.Allocator, label: []const u8) ![]const u8 {
         }
     }
     return out.items;
+}
+
+/// Zig string-literal-body escaping ONLY — quotes, backslashes,
+/// newlines, and other control bytes become `\"`, `\n`, `\xNN`, etc.
+/// (no surrounding quotes). This is step 1 of `escapeLogLabel`, factored
+/// out so the `Format` node (flow-codegen#26) can reuse it WITHOUT the
+/// brace-doubling step 2: a `Format` `template` is VERBATIM `std.fmt`
+/// syntax, so its `{d}`/`{s}`/`{}` placeholders must survive as REAL
+/// format placeholders (a `Log` label, by contrast, is literal text, so
+/// its braces are doubled to print literally). `fmtString` never emits a
+/// brace of its own (control bytes become `\xNN`), so every `{`/`}` in
+/// the output came verbatim from the template — exactly the placeholders
+/// the author wrote.
+pub fn escapeZigStringBody(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.zig.fmtString(s)});
 }
 
 /// Resolve the value supplied for `param` at a `Subflow` call site,

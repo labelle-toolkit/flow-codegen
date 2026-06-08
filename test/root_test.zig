@@ -38,6 +38,10 @@ pub const FlowVocabularyTests = @import("vocabulary_test.zig").FlowVocabularyTes
 pub const CustomNodeTests = @import("customnode_test.zig").CustomNodeTests;
 pub const CoercionTests = @import("coercion_test.zig").CoercionTests;
 
+/// String-formatting + value-helper reporter nodes (flow-codegen#26):
+/// `Format` / `Concat` / `IntToString` / `FloatToString`.
+pub const StringNodeTests = @import("string_nodes_test.zig").StringNodeTests;
+
 // =====================================================================
 // Codegen validation — flows that parse cleanly but would otherwise
 // emit Zig that fails to compile (PR #6 review follow-up)
