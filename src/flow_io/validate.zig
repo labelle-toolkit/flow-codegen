@@ -10,6 +10,7 @@ const Node = model.Node;
 const Param = model.Param;
 const Variable = model.Variable;
 const Collection = model.Collection;
+const CollectionKind = model.CollectionKind;
 const ParseError = model.ParseError;
 
 pub fn validate(flow: Flow) ParseError!void {
@@ -56,6 +57,13 @@ pub fn validate(flow: Flow) ParseError!void {
         }
         if (hasVariable(flow.variables, c.name)) return error.DuplicateVariableName;
         if (hasVariable(flow.locals, c.name)) return error.DuplicateVariableName;
+        // Per-shape required type fields (flow-codegen#24): a `.list`
+        // needs `element`; a `.map` needs both `key` and `value`. Empty
+        // strings (absent on disk) are malformed.
+        switch (c.kind) {
+            .list => if (c.element.len == 0) return error.MalformedCollection,
+            .map => if (c.key.len == 0 or c.value.len == 0) return error.MalformedCollection,
+        }
     }
 
     // Every edge endpoint resolves to a real node.
@@ -77,9 +85,9 @@ pub fn validate(flow: Flow) ParseError!void {
         const ok = switch (src.kind) {
             .Branch => std.mem.eql(u8, x.from.pin, "then") or
                 std.mem.eql(u8, x.from.pin, "else"),
-            // `ForRange`/`While`/`ForEach` (flow-codegen#21, #24) route
-            // their single `body` exec output.
-            .ForRange, .While, .ForEach => std.mem.eql(u8, x.from.pin, "body"),
+            // `ForRange`/`While`/`ForEach`/`MapForEach` (flow-codegen#21,
+            // #24) route their single `body` exec output.
+            .ForRange, .While, .ForEach, .MapForEach => std.mem.eql(u8, x.from.pin, "body"),
             // A `Switch` routes through its `default` exec output or any
             // `case<N>` exec output (flow-codegen#22) — the N-way analogue
             // of a `Branch`'s `then`/`else`.
@@ -153,29 +161,24 @@ pub fn validate(flow: Flow) ParseError!void {
                 if (v.type.len == 0 or v.type[0] != '?') return error.MalformedFlow;
             },
             // List operation nodes (flow-codegen#24) resolve their
-            // `collection` field by name against the top-level
-            // `collections` block; an unknown list is `UnknownCollection`.
-            .ListAppend => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListLength => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListGet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListSet => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListContains => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ListClear => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
-            .ForEach => |b| {
-                if (!hasCollection(flow.collections, b.collection)) return error.UnknownCollection;
-            },
+            // `collection` field by name AND require it to be a LIST — a
+            // list op on a `.map` would lower to the wrong API (bugbot).
+            .ListAppend => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListLength => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListGet => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListSet => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListContains => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ListClear => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            .ForEach => |b| try requireCollectionKind(flow.collections, b.collection, .list),
+            // Map operation nodes (flow-codegen#24, MAPS) — require a
+            // MAP-kind collection (a map op on a `.list` is wrong; bugbot).
+            .MapSet => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapGet => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapHas => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapRemove => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapClear => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapLength => |b| try requireCollectionKind(flow.collections, b.collection, .map),
+            .MapForEach => |b| try requireCollectionKind(flow.collections, b.collection, .map),
             else => {},
         }
     }
@@ -197,6 +200,19 @@ pub fn findVariable(variables: []const Variable, name: []const u8) ?Variable {
 pub fn hasCollection(collections: []const Collection, name: []const u8) bool {
     for (collections) |c| if (std.mem.eql(u8, c.name, name)) return true;
     return false;
+}
+
+pub fn findCollection(collections: []const Collection, name: []const u8) ?Collection {
+    for (collections) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    return null;
+}
+
+/// A collection-op node must name a collection of the matching kind:
+/// unknown name → `UnknownCollection`; right name, wrong kind (a list op
+/// on a map or vice versa) → `MalformedCollection` (flow-codegen#24).
+fn requireCollectionKind(collections: []const Collection, name: []const u8, kind: CollectionKind) ParseError!void {
+    const c = findCollection(collections, name) orelse return error.UnknownCollection;
+    if (c.kind != kind) return error.MalformedCollection;
 }
 
 pub fn hasNode(nodes: []const Node, id: u32) bool {

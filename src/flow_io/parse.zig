@@ -193,8 +193,14 @@ pub fn buildVariables(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Variable 
 }
 
 /// Parse the optional `collections` array (flow-codegen#24). Absent →
-/// empty slice (every pre-collections file). Each entry is `{ "name":
-/// "<ident>", "element": "<zig type text>" }`.
+/// empty slice (every pre-collections file). A LIST entry is `{ "name":
+/// "<ident>", "element": "<zig type text>" }` (the `kind` field is
+/// optional and defaults to `"list"`, so pre-MAPS files parse unchanged).
+/// A MAP entry is `{ "name": "<ident>", "kind": "map", "key": "<type>",
+/// "value": "<type>" }`. The shape-specific fields (`element` vs
+/// `key`/`value`) are validated in `flow_io.validate`
+/// (`MalformedCollection`); here we only require `name` and a recognised
+/// `kind`.
 pub fn buildCollections(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Collection {
     const v = maybe orelse return &.{};
     if (v != .array) return error.MalformedFlow;
@@ -204,11 +210,39 @@ pub fn buildCollections(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Collect
         if (it != .object) return error.MalformedFlow;
         const o = it.object;
         const cname = o.get("name") orelse return error.MalformedFlow;
-        const celement = o.get("element") orelse return error.MalformedFlow;
-        if (cname != .string or celement != .string) return error.MalformedFlow;
+        if (cname != .string) return error.MalformedFlow;
+
+        // `kind` is optional; absent → `.list` (back-compat). Unknown
+        // discriminator strings are `MalformedFlow`.
+        const kind: model.CollectionKind = if (o.get("kind")) |k| blk: {
+            if (k != .string) return error.MalformedFlow;
+            if (std.mem.eql(u8, k.string, "list")) break :blk .list;
+            if (std.mem.eql(u8, k.string, "map")) break :blk .map;
+            return error.MalformedFlow;
+        } else .list;
+
+        // Optional per-shape type fields — duped when present, empty
+        // otherwise. The presence rules (list needs `element`; map needs
+        // `key`+`value`) are enforced in `validate`.
+        const element = if (o.get("element")) |e| blk: {
+            if (e != .string) return error.MalformedFlow;
+            break :blk try a.dupe(u8, e.string);
+        } else "";
+        const key = if (o.get("key")) |kk| blk: {
+            if (kk != .string) return error.MalformedFlow;
+            break :blk try a.dupe(u8, kk.string);
+        } else "";
+        const value = if (o.get("value")) |vv| blk: {
+            if (vv != .string) return error.MalformedFlow;
+            break :blk try a.dupe(u8, vv.string);
+        } else "";
+
         out[i] = .{
             .name = try a.dupe(u8, cname.string),
-            .element = try a.dupe(u8, celement.string),
+            .kind = kind,
+            .element = element,
+            .key = key,
+            .value = value,
         };
     }
     return out;
@@ -451,6 +485,23 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
         // `item`/`index` are data outputs; only the list `collection`
         // name lives on the node.
         return .{ .ForEach = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapSet")) {
+        // Map ops (flow-codegen#24, MAPS) reference a map by `collection`
+        // name; their data inputs (`key`/`value`/`default`) and the
+        // `MapForEach` `body`/`key`/`value` pins are edges, not payload.
+        return .{ .MapSet = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapGet")) {
+        return .{ .MapGet = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapHas")) {
+        return .{ .MapHas = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapRemove")) {
+        return .{ .MapRemove = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapClear")) {
+        return .{ .MapClear = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapLength")) {
+        return .{ .MapLength = .{ .collection = try reqStr(a, o, "collection") } };
+    } else if (std.mem.eql(u8, type_name, "MapForEach")) {
+        return .{ .MapForEach = .{ .collection = try reqStr(a, o, "collection") } };
     }
     return error.UnknownNodeType;
 }

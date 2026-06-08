@@ -97,6 +97,31 @@ pub const CallToCustomNodeTests = struct {
         try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.collections[0].element, "u32"));
     }
 
+    test "convertFlow carries a map collection's kind/key/value through (flow-codegen#24)" {
+        const allocator = std.testing.allocator;
+        const input =
+            \\{
+            \\  "name": "f",
+            \\  "event": { "type": "OnCall" },
+            \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
+            \\  "nodes": [ { "id": 1, "type": "MapClear", "collection": "scores", "pos": [0, 0] } ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, input);
+        defer loaded.deinit();
+        var catalog = try call_to_customnode.parseCatalog(allocator, simple_catalog);
+        defer catalog.deinit();
+        var result = try call_to_customnode.convertFlow(allocator, loaded.flow, catalog);
+        defer result.deinit();
+        // The map shape (kind + key/value) survives the deep copy; a
+        // missing field would silently drop to the `.list`/empty defaults.
+        try expect.toBeTrue(result.loaded.flow.collections.len == 1);
+        try expect.toBeTrue(result.loaded.flow.collections[0].kind == .map);
+        try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.collections[0].key, "u32"));
+        try expect.toBeTrue(std.mem.eql(u8, result.loaded.flow.collections[0].value, "i32"));
+    }
+
     test "simple match: Call applyImpulse -> CustomNode apply_impulse" {
         const allocator = std.testing.allocator;
         const out = try runFixture(allocator, simple_input, simple_catalog, simple_expected);

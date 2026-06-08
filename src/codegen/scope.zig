@@ -247,6 +247,36 @@ fn validateForEachCaptureScopes(
     }
 }
 
+/// Validate that every consumer of a `MapForEach` node's `key` / `value`
+/// output is within that loop's body scope (flow-codegen#24, MAPS) — the
+/// direct analogue of `validateForEachCaptureScopes`. The `entry_<id>`
+/// capture (whose `key_ptr`/`value_ptr` the outputs read) is declared only
+/// inside the `while` body block; a consumer computed OUTSIDE that scope
+/// would emit an out-of-scope read, so the flow is `error.MalformedFlow`.
+fn validateMapForEachCaptureScopes(
+    allocator: std.mem.Allocator,
+    ctx: *GraphContext,
+    scopes: *const ScopeMap,
+) (CodegenError || std.mem.Allocator.Error)!void {
+    for (ctx.flow.nodes) |*n| {
+        if (n.kind != .MapForEach) continue;
+        const own_scope = scopes.get(n.id);
+        const body_scope = try appendFrame(allocator, own_scope, n.id, "body");
+        defer allocator.free(body_scope);
+
+        for (ctx.flow.edges) |e| {
+            if (e.from.node != n.id) continue;
+            // Only the `key`/`value` data outputs are scope-bound captures.
+            if (!std.mem.eql(u8, e.from.pin, "key") and
+                !std.mem.eql(u8, e.from.pin, "value")) continue;
+            const consumer_scope = scopes.get(e.to.node);
+            if (!scopePrefix(body_scope, consumer_scope)) {
+                return error.MalformedFlow;
+            }
+        }
+    }
+}
+
 /// Resolve a command/`Branch` node's scope from the exec edge targeting
 /// it. `depth` guards against an exec-edge cycle in a malformed graph —
 /// beyond the node count there must be a loop, so bail to top-level.
@@ -351,6 +381,13 @@ pub fn emitBody(
     // body scope (or a descendant). Reject an out-of-scope read up front.
     try validateForEachCaptureScopes(allocator, ctx, &scopes);
 
+    // MapForEach `key`/`value` scope validation (flow-codegen#24, MAPS):
+    // same shape as `ForEach` — the `entry_<id>` capture is declared only
+    // inside the `while` body block, so every consumer of a
+    // `MapForEach.key`/`MapForEach.value` output must compute within that
+    // body scope (or a descendant). Reject an out-of-scope read up front.
+    try validateMapForEachCaptureScopes(allocator, ctx, &scopes);
+
     // Suppression pre-pass (flow-codegen#21, bugbot "While cond leaves
     // unused bindings"): a reporter wired ONLY into `While.cond` pins
     // (transitively, through other inlined reporters) is inlined into the
@@ -412,6 +449,15 @@ fn emitScope(
         // the recursively-emitted body scope (see `emitForEach`).
         if (node.kind == .ForEach) {
             try emitForEach(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
+            continue;
+        }
+
+        // `MapForEach` (flow-codegen#24, MAPS) is the map analogue — it
+        // expands to a `var it_<id> = <map>.iterator(); while
+        // (it_<id>.next()) |entry_<id>| { … }` wrapping the recursively-
+        // emitted body scope (see `emitMapForEach`).
+        if (node.kind == .MapForEach) {
+            try emitMapForEach(allocator, w, ctx, flow_name, emit_preview, scopes, suppressed, scope, node, scratch);
             continue;
         }
 
@@ -705,6 +751,57 @@ fn emitForEach(
         "    for ({s}.items, 0..) |{s}, {s}| {{\n",
         .{ collection, item_cap, idx_cap },
     );
+    if (body.len != 0) try indentBlock(w, body, "    ");
+    try w.writeAll("    }\n");
+}
+
+/// Lower a `MapForEach` node at `scope` to a Zig hash-map iterator loop
+/// (flow-codegen#24, MAPS). The map analogue of `emitForEach`: the body
+/// scope frame is `{ branch: <id>, side: "body" }`, so `execScopeOf` routes
+/// body-targeted nodes here, and reporters whose LCA scope sinks into the
+/// body recompute each pass.
+///
+/// Lowers to:
+///   var it_<id> = <map>.iterator();
+///   while (it_<id>.next()) |entry_<id>| { <body> }
+/// The body reads the `key`/`value` output pins through `resolveInput`,
+/// which maps them to `entry_<id>.key_ptr.*` / `entry_<id>.value_ptr.*`.
+///
+/// Unused-capture handling: a `while`-payload capture that is never read is
+/// a Zig "unused capture" error. `entry_<id>` is always captured; when
+/// NEITHER `key` nor `value` is read we discard it with `_ = entry_<id>;`
+/// inside the body so the loop runs purely for its side effects.
+fn emitMapForEach(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ctx: *GraphContext,
+    flow_name: []const u8,
+    emit_preview: bool,
+    scopes: *const ScopeMap,
+    suppressed: *const std.AutoHashMap(u32, void),
+    scope: []const ScopeFrame,
+    node: *const flow_io.Node,
+    scratch: std.mem.Allocator,
+) (CodegenError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    if (emit_preview) try writePreviewPulse(w, flow_name, node.id);
+
+    // Render the body scope to a buffer, then re-indent it under the
+    // `while` header — same buffer+indent mechanism `emitForEach` uses.
+    var body_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer body_aw.deinit();
+    const child = try appendFrame(allocator, scope, node.id, "body");
+    defer allocator.free(child);
+    try emitScope(allocator, &body_aw.writer, ctx, flow_name, emit_preview, scopes, suppressed, child, scratch);
+    const body = body_aw.written();
+
+    const collection = node.kind.MapForEach.collection;
+    const reads_entry = anyConsumerOf(ctx, node.id, "key") or
+        anyConsumerOf(ctx, node.id, "value");
+
+    try w.print("    var it_{d} = {s}.iterator();\n", .{ node.id, collection });
+    try w.print("    while (it_{d}.next()) |entry_{d}| {{\n", .{ node.id, node.id });
+    // Suppress the unused capture when the body reads neither field.
+    if (!reads_entry) try w.print("        _ = entry_{d};\n", .{node.id});
     if (body.len != 0) try indentBlock(w, body, "    ");
     try w.writeAll("    }\n");
 }

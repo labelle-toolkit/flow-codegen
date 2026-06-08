@@ -105,6 +105,19 @@ pub const GraphContext = struct {
             return try std.fmt.allocPrint(alloc, "idx_{d}", .{producer.id});
         }
 
+        // A `MapForEach`'s `key` / `value` output pins ARE the hash-map
+        // iterator entry's fields (flow-codegen#24, MAPS) — they resolve to
+        // `entry_<id>.key_ptr.*` / `entry_<id>.value_ptr.*`, the captures
+        // declared by the `while (it.next()) |entry_<id>|` header, NOT
+        // `n<id>_…` bindings. Body nodes that read them emit inside the
+        // loop body where the capture is in scope (mirrors `ForEach`).
+        if (producer.kind == .MapForEach and std.mem.eql(u8, edge.from.pin, "key")) {
+            return try std.fmt.allocPrint(alloc, "entry_{d}.key_ptr.*", .{producer.id});
+        }
+        if (producer.kind == .MapForEach and std.mem.eql(u8, edge.from.pin, "value")) {
+            return try std.fmt.allocPrint(alloc, "entry_{d}.value_ptr.*", .{producer.id});
+        }
+
         const primary = primaryOutputPin(producer.kind);
         if (primary.len != 0 and std.mem.eql(u8, edge.from.pin, primary)) {
             return try std.fmt.allocPrint(

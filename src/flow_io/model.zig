@@ -300,6 +300,41 @@ pub const NodeKind = union(enum) {
     /// `for (<name>.items, 0..) |item_<id>, idx_<id>| { <body> }`.
     /// Carries no per-kind payload beyond the list `collection` name.
     ForEach: struct { collection: []const u8 },
+    /// `MapSet` — command (flow-codegen#24, MAPS). Writes the wired
+    /// `value` data input under the wired `key` into the named map.
+    /// Lowers to `<name>.put(game.allocator, <key>, <value>) catch {};`.
+    MapSet: struct { collection: []const u8 },
+    /// `MapGet` — reporter (flow-codegen#24, MAPS). Reads the value at
+    /// the wired `key`, falling back to the wired `default` when absent:
+    /// `const n<id>_value = <name>.get(<key>) orelse <default>;`. The
+    /// `default` data input defaults to `0` when unwired (mirroring
+    /// `ListGet`); author wires a real default for non-numeric values.
+    MapGet: struct { collection: []const u8 },
+    /// `MapHas` — reporter (flow-codegen#24, MAPS). Binds a `bool` —
+    /// whether the named map contains the wired `key`:
+    /// `const n<id>_value = <name>.contains(<key>);`.
+    MapHas: struct { collection: []const u8 },
+    /// `MapRemove` — command (flow-codegen#24, MAPS). Removes the wired
+    /// `key` from the named map (no-op if absent), discarding the
+    /// `bool` result: `_ = <name>.remove(<key>);`.
+    MapRemove: struct { collection: []const u8 },
+    /// `MapClear` — command (flow-codegen#24, MAPS). Empties the map
+    /// while keeping its capacity — `<name>.clearRetainingCapacity();`.
+    MapClear: struct { collection: []const u8 },
+    /// `MapLength` — reporter (flow-codegen#24, MAPS). Binds the map's
+    /// entry count (`usize`) — `const n<id>_value = <name>.count();`.
+    MapLength: struct { collection: []const u8 },
+    /// `MapForEach` — control-flow loop over a map (flow-codegen#24,
+    /// MAPS; the map analogue of `ForEach`). Exposes a single **exec**
+    /// output pin `body` (wired through `Flow.exec_edges`) plus two data
+    /// **output** pins — `key` and `value` — readable only by body nodes
+    /// (codegen special-cases the read in `resolveInput`, mirroring
+    /// `ForEach.item`/`index`). Lowers to a `std.HashMap` iterator loop:
+    /// `var it_<id> = <name>.iterator(); while (it_<id>.next()) |entry_<id>|
+    /// { <body> }`, where `key` reads `entry_<id>.key_ptr.*` and `value`
+    /// reads `entry_<id>.value_ptr.*`. Carries no per-kind payload beyond
+    /// the map `collection` name.
+    MapForEach: struct { collection: []const u8 },
 };
 
 /// One node in a flow graph. `id` is unique within a single file
@@ -361,20 +396,38 @@ pub const Variable = struct {
     default: Literal,
 };
 
-/// A top-level declared growable LIST collection (flow-codegen#24, v1 —
-/// MAPS deferred to a follow-up). Lowers to a file-scope
-/// `pub var <name>: std.ArrayList(<element>) = .empty;` in the generated
-/// `.zig` module — game-allocator-backed, game-lifetime. Operations
-/// (`ListAppend`/`ListGet`/… and `ForEach`) reference it by `name` and
-/// allocate on demand through `game.allocator`. There is NO auto-deinit in
-/// v1: lists live for the game's lifetime and are reclaimed by the OS at
-/// exit; proper deinit-on-teardown is a follow-up.
+/// Discriminates a `Collection`'s shape (flow-codegen#24). `.list` is the
+/// growable-array default (back-compat: pre-MAPS files omit `kind` and a
+/// missing discriminator parses as `.list`); `.map` is the hash-map shape.
+pub const CollectionKind = enum { list, map };
+
+/// A top-level declared growable collection (flow-codegen#24). A `.list`
+/// lowers to a file-scope `pub var <name>: std.ArrayList(<element>) =
+/// .empty;`; a `.map` lowers to `pub var <name>:
+/// std.AutoHashMapUnmanaged(<key>, <value>) = .empty;`. Both are
+/// game-allocator-backed and game-lifetime. Operations
+/// (`ListAppend`/`MapSet`/… and `ForEach`/`MapForEach`) reference the
+/// collection by `name` and allocate on demand through `game.allocator`.
+/// There is NO auto-deinit in v1: collections live for the game's lifetime
+/// and are reclaimed by the OS at exit; proper deinit-on-teardown is a
+/// follow-up.
 pub const Collection = struct {
     /// Zig identifier — the collection's symbol in the generated module.
     name: []const u8,
-    /// Zig source text of the list's ELEMENT type — e.g. `"u32"`,
-    /// `"i32"`, `"f32"`. Emitted verbatim as `std.ArrayList(<element>)`.
-    element: []const u8,
+    /// Which shape this is. Defaults to `.list` so pre-MAPS files (which
+    /// omit `kind`) round-trip unchanged.
+    kind: CollectionKind = .list,
+    /// LIST only — Zig source text of the element type — e.g. `"u32"`.
+    /// Emitted verbatim as `std.ArrayList(<element>)`. Empty for maps.
+    element: []const u8 = "",
+    /// MAP only — Zig source text of the key type — e.g. `"u32"`.
+    /// Emitted verbatim as the first `std.AutoHashMapUnmanaged` arg.
+    /// Empty for lists.
+    key: []const u8 = "",
+    /// MAP only — Zig source text of the value type — e.g. `"i32"`.
+    /// Emitted verbatim as the second `std.AutoHashMapUnmanaged` arg.
+    /// Empty for lists.
+    value: []const u8 = "",
 };
 
 /// A fully parsed flow. Every slice is owned by the surrounding
@@ -480,8 +533,13 @@ pub const ParseError = error{
     /// A `GetVariable` / `SetVariable` / `ChangeVariable` names a
     /// variable not in the top-level `variables` block.
     UnknownVariable,
-    /// A list operation node (`ListAppend` / `ListGet` / … / `ForEach`)
-    /// names a `collection` not in the top-level `collections` block
+    /// A collection operation node (`ListAppend` / `ListGet` / … /
+    /// `ForEach`, or `MapSet` / `MapGet` / … / `MapForEach`) names a
+    /// `collection` not in the top-level `collections` block
     /// (flow-codegen#24).
     UnknownCollection,
+    /// A declared collection is malformed for its `kind` (flow-codegen#24):
+    /// a `.list` is missing `element`, or a `.map` is missing `key` or
+    /// `value`.
+    MalformedCollection,
 };
