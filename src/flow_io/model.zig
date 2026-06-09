@@ -384,6 +384,46 @@ pub const NodeKind = union(enum) {
     /// two share a template (the node kinds stay distinct for editor
     /// clarity and future per-type precision controls).
     FloatToString: struct {},
+    /// `IsKeyDown` — input reporter (labelle-gui#208 Option A). The
+    /// held-state complement to the input EVENT nodes: pure value
+    /// reporter (output pin `value: bool`, no exec pins) read inside a
+    /// per-frame flow (`engine.tick` / `OnEvent` handler), e.g.
+    /// `Branch(cond = IsKeyDown("w")) → move`. Lowers to the GAME INPUT
+    /// MIXIN method `game.isKeyDown(.<key>)` (labelle-engine
+    /// `src/game/input_mixin.zig`).
+    ///
+    /// `key` is the BARE enum-tag name of a `KeyboardKey` (e.g. `"space"`,
+    /// `"w"`, `"left"`) — NOT a wired pin. Codegen emits it as a Zig ENUM
+    /// LITERAL — `game.isKeyDown(.<key>)` — so it infers to `KeyboardKey`
+    /// without the generated module importing the enum (mirrors how
+    /// `engine.KeyboardKey.space` is referenced elsewhere). `validate`
+    /// checks the tag is non-empty and a plausible Zig identifier;
+    /// AstGen CANNOT verify the tag is a real `KeyboardKey` member — that
+    /// is resolved by Sema at game compile, surfacing as an
+    /// `enum '…' has no member named '…'` error there.
+    IsKeyDown: struct { key: []const u8 = "" },
+    /// `IsKeyPressed` — input reporter (labelle-gui#208 Option A). The
+    /// rising-edge sibling of `IsKeyDown`: true only on the frame the key
+    /// transitions to down. Output pin `value: bool`, no exec pins.
+    /// Lowers to the mixin method `game.isKeyPressed(.<key>)`. Same
+    /// enum-literal `key` encoding, validation, and Sema-deferred
+    /// tag-checking caveat as `IsKeyDown`.
+    IsKeyPressed: struct { key: []const u8 = "" },
+    /// `GetMouseX` — input reporter (labelle-gui#208 Option A). Pure value
+    /// reporter (output pin `value: f32`, no exec pins, no payload).
+    /// Lowers to the mixin method `game.getMouseX()` — the mouse cursor's
+    /// X position in window pixels for the current frame.
+    GetMouseX: struct {},
+    /// `GetMouseY` — input reporter (labelle-gui#208 Option A). Pure value
+    /// reporter (output pin `value: f32`, no exec pins, no payload).
+    /// Lowers to the mixin method `game.getMouseY()` — the mouse cursor's
+    /// Y position in window pixels for the current frame.
+    GetMouseY: struct {},
+    /// `GetMouseWheel` — input reporter (labelle-gui#208 Option A). Pure
+    /// value reporter (output pin `value: f32`, no exec pins, no payload).
+    /// Lowers to the mixin method `game.getMouseWheelMove()` — the mouse
+    /// wheel delta for the current frame (positive = forward/up).
+    GetMouseWheel: struct {},
     /// `ListAppend` — command (flow-codegen#24). Appends the wired
     /// `value` data input to the named growable list. Lowers to
     /// `<name>.append(game.allocator, <value>) catch {};`.

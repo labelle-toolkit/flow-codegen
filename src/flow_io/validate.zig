@@ -216,9 +216,37 @@ pub fn validate(flow: Flow) ParseError!void {
             // `value` inputs are checked at codegen by `resolveInput`
             // (`DanglingPin` for a missing required input).
             .Format, .Concat, .IntToString, .FloatToString => {},
+            // Input reporters (labelle-gui#208 Option A). The key-taking
+            // ones carry a `key` FIELD (the bare `KeyboardKey` enum-tag
+            // name) — codegen emits it as a Zig enum literal
+            // `game.isKeyDown(.<key>)`, so it must be non-empty and a
+            // plausible Zig identifier or the generated source won't
+            // parse. AstGen CANNOT verify the tag is a real `KeyboardKey`
+            // member — that's a Sema check at game compile. The mouse
+            // reporters take no payload, so there's nothing to validate.
+            .IsKeyDown => |b| if (!isPlausibleIdent(b.key)) return error.MalformedFlow,
+            .IsKeyPressed => |b| if (!isPlausibleIdent(b.key)) return error.MalformedFlow,
+            .GetMouseX, .GetMouseY, .GetMouseWheel => {},
             else => {},
         }
     }
+}
+
+/// Is `s` a plausible bare Zig identifier — non-empty, leading
+/// letter/underscore, the rest alphanumeric/underscore? Used to gate the
+/// `key` field of the input-reporter nodes (labelle-gui#208 Option A),
+/// which codegen splices verbatim after a `.` to form a `KeyboardKey`
+/// enum literal (`game.isKeyDown(.<key>)`). This guards the GENERATED
+/// SOURCE against unparseable tags; it does NOT (and cannot here) check
+/// that the tag is an actual `KeyboardKey` member — that resolves in Sema
+/// at game compile.
+pub fn isPlausibleIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
+    for (s[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
 }
 
 pub fn hasVariable(variables: []const Variable, name: []const u8) bool {

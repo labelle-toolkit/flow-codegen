@@ -292,6 +292,42 @@ pub fn writeNodeBody(
             "    const n{d}_value = {s} != null;\n",
             .{ node.id, b.name },
         ),
+        // Input reporters (labelle-gui#208 Option A) — pure value reporters
+        // that read live host input state for the current frame. Each binds
+        // its result to `n<id>_value` (the reporter shape consumers read via
+        // their input pins, like `GetVariable`); they are also in
+        // `inline.zig`'s pure-inlinable set, so a `While` cond / `Delay`
+        // snapshot re-reads them in place instead of freezing this binding.
+        // They lower to the GAME INPUT MIXIN methods
+        // (labelle-engine `src/game/input_mixin.zig`).
+        //
+        // `IsKeyDown`/`IsKeyPressed` splice the `key` FIELD as a Zig ENUM
+        // LITERAL — `game.isKeyDown(.<key>)` — so it infers to `KeyboardKey`
+        // without the generated module importing the enum (mirrors how
+        // `engine.KeyboardKey.space` is referenced). `validate` has already
+        // confirmed `key` is a plausible identifier; AstGen still CANNOT
+        // verify it names a real `KeyboardKey` member — that resolves in
+        // Sema at game compile.
+        .IsKeyDown => |b| try w.print(
+            "    const n{d}_value = game.isKeyDown(.{s});\n",
+            .{ node.id, b.key },
+        ),
+        .IsKeyPressed => |b| try w.print(
+            "    const n{d}_value = game.isKeyPressed(.{s});\n",
+            .{ node.id, b.key },
+        ),
+        .GetMouseX => try w.print(
+            "    const n{d}_value = game.getMouseX();\n",
+            .{node.id},
+        ),
+        .GetMouseY => try w.print(
+            "    const n{d}_value = game.getMouseY();\n",
+            .{node.id},
+        ),
+        .GetMouseWheel => try w.print(
+            "    const n{d}_value = game.getMouseWheelMove();\n",
+            .{node.id},
+        ),
         // `CustomNode` lowers to a call against the assembler-emitted
         // `game_mod.PluginFlowNodes.<qualified>.impl` (RFC-FLOW-VOCABULARY
         // §1 + §5). The dotted name on the node maps to the qualified

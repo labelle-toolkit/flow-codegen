@@ -376,7 +376,22 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
         // `Once` (flow-codegen#47) is payload-free like `Branch`: its `body`
         // target is an exec edge and its gate is a per-node `pub var` emitted
         // by codegen, not on-node state — so nothing to write here.
-        .Branch, .ForRange, .While, .Select, .Switch, .Concat, .IntToString, .FloatToString, .Once => {},
+        // `GetMouseX`/`GetMouseY`/`GetMouseWheel` (labelle-gui#208 Option A)
+        // are payload-free input reporters — they take no inputs and lower
+        // directly to a mixin getter, so nothing to write here.
+        .Branch, .ForRange, .While, .Select, .Switch, .Concat, .IntToString, .FloatToString, .Once, .GetMouseX, .GetMouseY, .GetMouseWheel => {},
+        // `IsKeyDown`/`IsKeyPressed` (labelle-gui#208 Option A) carry only
+        // their inline `key` (the bare `KeyboardKey` enum-tag name); the
+        // node has no input pins. Emit `key` like `Log`'s `label` so the
+        // round-trip stays byte-deterministic.
+        .IsKeyDown => |b| {
+            try w.writeAll(", \"key\": ");
+            try writeJsonString(w, b.key);
+        },
+        .IsKeyPressed => |b| {
+            try w.writeAll(", \"key\": ");
+            try writeJsonString(w, b.key);
+        },
         // `Cooldown` (flow-codegen#47) carries only its inline `seconds`
         // duration (an `f64`); its `body` target is an exec edge. Emit
         // `seconds` with `{d}` so the round-trip stays byte-deterministic
