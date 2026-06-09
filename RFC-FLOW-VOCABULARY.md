@@ -121,7 +121,17 @@ types automatically.
   concrete Zig type. No generic flow nodes.
 - **Not addressing globals or save/load.** Variables in v1 are
   file-scope locals — persistent across handler calls but invisible to
-  other flows. Globals + save/load are their own conversation.
+  other flows. **Resolved convention (2026-06): flow state is
+  TRANSIENT — durable state belongs in ECS components.** `variables`,
+  `collections`, and time-gate state (`Cooldown`/`Once`/`Delay`) live in
+  module globals that `saveGameState`/`loadGameState` (which serialize
+  the ECS world) deliberately do NOT capture. They reset to their
+  defaults on load — cooldowns become ready, counters reset. labelle is
+  ECS-oriented: persistent gameplay state (score, flags, inventory)
+  should be an ECS component the save system already round-trips; flow
+  variables are per-session scratch / wiring scratch, not a persistence
+  surface. (Decision: labelle-engine#604 — not building flow-state
+  serialization; this convention replaces it.)
 - **Not solving the broadcast-visibility problem.** Two-flow
   composition via `Emit` + `OnEvent` works today; the UX gap (which
   flow listens to which event is invisible) is editor-only and out of
@@ -286,6 +296,13 @@ generated `.zig` module's file scope. So "local" means *scoped to the
 flow, persistent across handler invocations, invisible to other
 flows* — like a C `static`. Without that, the variable would only live
 for one handler call and couldn't accumulate, which defeats the point.
+
+> **Persistence:** "persistent" means *across handler calls within a
+> session* — NOT across save/load. These module globals are transient
+> and reset to their defaults on `loadGameState` (see Non-goals). Put
+> durable gameplay state in an **ECS component** (the save system
+> round-trips those); use `variables` for per-session accumulation and
+> wiring scratch.
 
 Forward-compatible with the eventual globals story: a project-wide
 `variables/` folder generates a separate Zig file with `pub var`s
