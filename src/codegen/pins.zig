@@ -55,7 +55,7 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // with the other reporters). `IsKeyDown`/`IsKeyPressed` are `bool`;
         // the mouse reporters are `f32`. Unlike the string reporters they
         // allocate nothing, so they ARE in `inline.zig`'s inlinable set.
-        .IsKeyDown, .IsKeyPressed, .GetMouseX, .GetMouseY, .GetMouseWheel => "value",
+        .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => "value",
         // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
         // §1 + §5). When the impl returns a value, the binding name is
         // `n<id>_value` (matching the reporter naming convention shared
@@ -222,7 +222,7 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // pins — their only parameter is the inline `key` FIELD (on the
         // key-taking ones), not a wire; the mouse reporters take nothing.
         // Their sole pin is the `value` OUTPUT.
-        .IsKeyDown, .IsKeyPressed, .GetMouseX, .GetMouseY, .GetMouseWheel => false,
+        .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => false,
         // `Once`/`Cooldown` (flow-codegen#47) consume NO data inputs — their
         // `body` is an exec output wired via `exec_edges`, and their gate
         // state is a per-node `pub var`, not a wired pin.

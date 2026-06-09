@@ -3,11 +3,20 @@
 //! REPORTER (output pin `value`, no exec pins) that lowers to a GAME INPUT
 //! MIXIN method (labelle-engine `src/game/input_mixin.zig`):
 //!
-//!   IsKeyDown { key }     → game.isKeyDown(.<key>)        (bool)
-//!   IsKeyPressed { key }  → game.isKeyPressed(.<key>)     (bool)
-//!   GetMouseX             → game.getMouseX()              (f32)
-//!   GetMouseY             → game.getMouseY()              (f32)
-//!   GetMouseWheel         → game.getMouseWheelMove()      (f32)
+//!   IsKeyDown { key }                  → game.isKeyDown(.<key>)              (bool)
+//!   IsKeyPressed { key }               → game.isKeyPressed(.<key>)           (bool)
+//!   IsKeyReleased { key }              → game.isKeyReleased(.<key>)          (bool)
+//!   IsMouseButtonDown { button }       → game.isMouseButtonDown(.<button>)   (bool)
+//!   IsMouseButtonPressed { button }    → game.isMouseButtonPressed(.<button>)(bool)
+//!   IsMouseButtonReleased { button }   → game.isMouseButtonReleased(.<button>)(bool)
+//!   GetMouseX                          → game.getMouseX()                    (f32)
+//!   GetMouseY                          → game.getMouseY()                    (f32)
+//!   GetMouseWheel                      → game.getMouseWheelMove()            (f32)
+//!
+//! The key/button reporters (labelle-gui#208) splice their FIELD as a Zig
+//! enum literal via `std.zig.fmtId` (so a keyword-named tag is wrapped
+//! `.@"..."`); the `button` ones name a `MouseButton` member. AstGen cannot
+//! verify the tag is a real enum member — Sema does, at game compile.
 //!
 //! Unlike the string reporters (flow-codegen#26) these allocate NOTHING,
 //! so they are pure-inlinable leaves (`inline.zig`): a `While` cond / `Delay`
@@ -394,8 +403,289 @@ pub const InputReporterTests = struct {
     }
 
     // -----------------------------------------------------------------
+    // IsKeyReleased (labelle-gui#208 — key-release complement)
+    // -----------------------------------------------------------------
+
+    test "IsKeyReleased lowers to game.isKeyReleased(.<key>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderKeyReporter(allocator, "IsKeyReleased", "space");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isKeyReleased(.space);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsKeyReleased escapes a keyword-named key via @\"...\" (std.zig.fmtId)" {
+        const allocator = std.testing.allocator;
+        const out = try renderKeyReporter(allocator, "IsKeyReleased", "return");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.isKeyReleased(.@\"return\");") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsKeyReleased round-trips through write" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "ikr_rt",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsKeyReleased", "key": "w", "pos": [3, 4] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .IsKeyReleased);
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.IsKeyReleased.key, "w"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "IsKeyReleased with an empty key is rejected at parse/validate" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "ikr_empty",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsKeyReleased", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    // -----------------------------------------------------------------
+    // IsMouseButtonDown / Pressed / Released (labelle-gui#208 — the
+    // `button`-taking mouse-button complement). `button` is a bare
+    // `MouseButton` enum-tag (`"left"`, `"right"`, `"middle"`); like the
+    // key reporters AstGen can't verify it names a real member — Sema does.
+    // -----------------------------------------------------------------
+
+    test "IsMouseButtonDown lowers to game.isMouseButtonDown(.<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsMouseButtonDown", "left");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isMouseButtonDown(.left);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsMouseButtonPressed lowers to game.isMouseButtonPressed(.<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsMouseButtonPressed", "right");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isMouseButtonPressed(.right);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsMouseButtonReleased lowers to game.isMouseButtonReleased(.<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsMouseButtonReleased", "middle");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isMouseButtonReleased(.middle);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "a keyword-named button is escaped via @\"...\" (std.zig.fmtId, matching #51)" {
+        const allocator = std.testing.allocator;
+        // `error` is a Zig keyword — not a real MouseButton member, but the
+        // codegen escaping (the path under test) must still wrap it so the
+        // generated source parses. The Sema check is deferred to game compile.
+        const out = try renderButtonReporter(allocator, "IsMouseButtonDown", "error");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.isMouseButtonDown(.@\"error\");") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsMouseButtonDown round-trips through write (button field)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "imbd_rt",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsMouseButtonDown", "button": "left", "pos": [5, 6] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .IsMouseButtonDown);
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.IsMouseButtonDown.button, "left"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "IsMouseButtonPressed round-trips through write (button field)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "imbp_rt",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsMouseButtonPressed", "button": "right", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.IsMouseButtonPressed.button, "right"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "a mouse-button reporter with an empty button is rejected at parse/validate" {
+        const allocator = std.testing.allocator;
+        // No `button` defaults to "" — not a plausible identifier, so the
+        // generated `.<button>` would be unparseable. Rejected by `validate`.
+        const src =
+            \\{
+            \\  "name": "imbd_empty",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsMouseButtonDown", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a mouse-button reporter with a non-identifier button is rejected" {
+        const allocator = std.testing.allocator;
+        // `1left` starts with a digit — not a Zig identifier.
+        const src =
+            \\{
+            \\  "name": "imbd_bad",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsMouseButtonReleased", "button": "1left", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "IsMouseButtonDown feeding a While cond is re-inlined verbatim (pure leaf)" {
+        const allocator = std.testing.allocator;
+        // A mouse-button reporter is in the inlinable-leaf set, so a `While`
+        // cond re-reads the live button each pass — the mixin call is
+        // spliced into the `while (...)` header, NOT frozen as `n<id>_value`.
+        const src =
+            \\{
+            \\  "name": "imbd_while",
+            \\  "variables": [
+            \\    { "name": "ticks", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsMouseButtonDown", "button": "left", "pos": [0, 0] },
+            \\    { "id": 2, "type": "While", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "ticks", "by": "1", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "imbd_while" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (game.isMouseButtonDown(.left))") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isMouseButtonDown") == null);
+
+        try expectAstGenOk(allocator, out);
+    }
+
+    // -----------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------
+
+    /// Render a `key`-taking reporter (`IsKeyDown`/`IsKeyPressed`/
+    /// `IsKeyReleased`) wired into a `bool` `Output`.
+    fn renderKeyReporter(
+        allocator: std.mem.Allocator,
+        type_name: []const u8,
+        key: []const u8,
+    ) ![]const u8 {
+        const src = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "name": "single",
+            \\  "event": {{ "type": "OnCall" }},
+            \\  "nodes": [
+            \\    {{ "id": 1, "type": "{s}", "key": "{s}", "pos": [0, 0] }},
+            \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }}
+            \\  ],
+            \\  "edges": [
+            \\    {{ "from": {{ "node": 1, "pin": "value" }}, "to": {{ "node": 2, "pin": "value" }} }}
+            \\  ]
+            \\}}
+        , .{ type_name, key });
+        defer allocator.free(src);
+
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        return try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "single" });
+    }
+
+    /// Render a `button`-taking reporter (`IsMouseButtonDown`/`Pressed`/
+    /// `Released`) wired into a `bool` `Output`.
+    fn renderButtonReporter(
+        allocator: std.mem.Allocator,
+        type_name: []const u8,
+        button: []const u8,
+    ) ![]const u8 {
+        const src = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "name": "single",
+            \\  "event": {{ "type": "OnCall" }},
+            \\  "nodes": [
+            \\    {{ "id": 1, "type": "{s}", "button": "{s}", "pos": [0, 0] }},
+            \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }}
+            \\  ],
+            \\  "edges": [
+            \\    {{ "from": {{ "node": 1, "pin": "value" }}, "to": {{ "node": 2, "pin": "value" }} }}
+            \\  ]
+            \\}}
+        , .{ type_name, button });
+        defer allocator.free(src);
+
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        return try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "single" });
+    }
 
     /// Render a single payload-free reporter wired into an `Output`, so the
     /// reporter is consumed (no unused-binding lint) and the generated Zig

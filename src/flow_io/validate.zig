@@ -226,6 +226,15 @@ pub fn validate(flow: Flow) ParseError!void {
             // reporters take no payload, so there's nothing to validate.
             .IsKeyDown => |b| if (!isPlausibleIdent(b.key)) return error.MalformedFlow,
             .IsKeyPressed => |b| if (!isPlausibleIdent(b.key)) return error.MalformedFlow,
+            .IsKeyReleased => |b| if (!isPlausibleIdent(b.key)) return error.MalformedFlow,
+            // The mouse-button reporters carry a `button` FIELD (the bare
+            // `MouseButton` enum-tag name) — codegen emits it as a Zig enum
+            // literal `game.isMouseButtonDown(.<button>)`, so it must be
+            // non-empty and a plausible Zig identifier. Same Sema-deferred
+            // tag-checking caveat as the key reporters.
+            .IsMouseButtonDown => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
+            .IsMouseButtonPressed => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
+            .IsMouseButtonReleased => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
             .GetMouseX, .GetMouseY, .GetMouseWheel => {},
             else => {},
         }

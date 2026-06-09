@@ -392,6 +392,27 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"key\": ");
             try writeJsonString(w, b.key);
         },
+        .IsKeyReleased => |b| {
+            try w.writeAll(", \"key\": ");
+            try writeJsonString(w, b.key);
+        },
+        // `IsMouseButtonDown`/`IsMouseButtonPressed`/`IsMouseButtonReleased`
+        // (labelle-gui#208) carry only their inline `button` (the bare
+        // `MouseButton` enum-tag name); the node has no input pins. Emit
+        // `button` like `IsKeyDown`'s `key` so the round-trip stays
+        // byte-deterministic.
+        .IsMouseButtonDown => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
+        .IsMouseButtonPressed => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
+        .IsMouseButtonReleased => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
         // `Cooldown` (flow-codegen#47) carries only its inline `seconds`
         // duration (an `f64`); its `body` target is an exec edge. Emit
         // `seconds` with `{d}` so the round-trip stays byte-deterministic

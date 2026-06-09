@@ -547,6 +547,46 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
             else
                 "",
         } };
+    } else if (std.mem.eql(u8, type_name, "IsKeyReleased")) {
+        // Falling-edge sibling of `IsKeyDown` (labelle-gui#208). Same
+        // enum-literal `key` field encoding.
+        return .{ .IsKeyReleased = .{
+            .key = if (o.get("key")) |kv|
+                (if (kv == .string) try a.dupe(u8, kv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsMouseButtonDown")) {
+        // Mouse-button input reporter (labelle-gui#208). `button` is the
+        // bare `MouseButton` enum-tag name (e.g. `"left"`, `"right"`);
+        // codegen emits it as a Zig enum literal
+        // `game.isMouseButtonDown(.<button>)`. No data input pins —
+        // `button` is an inline FIELD, not a wire. Absent `button` defaults
+        // to `""` (rejected by `validate`).
+        return .{ .IsMouseButtonDown = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsMouseButtonPressed")) {
+        // Rising-edge sibling of `IsMouseButtonDown` (labelle-gui#208).
+        // Same enum-literal `button` field encoding.
+        return .{ .IsMouseButtonPressed = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsMouseButtonReleased")) {
+        // Falling-edge sibling of `IsMouseButtonDown` (labelle-gui#208).
+        // Same enum-literal `button` field encoding.
+        return .{ .IsMouseButtonReleased = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
     } else if (std.mem.eql(u8, type_name, "GetMouseX")) {
         // Input reporter (labelle-gui#208 Option A). No per-kind payload,
         // no input pins — lowers to `game.getMouseX()`.

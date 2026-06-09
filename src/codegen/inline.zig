@@ -66,6 +66,10 @@ fn deepInlineNode(
         // so it infers to `KeyboardKey` without importing the enum.
         .IsKeyDown => |b| return try std.fmt.allocPrint(alloc, "game.isKeyDown(.{f})", .{std.zig.fmtId(b.key)}),
         .IsKeyPressed => |b| return try std.fmt.allocPrint(alloc, "game.isKeyPressed(.{f})", .{std.zig.fmtId(b.key)}),
+        .IsKeyReleased => |b| return try std.fmt.allocPrint(alloc, "game.isKeyReleased(.{f})", .{std.zig.fmtId(b.key)}),
+        .IsMouseButtonDown => |b| return try std.fmt.allocPrint(alloc, "game.isMouseButtonDown(.{f})", .{std.zig.fmtId(b.button)}),
+        .IsMouseButtonPressed => |b| return try std.fmt.allocPrint(alloc, "game.isMouseButtonPressed(.{f})", .{std.zig.fmtId(b.button)}),
+        .IsMouseButtonReleased => |b| return try std.fmt.allocPrint(alloc, "game.isMouseButtonReleased(.{f})", .{std.zig.fmtId(b.button)}),
         .GetMouseX => return try alloc.dupe(u8, "game.getMouseX()"),
         .GetMouseY => return try alloc.dupe(u8, "game.getMouseY()"),
         .GetMouseWheel => return try alloc.dupe(u8, "game.getMouseWheelMove()"),
@@ -145,7 +149,7 @@ pub fn isInlinableKind(k: flow_io.NodeKind) bool {
         // leaves that allocate NOTHING — like `GetVariable`, they can be
         // re-emitted in place, so a `While`/`Delay` re-reads live input
         // each pass instead of freezing a once-bound value.
-        .IsKeyDown, .IsKeyPressed, .GetMouseX, .GetMouseY, .GetMouseWheel => true,
+        .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => true,
         // String reporters (`Format`/`Concat`/`IntToString`/`FloatToString`,
         // flow-codegen#26) are intentionally absent from this set: they
         // ALLOCATE via `game.allocator`, so they must bind to an
