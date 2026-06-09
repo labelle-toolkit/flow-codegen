@@ -304,17 +304,18 @@ pub fn writeNodeBody(
         // `IsKeyDown`/`IsKeyPressed` splice the `key` FIELD as a Zig ENUM
         // LITERAL — `game.isKeyDown(.<key>)` — so it infers to `KeyboardKey`
         // without the generated module importing the enum (mirrors how
-        // `engine.KeyboardKey.space` is referenced). `validate` has already
-        // confirmed `key` is a plausible identifier; AstGen still CANNOT
-        // verify it names a real `KeyboardKey` member — that resolves in
-        // Sema at game compile.
+        // `engine.KeyboardKey.space` is referenced). `std.zig.fmtId` emits
+        // the tag, wrapping a Zig keyword (`.@"return"`) so a keyword-named
+        // key still parses (gemini #51). `validate` confirmed `key` is a
+        // plausible identifier; AstGen still CANNOT verify it names a real
+        // `KeyboardKey` member — that resolves in Sema at game compile.
         .IsKeyDown => |b| try w.print(
-            "    const n{d}_value = game.isKeyDown(.{s});\n",
-            .{ node.id, b.key },
+            "    const n{d}_value = game.isKeyDown(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.key) },
         ),
         .IsKeyPressed => |b| try w.print(
-            "    const n{d}_value = game.isKeyPressed(.{s});\n",
-            .{ node.id, b.key },
+            "    const n{d}_value = game.isKeyPressed(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.key) },
         ),
         .GetMouseX => try w.print(
             "    const n{d}_value = game.getMouseX();\n",

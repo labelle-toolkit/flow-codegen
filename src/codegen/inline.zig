@@ -64,8 +64,8 @@ fn deepInlineNode(
         // verbatim each iteration (a `While(cond = IsKeyDown("w"))` polls
         // the held key every pass). `key` is spliced as a Zig enum literal
         // so it infers to `KeyboardKey` without importing the enum.
-        .IsKeyDown => |b| return try std.fmt.allocPrint(alloc, "game.isKeyDown(.{s})", .{b.key}),
-        .IsKeyPressed => |b| return try std.fmt.allocPrint(alloc, "game.isKeyPressed(.{s})", .{b.key}),
+        .IsKeyDown => |b| return try std.fmt.allocPrint(alloc, "game.isKeyDown(.{f})", .{std.zig.fmtId(b.key)}),
+        .IsKeyPressed => |b| return try std.fmt.allocPrint(alloc, "game.isKeyPressed(.{f})", .{std.zig.fmtId(b.key)}),
         .GetMouseX => return try alloc.dupe(u8, "game.getMouseX()"),
         .GetMouseY => return try alloc.dupe(u8, "game.getMouseY()"),
         .GetMouseWheel => return try alloc.dupe(u8, "game.getMouseWheelMove()"),

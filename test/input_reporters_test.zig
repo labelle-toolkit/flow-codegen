@@ -71,6 +71,34 @@ pub const InputReporterTests = struct {
         try expectAstGenOk(allocator, out);
     }
 
+    test "a keyword-named key is escaped via @\"...\" so it still parses (gemini #51)" {
+        // A flow author can type any key string; if it's a Zig keyword, a
+        // bare `.return` is a parse error — `std.zig.fmtId` wraps it as
+        // `.@"return"`. (The tag still must name a real KeyboardKey member;
+        // that's Sema, not checked here.)
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "kw_key",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsKeyDown", "key": "return", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "kw_key" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.isKeyDown(.@\"return\");") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
     test "IsKeyDown round-trips through write (parse -> write -> parse)" {
         const allocator = std.testing.allocator;
         const src =
