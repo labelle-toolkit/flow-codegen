@@ -390,6 +390,10 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         // payload-free.
         .IsKeyDown => |b| .{ .IsKeyDown = .{ .key = try a.dupe(u8, b.key) } },
         .IsKeyPressed => |b| .{ .IsKeyPressed = .{ .key = try a.dupe(u8, b.key) } },
+        .IsKeyReleased => |b| .{ .IsKeyReleased = .{ .key = try a.dupe(u8, b.key) } },
+        .IsMouseButtonDown => |b| .{ .IsMouseButtonDown = .{ .button = try a.dupe(u8, b.button) } },
+        .IsMouseButtonPressed => |b| .{ .IsMouseButtonPressed = .{ .button = try a.dupe(u8, b.button) } },
+        .IsMouseButtonReleased => |b| .{ .IsMouseButtonReleased = .{ .button = try a.dupe(u8, b.button) } },
         .GetMouseX => .{ .GetMouseX = .{} },
         .GetMouseY => .{ .GetMouseY = .{} },
         .GetMouseWheel => .{ .GetMouseWheel = .{} },

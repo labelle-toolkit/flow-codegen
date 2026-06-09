@@ -409,6 +409,42 @@ pub const NodeKind = union(enum) {
     /// enum-literal `key` encoding, validation, and Sema-deferred
     /// tag-checking caveat as `IsKeyDown`.
     IsKeyPressed: struct { key: []const u8 = "" },
+    /// `IsKeyReleased` — input reporter (labelle-gui#208). The falling-edge
+    /// sibling of `IsKeyDown`/`IsKeyPressed`: true only on the frame the key
+    /// transitions to up. Output pin `value: bool`, no exec pins. Lowers to
+    /// the mixin method `game.isKeyReleased(.<key>)` (labelle-engine
+    /// `feat/input-mixin-accessors`). Same enum-literal `key` encoding,
+    /// validation, and Sema-deferred tag-checking caveat as `IsKeyDown`.
+    IsKeyReleased: struct { key: []const u8 = "" },
+    /// `IsMouseButtonDown` — input reporter (labelle-gui#208). Held-state
+    /// reporter for a mouse button: pure value reporter (output pin
+    /// `value: bool`, no exec pins). Lowers to the mixin method
+    /// `game.isMouseButtonDown(.<button>)` (labelle-engine
+    /// `feat/input-mixin-accessors`).
+    ///
+    /// `button` is the BARE enum-tag name of a `MouseButton` (`"left"`,
+    /// `"right"`, `"middle"`) — NOT a wired pin. Codegen emits it as a Zig
+    /// ENUM LITERAL — `game.isMouseButtonDown(.<button>)` — via
+    /// `std.zig.fmtId` (so a keyword-named tag still parses), mirroring how
+    /// `IsKeyDown` encodes `key`. `validate` checks the tag is non-empty and
+    /// a plausible Zig identifier; AstGen CANNOT verify the tag is a real
+    /// `MouseButton` member — that is resolved by Sema at game compile,
+    /// surfacing as an `enum '…' has no member named '…'` error there.
+    IsMouseButtonDown: struct { button: []const u8 = "" },
+    /// `IsMouseButtonPressed` — input reporter (labelle-gui#208). The
+    /// rising-edge sibling of `IsMouseButtonDown`: true only on the frame the
+    /// button transitions to down. Output pin `value: bool`, no exec pins.
+    /// Lowers to `game.isMouseButtonPressed(.<button>)`. Same enum-literal
+    /// `button` encoding, validation, and Sema-deferred tag-checking caveat
+    /// as `IsMouseButtonDown`.
+    IsMouseButtonPressed: struct { button: []const u8 = "" },
+    /// `IsMouseButtonReleased` — input reporter (labelle-gui#208). The
+    /// falling-edge sibling of `IsMouseButtonDown`: true only on the frame
+    /// the button transitions to up. Output pin `value: bool`, no exec pins.
+    /// Lowers to `game.isMouseButtonReleased(.<button>)`. Same enum-literal
+    /// `button` encoding, validation, and Sema-deferred tag-checking caveat
+    /// as `IsMouseButtonDown`.
+    IsMouseButtonReleased: struct { button: []const u8 = "" },
     /// `GetMouseX` — input reporter (labelle-gui#208 Option A). Pure value
     /// reporter (output pin `value: f32`, no exec pins, no payload).
     /// Lowers to the mixin method `game.getMouseX()` — the mouse cursor's

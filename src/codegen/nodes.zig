@@ -317,6 +317,27 @@ pub fn writeNodeBody(
             "    const n{d}_value = game.isKeyPressed(.{f});\n",
             .{ node.id, std.zig.fmtId(b.key) },
         ),
+        .IsKeyReleased => |b| try w.print(
+            "    const n{d}_value = game.isKeyReleased(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.key) },
+        ),
+        // The mouse-button reporters splice the `button` FIELD as a Zig ENUM
+        // LITERAL — `game.isMouseButtonDown(.<button>)` — so it infers to
+        // `MouseButton` without the generated module importing the enum.
+        // `std.zig.fmtId` wraps a keyword-named tag (`.@"…"`) exactly like
+        // the key reporters; Sema verifies the tag names a real member.
+        .IsMouseButtonDown => |b| try w.print(
+            "    const n{d}_value = game.isMouseButtonDown(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
+        .IsMouseButtonPressed => |b| try w.print(
+            "    const n{d}_value = game.isMouseButtonPressed(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
+        .IsMouseButtonReleased => |b| try w.print(
+            "    const n{d}_value = game.isMouseButtonReleased(.{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
         .GetMouseX => try w.print(
             "    const n{d}_value = game.getMouseX();\n",
             .{node.id},
