@@ -526,6 +526,39 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
         // Float-stringify reporter (flow-codegen#26). No per-kind payload —
         // its single `value` float input is a data edge.
         return .{ .FloatToString = .{} };
+    } else if (std.mem.eql(u8, type_name, "IsKeyDown")) {
+        // Input reporter (labelle-gui#208 Option A). `key` is the bare
+        // `KeyboardKey` enum-tag name (e.g. `"space"`, `"w"`); codegen
+        // emits it as a Zig enum literal `game.isKeyDown(.<key>)`. No
+        // data input pins — `key` is an inline FIELD, not a wire. Absent
+        // `key` defaults to `""` (rejected by `validate`).
+        return .{ .IsKeyDown = .{
+            .key = if (o.get("key")) |kv|
+                (if (kv == .string) try a.dupe(u8, kv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsKeyPressed")) {
+        // Rising-edge sibling of `IsKeyDown` (labelle-gui#208 Option A).
+        // Same enum-literal `key` field encoding.
+        return .{ .IsKeyPressed = .{
+            .key = if (o.get("key")) |kv|
+                (if (kv == .string) try a.dupe(u8, kv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "GetMouseX")) {
+        // Input reporter (labelle-gui#208 Option A). No per-kind payload,
+        // no input pins — lowers to `game.getMouseX()`.
+        return .{ .GetMouseX = .{} };
+    } else if (std.mem.eql(u8, type_name, "GetMouseY")) {
+        // Input reporter (labelle-gui#208 Option A). No per-kind payload,
+        // no input pins — lowers to `game.getMouseY()`.
+        return .{ .GetMouseY = .{} };
+    } else if (std.mem.eql(u8, type_name, "GetMouseWheel")) {
+        // Input reporter (labelle-gui#208 Option A). No per-kind payload,
+        // no input pins — lowers to `game.getMouseWheelMove()`.
+        return .{ .GetMouseWheel = .{} };
     } else if (std.mem.eql(u8, type_name, "ListAppend")) {
         // List ops (flow-codegen#24) reference a list by `collection`
         // name; their data inputs (`value`/`index`) are edges.

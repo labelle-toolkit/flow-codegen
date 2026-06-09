@@ -42,6 +42,10 @@ pub const CoercionTests = @import("coercion_test.zig").CoercionTests;
 /// `Format` / `Concat` / `IntToString` / `FloatToString`.
 pub const StringNodeTests = @import("string_nodes_test.zig").StringNodeTests;
 
+/// Input REPORTER nodes (labelle-gui#208 Option A): `IsKeyDown` /
+/// `IsKeyPressed` / `GetMouseX` / `GetMouseY` / `GetMouseWheel`.
+pub const InputReporterTests = @import("input_reporters_test.zig").InputReporterTests;
+
 /// Time exec-gate nodes (flow-codegen#47): `Once` / `Cooldown`.
 pub const TimeGateTests = @import("time_gate_test.zig").TimeGateTests;
 

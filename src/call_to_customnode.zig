@@ -384,6 +384,15 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .Concat => .{ .Concat = .{} },
         .IntToString => .{ .IntToString = .{} },
         .FloatToString => .{ .FloatToString = .{} },
+        // Input reporters (labelle-gui#208 Option A). The key-taking ones
+        // carry an inline `key` (the bare `KeyboardKey` enum-tag name) —
+        // dupe it like other string payloads. The mouse reporters are
+        // payload-free.
+        .IsKeyDown => |b| .{ .IsKeyDown = .{ .key = try a.dupe(u8, b.key) } },
+        .IsKeyPressed => |b| .{ .IsKeyPressed = .{ .key = try a.dupe(u8, b.key) } },
+        .GetMouseX => .{ .GetMouseX = .{} },
+        .GetMouseY => .{ .GetMouseY = .{} },
+        .GetMouseWheel => .{ .GetMouseWheel = .{} },
         // List operation nodes (flow-codegen#24) carry only the list
         // `collection` name — dupe it like other string payloads.
         .ListAppend => |b| .{ .ListAppend = .{ .collection = try a.dupe(u8, b.collection) } },

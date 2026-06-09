@@ -59,6 +59,16 @@ fn deepInlineNode(
         // Delay deferring a subflow wired from a param capture the param.
         .Param => |b| return try pins.sanitizeSymbol(alloc, b.param),
         .HasValueVariable => |b| return try std.fmt.allocPrint(alloc, "({s} != null)", .{b.name}),
+        // Input reporters (labelle-gui#208 Option A) — pure host-state
+        // reads that allocate nothing, so they re-emit the mixin call
+        // verbatim each iteration (a `While(cond = IsKeyDown("w"))` polls
+        // the held key every pass). `key` is spliced as a Zig enum literal
+        // so it infers to `KeyboardKey` without importing the enum.
+        .IsKeyDown => |b| return try std.fmt.allocPrint(alloc, "game.isKeyDown(.{f})", .{std.zig.fmtId(b.key)}),
+        .IsKeyPressed => |b| return try std.fmt.allocPrint(alloc, "game.isKeyPressed(.{f})", .{std.zig.fmtId(b.key)}),
+        .GetMouseX => return try alloc.dupe(u8, "game.getMouseX()"),
+        .GetMouseY => return try alloc.dupe(u8, "game.getMouseY()"),
+        .GetMouseWheel => return try alloc.dupe(u8, "game.getMouseWheelMove()"),
         // Binary/unary combinators — recurse into each operand so the
         // whole subtree recomputes. Unwired operands fall back to the
         // same per-kind defaults `writeNodeBody` uses.
@@ -131,6 +141,11 @@ fn deepInlineOperand(
 pub fn isInlinableKind(k: flow_io.NodeKind) bool {
     return switch (k) {
         .GetVariable, .Literal, .Identifier, .Param, .HasValueVariable, .BinOp, .Compare, .Logic => true,
+        // Input reporters (labelle-gui#208 Option A) are pure host-state
+        // leaves that allocate NOTHING — like `GetVariable`, they can be
+        // re-emitted in place, so a `While`/`Delay` re-reads live input
+        // each pass instead of freezing a once-bound value.
+        .IsKeyDown, .IsKeyPressed, .GetMouseX, .GetMouseY, .GetMouseWheel => true,
         // String reporters (`Format`/`Concat`/`IntToString`/`FloatToString`,
         // flow-codegen#26) are intentionally absent from this set: they
         // ALLOCATE via `game.allocator`, so they must bind to an
