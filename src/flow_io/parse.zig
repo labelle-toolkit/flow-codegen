@@ -128,8 +128,11 @@ pub fn buildFlow(
     };
 
     const event: Event = if (event_node_count >= 1)
+        // `first_event_node_name` is already owned by the arena — it was
+        // duped out of the JSON in `buildNodeKind`'s `reqStr` — so we
+        // reference it directly rather than re-dup it.
         .{ .OnEvent = .{
-            .name = try a.dupe(u8, first_event_node_name),
+            .name = first_event_node_name,
             .priority = null,
         } }
     else

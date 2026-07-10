@@ -449,7 +449,8 @@ fn renderEntryFunction(
 ///
 /// The v1 legacy form (`module` + `callback` + `params`) was removed
 /// in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13); a `.flow.jsonc` with
-/// the retired keys now fails to parse in `flow_io.buildEvent`.
+/// the retired keys now fails to parse in `flow_io.buildFlow`, which
+/// rejects any top-level `event:` header outright (flow-codegen#17).
 fn renderEventEntry(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
