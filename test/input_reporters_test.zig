@@ -12,6 +12,15 @@
 //!   GetMouseX                          → game.getMouseX()                    (f32)
 //!   GetMouseY                          → game.getMouseY()                    (f32)
 //!   GetMouseWheel                      → game.getMouseWheelMove()            (f32)
+//!   IsGamepadButtonDown { button }     → game.isGamepadButtonDown(0,.<b>)    (bool)
+//!   IsGamepadButtonPressed { button }  → game.isGamepadButtonPressed(0,.<b>) (bool)
+//!   IsGamepadButtonReleased { button } → game.isGamepadButtonReleased(0,.<b>)(bool)
+//!   GetGamepadAxisValue { axis }       → game.getGamepadAxisValue(0,.<a>)    (f32)
+//!
+//! The gamepad reporters (labelle-assembler#250 Phase 3) mirror the mouse
+//! reporters: `button`/`axis` is a bare `GamepadButton`/`GamepadAxis` enum
+//! tag spliced as a Zig enum literal; the leading `0` is the primary-
+//! controller gamepad slot (per-player selection is Phase 2, a #250 non-goal).
 //!
 //! The key/button reporters (labelle-gui#208) splice their FIELD as a Zig
 //! enum literal via `std.zig.fmtId` (so a keyword-named tag is wrapped
@@ -612,6 +621,226 @@ pub const InputReporterTests = struct {
     }
 
     // -----------------------------------------------------------------
+    // Gamepad reporters (labelle-assembler#250 Phase 3) — the analog/button
+    // gamepad complement to the key/mouse reporters. The button-taking ones
+    // (`IsGamepadButtonDown`/`Pressed`/`Released`) name a `GamepadButton`
+    // member; `GetGamepadAxisValue` names a `GamepadAxis` member. Each lowers
+    // to a GAME INPUT MIXIN call on the primary controller (gamepad slot 0),
+    // forwarding to labelle-core `InputInterface.{isGamepadButtonDown,
+    // getGamepadAxisValue}`. As with the key/mouse reporters AstGen can't
+    // verify the tag names a real enum member — Sema does, at game compile.
+    // -----------------------------------------------------------------
+
+    test "IsGamepadButtonDown lowers to game.isGamepadButtonDown(0, .<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsGamepadButtonDown", "right_face_down");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isGamepadButtonDown(0, .right_face_down);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "return n1_value;") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsGamepadButtonPressed lowers to game.isGamepadButtonPressed(0, .<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsGamepadButtonPressed", "left_trigger_1");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isGamepadButtonPressed(0, .left_trigger_1);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsGamepadButtonReleased lowers to game.isGamepadButtonReleased(0, .<button>)" {
+        const allocator = std.testing.allocator;
+        const out = try renderButtonReporter(allocator, "IsGamepadButtonReleased", "middle_right");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isGamepadButtonReleased(0, .middle_right);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "GetGamepadAxisValue lowers to game.getGamepadAxisValue(0, .<axis>) (f32)" {
+        const allocator = std.testing.allocator;
+        const out = try renderAxisReporter(allocator, "left_x", "f32");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.getGamepadAxisValue(0, .left_x);") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "a keyword-named gamepad button is escaped via @\"...\" (std.zig.fmtId, matching #51)" {
+        const allocator = std.testing.allocator;
+        // `error` is a Zig keyword — not a real GamepadButton member, but the
+        // codegen escaping (the path under test) must still wrap it so the
+        // generated source parses. The Sema check is deferred to game compile.
+        const out = try renderButtonReporter(allocator, "IsGamepadButtonDown", "error");
+        defer allocator.free(out);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "game.isGamepadButtonDown(0, .@\"error\");") != null);
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsGamepadButtonDown round-trips through write (button field)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "igbd_rt",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsGamepadButtonDown", "button": "right_face_down", "pos": [5, 6] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .IsGamepadButtonDown);
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.IsGamepadButtonDown.button, "right_face_down"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "GetGamepadAxisValue round-trips through write (axis field)" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "ggav_rt",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetGamepadAxisValue", "axis": "left_trigger", "pos": [7, 8] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const rendered = try flow_io.renderFlowJsonc(allocator, loaded);
+        defer allocator.free(rendered);
+        var roundtrip = try flow_io.parseFlow(allocator, rendered);
+        defer roundtrip.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.NodeKind), roundtrip.flow.nodes[0].kind), .GetGamepadAxisValue);
+        try expect.toBeTrue(std.mem.eql(u8, roundtrip.flow.nodes[0].kind.GetGamepadAxisValue.axis, "left_trigger"));
+
+        const rendered2 = try flow_io.renderFlowJsonc(allocator, roundtrip);
+        defer allocator.free(rendered2);
+        try expect.toBeTrue(std.mem.eql(u8, rendered, rendered2));
+    }
+
+    test "a gamepad-button reporter with an empty button is rejected at parse/validate" {
+        const allocator = std.testing.allocator;
+        // No `button` defaults to "" — not a plausible identifier, so the
+        // generated `.<button>` would be unparseable. Rejected by `validate`.
+        const src =
+            \\{
+            \\  "name": "igbd_empty",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsGamepadButtonDown", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "GetGamepadAxisValue with an empty axis is rejected at parse/validate" {
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "ggav_empty",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetGamepadAxisValue", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "a gamepad reporter with a non-identifier tag is rejected" {
+        const allocator = std.testing.allocator;
+        // `1axis` starts with a digit — not a Zig identifier.
+        const src =
+            \\{
+            \\  "name": "ggav_bad",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetGamepadAxisValue", "axis": "1axis", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": []
+            \\}
+        ;
+        try std.testing.expectError(error.MalformedFlow, flow_io.parseFlow(allocator, src));
+    }
+
+    test "GetGamepadAxisValue feeding a Compare reads through its binding" {
+        const allocator = std.testing.allocator;
+        // GetGamepadAxisValue(left_x) > 0.5 → bool. Proves the f32 axis
+        // reporter is usable as a Compare operand (the stick-deadzone shape).
+        const src =
+            \\{
+            \\  "name": "ggav_cmp",
+            \\  "nodes": [
+            \\    { "id": 1, "type": "GetGamepadAxisValue", "axis": "left_x", "pos": [0, 0] },
+            \\    { "id": 2, "type": "Literal", "value": "0.5", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Compare", "op": "gt", "pos": [0, 0] },
+            \\    { "id": 4, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 3, "pin": "a" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+            \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "ggav_cmp" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.getGamepadAxisValue(0, .left_x);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "n1_value > ") != null);
+
+        try expectAstGenOk(allocator, out);
+    }
+
+    test "IsGamepadButtonDown feeding a While cond is re-inlined verbatim (pure leaf)" {
+        const allocator = std.testing.allocator;
+        // A gamepad-button reporter is in the inlinable-leaf set, so a `While`
+        // cond re-reads the live button each pass — the mixin call is spliced
+        // into the `while (...)` header, NOT frozen as `n<id>_value`.
+        const src =
+            \\{
+            \\  "name": "igbd_while",
+            \\  "variables": [
+            \\    { "name": "ticks", "type": "i32", "default": 0 }
+            \\  ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "IsGamepadButtonDown", "button": "right_face_down", "pos": [0, 0] },
+            \\    { "id": 2, "type": "While", "pos": [0, 0] },
+            \\    { "id": 3, "type": "ChangeVariable", "name": "ticks", "by": "1", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "cond" } }
+            \\  ],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 2, "pin": "body" }, "to": { "node": 3 } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        const out = try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "igbd_while" });
+        defer allocator.free(out);
+
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "while (game.isGamepadButtonDown(0, .right_face_down))") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = game.isGamepadButtonDown") == null);
+
+        try expectAstGenOk(allocator, out);
+    }
+
+    // -----------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------
 
@@ -660,6 +889,32 @@ pub const InputReporterTests = struct {
             \\  ]
             \\}}
         , .{ type_name, button });
+        defer allocator.free(src);
+
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        return try flow_codegen.renderFlowZig(allocator, loaded.flow, .{ .flow_name = "single" });
+    }
+
+    /// Render an `axis`-taking reporter (`GetGamepadAxisValue`) wired into an
+    /// `Output` of `value_type` (`f32`).
+    fn renderAxisReporter(
+        allocator: std.mem.Allocator,
+        axis: []const u8,
+        value_type: []const u8,
+    ) ![]const u8 {
+        const src = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "name": "single",
+            \\  "nodes": [
+            \\    {{ "id": 1, "type": "GetGamepadAxisValue", "axis": "{s}", "pos": [0, 0] }},
+            \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "{s}", "pos": [0, 0] }}
+            \\  ],
+            \\  "edges": [
+            \\    {{ "from": {{ "node": 1, "pin": "value" }}, "to": {{ "node": 2, "pin": "value" }} }}
+            \\  ]
+            \\}}
+        , .{ axis, value_type });
         defer allocator.free(src);
 
         var loaded = try flow_io.parseFlow(allocator, src);

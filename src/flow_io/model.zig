@@ -465,6 +465,53 @@ pub const NodeKind = union(enum) {
     /// Lowers to the mixin method `game.getMouseWheelMove()` — the mouse
     /// wheel delta for the current frame (positive = forward/up).
     GetMouseWheel: struct {},
+    /// `IsGamepadButtonDown` — gamepad input reporter (labelle-assembler#250
+    /// Phase 3, the held-state complement to the gamepad EVENT nodes and the
+    /// direct analogue of `IsKeyDown`/`IsMouseButtonDown`). Pure value
+    /// reporter (output pin `value: bool`, no exec pins). Lowers to the GAME
+    /// INPUT MIXIN method `game.isGamepadButtonDown(0, .<button>)`, which
+    /// forwards to the labelle-core `InputInterface.isGamepadButtonDown`
+    /// (`labelle-core/src/input.zig`).
+    ///
+    /// `button` is the BARE enum-tag name of a `GamepadButton` (e.g.
+    /// `"right_face_down"`, `"left_trigger_1"`) — NOT a wired pin. Codegen
+    /// emits it as a Zig ENUM LITERAL — `game.isGamepadButtonDown(0,
+    /// .<button>)` — via `std.zig.fmtId`, so it infers to `GamepadButton`
+    /// without the generated module importing the enum (mirrors how
+    /// `IsMouseButtonDown` encodes `button`). The leading `0` is the gamepad
+    /// slot: Phase 3 targets the primary controller; per-player selection is
+    /// Phase 2 (player mapping), a non-goal of #250. `validate` checks the
+    /// tag is non-empty and a plausible Zig identifier; AstGen CANNOT verify
+    /// the tag is a real `GamepadButton` member — Sema does, at game compile.
+    IsGamepadButtonDown: struct { button: []const u8 = "" },
+    /// `IsGamepadButtonPressed` — gamepad input reporter (labelle-assembler
+    /// #250). The rising-edge sibling of `IsGamepadButtonDown`: true only on
+    /// the frame the button transitions to down. Output pin `value: bool`, no
+    /// exec pins. Lowers to `game.isGamepadButtonPressed(0, .<button>)`. Same
+    /// enum-literal `button` encoding, validation, and Sema-deferred
+    /// tag-checking caveat as `IsGamepadButtonDown`.
+    IsGamepadButtonPressed: struct { button: []const u8 = "" },
+    /// `IsGamepadButtonReleased` — gamepad input reporter (labelle-assembler
+    /// #250). The falling-edge sibling of `IsGamepadButtonDown`: true only on
+    /// the frame the button transitions to up. Output pin `value: bool`, no
+    /// exec pins. Lowers to `game.isGamepadButtonReleased(0, .<button>)`. Same
+    /// enum-literal `button` encoding, validation, and Sema-deferred
+    /// tag-checking caveat as `IsGamepadButtonDown`.
+    IsGamepadButtonReleased: struct { button: []const u8 = "" },
+    /// `GetGamepadAxisValue` — gamepad input reporter (labelle-assembler#250
+    /// Phase 3). Pure value reporter (output pin `value: f32`, no exec pins)
+    /// reading a live analog axis (stick/trigger) for the current frame.
+    /// Lowers to the GAME INPUT MIXIN method `game.getGamepadAxisValue(0,
+    /// .<axis>)`, which forwards to the labelle-core
+    /// `InputInterface.getGamepadAxisValue`.
+    ///
+    /// `axis` is the BARE enum-tag name of a `GamepadAxis` (e.g. `"left_x"`,
+    /// `"right_y"`, `"left_trigger"`) — NOT a wired pin. Codegen emits it as
+    /// a Zig ENUM LITERAL — `game.getGamepadAxisValue(0, .<axis>)` — via
+    /// `std.zig.fmtId`, so it infers to `GamepadAxis` without the generated
+    /// module importing the enum. Same gamepad-slot (`0`), validation, and
+    /// Sema-deferred tag-checking caveat as `IsGamepadButtonDown`.
+    GetGamepadAxisValue: struct { axis: []const u8 = "" },
     /// `ListAppend` — command (flow-codegen#24). Appends the wired
     /// `value` data input to the named growable list. Lowers to
     /// `<name>.append(game.allocator, <value>) catch {};`.

@@ -236,6 +236,16 @@ pub fn validate(flow: Flow) ParseError!void {
             .IsMouseButtonPressed => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
             .IsMouseButtonReleased => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
             .GetMouseX, .GetMouseY, .GetMouseWheel => {},
+            // Gamepad reporters (labelle-assembler#250 Phase 3) carry a
+            // `button`/`axis` FIELD (the bare `GamepadButton`/`GamepadAxis`
+            // enum-tag name) — codegen emits it as a Zig enum literal
+            // `game.isGamepadButtonDown(0, .<button>)`, so it must be
+            // non-empty and a plausible Zig identifier. Same Sema-deferred
+            // tag-checking caveat as the key/mouse reporters.
+            .IsGamepadButtonDown => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
+            .IsGamepadButtonPressed => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
+            .IsGamepadButtonReleased => |b| if (!isPlausibleIdent(b.button)) return error.MalformedFlow,
+            .GetGamepadAxisValue => |b| if (!isPlausibleIdent(b.axis)) return error.MalformedFlow,
             else => {},
         }
     }
