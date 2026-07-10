@@ -1,6 +1,5 @@
 {
   "name": "uses_call",
-  "event": { "type": "OnCall" },
   "nodes": [
     { "id": 1, "type": "Call", "callee": "box2d.applyImpulse", "pos": [120, 40] }
   ],

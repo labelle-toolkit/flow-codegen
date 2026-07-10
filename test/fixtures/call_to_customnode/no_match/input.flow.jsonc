@@ -1,6 +1,5 @@
 {
   "name": "uses_std",
-  "event": { "type": "OnCall" },
   "nodes": [
     { "id": 1, "type": "Call", "callee": "std.math.sin", "pos": [60, 20] }
   ],

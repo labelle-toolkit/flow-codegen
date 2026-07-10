@@ -30,7 +30,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "uses_custom",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [120, 40] }
             \\  ],
@@ -59,7 +58,6 @@ pub const CustomNodeTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "CustomNode", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -75,7 +73,6 @@ pub const CustomNodeTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "CustomNode", "name": "", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -90,7 +87,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "reporter_use",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
@@ -129,7 +125,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "command_use",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
             \\    { "id": 2, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
@@ -167,7 +162,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "unknown_use",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "CustomNode", "name": "nonexistent.thing", "pos": [0, 0] }
             \\  ],
@@ -198,7 +192,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "no_reg",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
             \\  ],
@@ -268,7 +261,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "chain",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "CustomNode", "name": "my_helpers.score", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -315,7 +307,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "unused_reporter",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "CustomNode", "name": "my_helpers.score", "pos": [0, 0] }
             \\  ],
@@ -354,7 +345,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "fallible_command",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
             \\    { "id": 2, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
@@ -402,7 +392,6 @@ pub const CustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "fallible_reporter",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
             \\    { "id": 2, "type": "CustomNode", "name": "my_helpers.roll", "pos": [0, 0] },

@@ -812,7 +812,7 @@ fn emitGate(
 /// deinit; the trampoline never frees it. The `entity` argument is `?EntityId`
 /// — bound to the flow's in-scope entity when it has one (so the Delay
 /// auto-cancels if that entity dies before firing). Post-Phase 6 flows have
-/// NO lifecycle `entity` identifier in scope (`OnCall`/`OnEvent`/subgraph all
+/// NO lifecycle `entity` identifier in scope (`.subgraph`/`OnEvent` both
 /// reach entities only through wired pins), so it is `null` here; an
 /// entity-bound Delay is a future enhancement once a flow surfaces "the
 /// entity" again.

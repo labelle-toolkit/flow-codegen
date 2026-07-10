@@ -86,7 +86,6 @@ pub const FlowIoTests = struct {
         const src =
             \\{
             \\  "name": "combat",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [
             \\    { "name": "damage", "type": "f32", "default": 10.0 }
             \\  ],
@@ -103,7 +102,7 @@ pub const FlowIoTests = struct {
         defer loaded.deinit();
 
         try expect.toBeTrue(std.mem.eql(u8, loaded.flow.name, "combat"));
-        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .OnCall);
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .subgraph);
         try expect.equal(loaded.flow.params.len, 1);
         try expect.toBeTrue(std.mem.eql(u8, loaded.flow.params[0].name, "damage"));
         try expect.toBeTrue(std.mem.eql(u8, loaded.flow.params[0].type, "f32"));
@@ -226,7 +225,6 @@ pub const FlowIoTests = struct {
         const src =
             \\{
             \\  "name": "emitter",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Emit", "event": "my_game.player_attacked", "pos": [400, 200] }
             \\  ],
@@ -255,7 +253,6 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Emit", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -350,7 +347,6 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "x", "type": "f32" } ],
             \\  "nodes": [ { "id": 1, "type": "Param", "param": "y", "pos": [0, 0] } ],
             \\  "edges": []
@@ -363,7 +359,6 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Output", "name": "r", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "r", "pos": [0, 0] }
@@ -378,7 +373,6 @@ pub const FlowIoTests = struct {
         const allocator = std.testing.allocator;
         const src =
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "params": [
             \\    { "name": "x", "type": "f32" },
             \\    { "name": "x", "type": "i32" }
@@ -452,7 +446,6 @@ pub const FlowIoTests = struct {
         const src =
             \\{
             \\  "name": "lit",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "label", "type": "[]const u8", "default": "hi \"there\"" } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "\"a\\tb\"", "pos": [0, 0] }
