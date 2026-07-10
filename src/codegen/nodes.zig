@@ -371,6 +371,20 @@ pub fn writeNodeBody(
         // returning impl binds the result to `n<id>_value` so downstream
         // pins can wire from it. The `kind` override on the FlowNode
         // factory is editor-side metadata; codegen ignores it.
+        //
+        // Fallible impls (flow-codegen#27). A plugin `impl` is commonly
+        // fallible — `!void` for a command, `!T` for a reporter. Its return
+        // type is opaque to flow-codegen (a pure text generator working off
+        // a string registry), so the error policy is applied by comptime
+        // adapters emitted into the generated file (`__flowCommand` /
+        // `__flowReport`, see `emitFallibleFlowNodeHelpers`): a command logs
+        // the error and continues (best-effort, matching the `ListAppend`
+        // `catch {}` precedent); a reporter fails fast, since a missing value
+        // can't be fed downstream. A non-fallible `impl` passes straight
+        // through — the error branch is comptime-eliminated, so the adapter
+        // is zero-cost. Routing through the adapter (rather than deciding at
+        // codegen time) is what lets flow-codegen support fallible nodes
+        // without an assembler-supplied `is_fallible` flag.
         .CustomNode => |b| {
             const reg = ctx.custom_nodes orelse return error.UnknownFlowNode;
             const entry = reg.get(b.name) orelse return error.UnknownFlowNode;
@@ -380,16 +394,18 @@ pub fn writeNodeBody(
             // `PluginFlowNodes.<q>` is a FlowNode *value*; `value.impl(game, …)`
             // would trip Zig's method-call syntax and bind the value as impl's
             // first parameter (`game`), shifting every real arg. `@TypeOf(...)`
-            // gives the FlowNodeReturn struct type, so `Type.impl(game, …)` is a
-            // plain namespaced call with no receiver to bind (flow-codegen#28).
+            // gives the FlowNodeReturn struct type, so `Type.impl` is a plain
+            // namespaced decl reference (flow-codegen#28). The reference (not a
+            // call) is handed to the adapter, which invokes it via `@call`
+            // with the positional args gathered into a tuple.
             if (entry.is_void) {
                 try w.print(
-                    "    @TypeOf(game_mod.PluginFlowNodes.{s}).impl(game",
+                    "    __flowCommand(@TypeOf(game_mod.PluginFlowNodes.{s}).impl, .{{ game",
                     .{entry.qualified},
                 );
             } else {
                 try w.print(
-                    "    const n{d}_value = @TypeOf(game_mod.PluginFlowNodes.{s}).impl(game",
+                    "    const n{d}_value = __flowReport(@TypeOf(game_mod.PluginFlowNodes.{s}).impl, .{{ game",
                     .{ node.id, entry.qualified },
                 );
             }
@@ -402,7 +418,7 @@ pub fn writeNodeBody(
                     try scratch.dupe(u8, "undefined");
                 try w.writeAll(expr);
             }
-            try w.writeAll(");\n");
+            try w.writeAll(" });\n");
         },
         // A Subflow node lowers to a *call* of the referenced flow's
         // generated function (RFC §6). Each param argument is supplied

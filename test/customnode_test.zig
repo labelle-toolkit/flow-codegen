@@ -119,7 +119,7 @@ pub const CustomNodeTests = struct {
 
         // Reporter shape: binds result to `n3_value`, qualified decl
         // path, both arg pins resolve to their wired producers.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game, n1_value, n2_value);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_value = __flowReport(@TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl, .{ game, n1_value, n2_value });") != null);
     }
 
     test "codegen lowers a void-returning CustomNode (command form)" {
@@ -154,8 +154,9 @@ pub const CustomNodeTests = struct {
         );
         defer allocator.free(out);
 
-        // Command shape: bare statement (no `const n2_value =` binding).
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "@TypeOf(game_mod.PluginFlowNodes.box2d__apply_impulse).impl(game, n1_value);") != null);
+        // Command shape: bare statement (no `const n2_value =` binding),
+        // routed through the `__flowCommand` error-policy adapter (#27).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "__flowCommand(@TypeOf(game_mod.PluginFlowNodes.box2d__apply_impulse).impl, .{ game, n1_value });") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value =") == null);
         // No discard line — there is no `n2_value` to discard.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n2_value;") == null);
@@ -247,8 +248,8 @@ pub const CustomNodeTests = struct {
         // The handler struct + dispatch method are emitted as usual.
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub const FlowEventHandler = struct") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "pub fn box2d__collision_begin(self: *@This()") != null);
-        // The void CustomNode body — bare statement, no result binding.
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "@TypeOf(game_mod.PluginFlowNodes.my_helpers__log_it).impl(game);") != null);
+        // The void CustomNode body — command adapter, no result binding.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "__flowCommand(@TypeOf(game_mod.PluginFlowNodes.my_helpers__log_it).impl, .{ game });") != null);
 
         const z = try allocator.allocSentinel(u8, out.len, 0);
         defer allocator.free(z);
@@ -294,7 +295,7 @@ pub const CustomNodeTests = struct {
         );
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = __flowReport(@TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl, .{ game });") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "const n3_result = n1_value + n2_value;") != null);
     }
 
@@ -336,7 +337,108 @@ pub const CustomNodeTests = struct {
         );
         defer allocator.free(out);
 
-        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = @TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl(game);") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n1_value = __flowReport(@TypeOf(game_mod.PluginFlowNodes.my_helpers__score).impl, .{ game });") != null);
         try expect.toBeTrue(std.mem.indexOf(u8, out, "_ = n1_value;") != null);
+    }
+
+    test "fallible !void command lowers through the __flowCommand adapter" {
+        // flow-codegen#27 — a plugin command `impl` commonly returns
+        // `!void`. flow-codegen can't see the return type (it works off a
+        // string registry), so a `void`-classified CustomNode is lowered
+        // through the `__flowCommand` comptime adapter, which applies the
+        // best-effort log-and-continue policy iff the impl is fallible and
+        // otherwise calls it directly (the error branch is comptime-
+        // eliminated). Emitting a bare `impl(game, …);` instead would be a
+        // raw "unhandled error union" Zig compile error for a `!void` impl.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fallible_command",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
+            \\    { "id": 2, "type": "CustomNode", "name": "box2d.apply_impulse", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "box2d.apply_impulse", .qualified = "box2d__apply_impulse", .is_void = true },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "fallible_command", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        // The call routes through the command adapter (no result binding).
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "__flowCommand(@TypeOf(game_mod.PluginFlowNodes.box2d__apply_impulse).impl, .{ game, n1_value });") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value =") == null);
+        // The adapter is emitted, with the best-effort log-and-continue
+        // policy for the fallible branch.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "inline fn __flowCommand(comptime f: anytype, args: anytype) void {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "@call(.auto, f, args) catch |__err|") != null);
+        // The whole generated file (adapters + call site) is valid Zig
+        // through AstGen, not merely parseable.
+        try helpers.expectAstGenOk(allocator, out);
+    }
+
+    test "fallible !T reporter lowers through the __flowReport adapter" {
+        // flow-codegen#27 — a reporter `impl` returning `!T` binds an error
+        // union to `n<id>_value`; downstream pins can't consume `!T` and an
+        // unwrapped error union won't compile. The `__flowReport` adapter
+        // applies the fail-fast unwrap policy (a missing value can't feed
+        // downstream pins) so the reporter compiles under a defined policy;
+        // its return type (`__FlowNodePayload`) is the error union's payload.
+        const allocator = std.testing.allocator;
+        const src =
+            \\{
+            \\  "name": "fallible_reporter",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
+            \\    { "id": 2, "type": "CustomNode", "name": "my_helpers.roll", "pos": [0, 0] },
+            \\    { "id": 3, "type": "Literal", "value": 1, "pos": [0, 0] },
+            \\    { "id": 4, "type": "BinOp", "op": "add", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } },
+            \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 4, "pin": "a" } },
+            \\    { "from": { "node": 3, "pin": "value" }, "to": { "node": 4, "pin": "b" } }
+            \\  ]
+            \\}
+        ;
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+
+        var reg = try buildRegistry(allocator, &.{
+            .{ .dotted = "my_helpers.roll", .qualified = "my_helpers__roll", .is_void = false },
+        });
+        defer reg.deinit();
+
+        const out = try flow_codegen.renderFlowZig(
+            allocator,
+            loaded.flow,
+            .{ .flow_name = "fallible_reporter", .custom_nodes = &reg },
+        );
+        defer allocator.free(out);
+
+        // The reporter binds the adapter's unwrapped result and chains into
+        // the downstream BinOp — proving the value is a plain `T`, not `!T`.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n2_value = __flowReport(@TypeOf(game_mod.PluginFlowNodes.my_helpers__roll).impl, .{ game, n1_value });") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "const n4_result = n2_value + n3_value;") != null);
+        // The reporter adapter + its payload-type helper are emitted with
+        // the fail-fast unwrap policy.
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "inline fn __flowReport(comptime f: anytype, args: anytype) __FlowNodePayload(f) {") != null);
+        try expect.toBeTrue(std.mem.indexOf(u8, out, "std.debug.panic(\"flow reporter node failed") != null);
+        try helpers.expectAstGenOk(allocator, out);
     }
 };
