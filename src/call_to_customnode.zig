@@ -397,6 +397,13 @@ fn cloneNode(a: std.mem.Allocator, n: flow_io.Node) !flow_io.Node {
         .GetMouseX => .{ .GetMouseX = .{} },
         .GetMouseY => .{ .GetMouseY = .{} },
         .GetMouseWheel => .{ .GetMouseWheel = .{} },
+        // Gamepad reporters (labelle-assembler#250 Phase 3) carry an inline
+        // `button`/`axis` (the bare `GamepadButton`/`GamepadAxis` enum-tag
+        // name) — dupe it like other string payloads.
+        .IsGamepadButtonDown => |b| .{ .IsGamepadButtonDown = .{ .button = try a.dupe(u8, b.button) } },
+        .IsGamepadButtonPressed => |b| .{ .IsGamepadButtonPressed = .{ .button = try a.dupe(u8, b.button) } },
+        .IsGamepadButtonReleased => |b| .{ .IsGamepadButtonReleased = .{ .button = try a.dupe(u8, b.button) } },
+        .GetGamepadAxisValue => |b| .{ .GetGamepadAxisValue = .{ .axis = try a.dupe(u8, b.axis) } },
         // List operation nodes (flow-codegen#24) carry only the list
         // `collection` name — dupe it like other string payloads.
         .ListAppend => |b| .{ .ListAppend = .{ .collection = try a.dupe(u8, b.collection) } },

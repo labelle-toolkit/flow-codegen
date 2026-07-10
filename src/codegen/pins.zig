@@ -56,6 +56,10 @@ pub fn primaryOutputPin(k: flow_io.NodeKind) []const u8 {
         // the mouse reporters are `f32`. Unlike the string reporters they
         // allocate nothing, so they ARE in `inline.zig`'s inlinable set.
         .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => "value",
+        // Gamepad reporters (labelle-assembler#250 Phase 3) each bind their
+        // host-input read to an `n<id>_value`. `IsGamepadButton*` are `bool`;
+        // `GetGamepadAxisValue` is `f32`. Pure leaves, so also inlinable.
+        .IsGamepadButtonDown, .IsGamepadButtonPressed, .IsGamepadButtonReleased, .GetGamepadAxisValue => "value",
         // `CustomNode` is the plugin-declared verb (RFC-FLOW-VOCABULARY
         // §1 + §5). When the impl returns a value, the binding name is
         // `n<id>_value` (matching the reporter naming convention shared
@@ -223,6 +227,10 @@ pub fn isInputPin(k: flow_io.NodeKind, pin: []const u8) bool {
         // key-taking ones), not a wire; the mouse reporters take nothing.
         // Their sole pin is the `value` OUTPUT.
         .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => false,
+        // Gamepad reporters (labelle-assembler#250) consume NO data input
+        // pins — their `button`/`axis` is an inline FIELD, not a wire; their
+        // sole pin is the `value` OUTPUT.
+        .IsGamepadButtonDown, .IsGamepadButtonPressed, .IsGamepadButtonReleased, .GetGamepadAxisValue => false,
         // `Once`/`Cooldown` (flow-codegen#47) consume NO data inputs — their
         // `body` is an exec output wired via `exec_edges`, and their gate
         // state is a per-node `pub var`, not a wired pin.

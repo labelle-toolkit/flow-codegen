@@ -45,6 +45,9 @@ pub const StringNodeTests = @import("string_nodes_test.zig").StringNodeTests;
 /// Input REPORTER nodes (labelle-gui#208): `IsKeyDown` / `IsKeyPressed` /
 /// `IsKeyReleased` / `IsMouseButtonDown` / `IsMouseButtonPressed` /
 /// `IsMouseButtonReleased` / `GetMouseX` / `GetMouseY` / `GetMouseWheel`.
+/// Plus the gamepad reporters (labelle-assembler#250 Phase 3):
+/// `IsGamepadButtonDown` / `IsGamepadButtonPressed` /
+/// `IsGamepadButtonReleased` / `GetGamepadAxisValue`.
 pub const InputReporterTests = @import("input_reporters_test.zig").InputReporterTests;
 
 /// Time exec-gate nodes (flow-codegen#47): `Once` / `Cooldown`.

@@ -350,6 +350,30 @@ pub fn writeNodeBody(
             "    const n{d}_value = game.getMouseWheelMove();\n",
             .{node.id},
         ),
+        // Gamepad reporters (labelle-assembler#250 Phase 3) — splice the
+        // `button`/`axis` FIELD as a Zig ENUM LITERAL, `game.isGamepadButton
+        // Down(0, .<button>)`, so it infers to `GamepadButton`/`GamepadAxis`
+        // without the generated module importing the enum (mirrors the
+        // mouse-button reporters). `std.zig.fmtId` wraps a keyword-named tag
+        // (`.@"…"`); Sema verifies the tag names a real member at game
+        // compile. The leading `0` is the primary-controller gamepad slot
+        // (per-player selection is Phase 2, a non-goal of #250).
+        .IsGamepadButtonDown => |b| try w.print(
+            "    const n{d}_value = game.isGamepadButtonDown(0, .{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
+        .IsGamepadButtonPressed => |b| try w.print(
+            "    const n{d}_value = game.isGamepadButtonPressed(0, .{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
+        .IsGamepadButtonReleased => |b| try w.print(
+            "    const n{d}_value = game.isGamepadButtonReleased(0, .{f});\n",
+            .{ node.id, std.zig.fmtId(b.button) },
+        ),
+        .GetGamepadAxisValue => |b| try w.print(
+            "    const n{d}_value = game.getGamepadAxisValue(0, .{f});\n",
+            .{ node.id, std.zig.fmtId(b.axis) },
+        ),
         // `CustomNode` lowers to a call against the assembler-emitted
         // `game_mod.PluginFlowNodes.<qualified>.impl` (RFC-FLOW-VOCABULARY
         // §1 + §5). The dotted name on the node maps to the qualified

@@ -73,6 +73,13 @@ fn deepInlineNode(
         .GetMouseX => return try alloc.dupe(u8, "game.getMouseX()"),
         .GetMouseY => return try alloc.dupe(u8, "game.getMouseY()"),
         .GetMouseWheel => return try alloc.dupe(u8, "game.getMouseWheelMove()"),
+        // Gamepad reporters (labelle-assembler#250) are pure host-state
+        // leaves too — re-emit the mixin call verbatim each iteration, with
+        // the `button`/`axis` spliced as a Zig enum literal.
+        .IsGamepadButtonDown => |b| return try std.fmt.allocPrint(alloc, "game.isGamepadButtonDown(0, .{f})", .{std.zig.fmtId(b.button)}),
+        .IsGamepadButtonPressed => |b| return try std.fmt.allocPrint(alloc, "game.isGamepadButtonPressed(0, .{f})", .{std.zig.fmtId(b.button)}),
+        .IsGamepadButtonReleased => |b| return try std.fmt.allocPrint(alloc, "game.isGamepadButtonReleased(0, .{f})", .{std.zig.fmtId(b.button)}),
+        .GetGamepadAxisValue => |b| return try std.fmt.allocPrint(alloc, "game.getGamepadAxisValue(0, .{f})", .{std.zig.fmtId(b.axis)}),
         // Binary/unary combinators — recurse into each operand so the
         // whole subtree recomputes. Unwired operands fall back to the
         // same per-kind defaults `writeNodeBody` uses.
@@ -150,6 +157,10 @@ pub fn isInlinableKind(k: flow_io.NodeKind) bool {
         // re-emitted in place, so a `While`/`Delay` re-reads live input
         // each pass instead of freezing a once-bound value.
         .IsKeyDown, .IsKeyPressed, .IsKeyReleased, .IsMouseButtonDown, .IsMouseButtonPressed, .IsMouseButtonReleased, .GetMouseX, .GetMouseY, .GetMouseWheel => true,
+        // Gamepad reporters (labelle-assembler#250) are pure host-state
+        // leaves like the key/mouse reporters — inlinable, so a `While`/
+        // `Delay` re-reads live gamepad state each pass.
+        .IsGamepadButtonDown, .IsGamepadButtonPressed, .IsGamepadButtonReleased, .GetGamepadAxisValue => true,
         // String reporters (`Format`/`Concat`/`IntToString`/`FloatToString`,
         // flow-codegen#26) are intentionally absent from this set: they
         // ALLOCATE via `game.allocator`, so they must bind to an

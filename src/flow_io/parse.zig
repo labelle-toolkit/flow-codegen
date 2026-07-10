@@ -567,6 +567,51 @@ pub fn buildNodeKind(a: std.mem.Allocator, type_name: []const u8, o: std.json.Ob
             else
                 "",
         } };
+    } else if (std.mem.eql(u8, type_name, "IsGamepadButtonDown")) {
+        // Gamepad input reporter (labelle-assembler#250 Phase 3). `button`
+        // is the bare `GamepadButton` enum-tag name (e.g.
+        // `"right_face_down"`); codegen emits it as a Zig enum literal
+        // `game.isGamepadButtonDown(0, .<button>)`. No data input pins —
+        // `button` is an inline FIELD, not a wire. Absent `button` defaults
+        // to `""` (rejected by `validate`). Same encoding as
+        // `IsMouseButtonDown`.
+        return .{ .IsGamepadButtonDown = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsGamepadButtonPressed")) {
+        // Rising-edge sibling of `IsGamepadButtonDown` (labelle-assembler
+        // #250). Same enum-literal `button` field encoding.
+        return .{ .IsGamepadButtonPressed = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "IsGamepadButtonReleased")) {
+        // Falling-edge sibling of `IsGamepadButtonDown` (labelle-assembler
+        // #250). Same enum-literal `button` field encoding.
+        return .{ .IsGamepadButtonReleased = .{
+            .button = if (o.get("button")) |bv|
+                (if (bv == .string) try a.dupe(u8, bv.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
+    } else if (std.mem.eql(u8, type_name, "GetGamepadAxisValue")) {
+        // Gamepad analog-axis reporter (labelle-assembler#250 Phase 3).
+        // `axis` is the bare `GamepadAxis` enum-tag name (e.g. `"left_x"`);
+        // codegen emits it as a Zig enum literal
+        // `game.getGamepadAxisValue(0, .<axis>)`. No data input pins —
+        // `axis` is an inline FIELD, not a wire. Absent `axis` defaults to
+        // `""` (rejected by `validate`).
+        return .{ .GetGamepadAxisValue = .{
+            .axis = if (o.get("axis")) |av|
+                (if (av == .string) try a.dupe(u8, av.string) else return error.MalformedFlow)
+            else
+                "",
+        } };
     } else if (std.mem.eql(u8, type_name, "GetMouseX")) {
         // Input reporter (labelle-gui#208 Option A). No per-kind payload,
         // no input pins — lowers to `game.getMouseX()`.

@@ -404,6 +404,29 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"button\": ");
             try writeJsonString(w, b.button);
         },
+        // `IsGamepadButtonDown`/`Pressed`/`Released` (labelle-assembler#250)
+        // carry only their inline `button` (the bare `GamepadButton`
+        // enum-tag name); the node has no input pins. Emit `button` like the
+        // mouse reporters so the round-trip stays byte-deterministic.
+        .IsGamepadButtonDown => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
+        .IsGamepadButtonPressed => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
+        .IsGamepadButtonReleased => |b| {
+            try w.writeAll(", \"button\": ");
+            try writeJsonString(w, b.button);
+        },
+        // `GetGamepadAxisValue` (labelle-assembler#250) carries only its
+        // inline `axis` (the bare `GamepadAxis` enum-tag name); the node has
+        // no input pins. Emit `axis` so the round-trip stays deterministic.
+        .GetGamepadAxisValue => |b| {
+            try w.writeAll(", \"axis\": ");
+            try writeJsonString(w, b.axis);
+        },
         // `Cooldown` (flow-codegen#47) carries only its inline `seconds`
         // duration (an `f64`); its `body` target is an exec edge. Emit
         // `seconds` with `{d}` so the round-trip stays byte-deterministic
