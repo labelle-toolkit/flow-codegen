@@ -226,6 +226,28 @@ pub fn renderFlowFile(
         if (emitted_any) try w.writeAll("\n");
     }
 
+    // Fallible-FlowNode error-policy adapters (flow-codegen#27). Emit the
+    // `__flowCommand` / `__flowReport` comptime helpers only when this file
+    // actually lowers a `CustomNode` (any command or reporter) — the
+    // lowering routes every plugin `impl` call through them so an error
+    // union in the impl compiles under a defined policy instead of tripping
+    // a raw Zig "unhandled error" compile error.
+    {
+        var needs_helpers = false;
+        var flow_idx: usize = 0;
+        while (flow_idx <= subgraphs.items.len) : (flow_idx += 1) {
+            const f = if (flow_idx == 0) entry else subgraphs.items[flow_idx - 1];
+            for (f.nodes) |n| {
+                if (n.kind == .CustomNode) {
+                    needs_helpers = true;
+                    break;
+                }
+            }
+            if (needs_helpers) break;
+        }
+        if (needs_helpers) try emitFallibleFlowNodeHelpers(w);
+    }
+
     // Entry flow → its event `pub fn`.
     try renderEntryFunction(allocator, w, entry, registry, options.custom_nodes, options.flow_name);
 
@@ -257,6 +279,55 @@ fn collectSubgraphs(
         try out.append(allocator, ref);
         try collectSubgraphs(allocator, registry, ref, out, seen);
     }
+}
+
+/// Emit the comptime error-policy adapters a fallible `CustomNode`
+/// lowering routes through (flow-codegen#27). flow-codegen can't see the
+/// impl's return type (it works off a string registry), so the fallible/
+/// non-fallible decision is deferred to the generated file's own compile
+/// via these adapters:
+///
+///   * `__flowCommand` — a `!void` command's error is logged and swallowed
+///     (best-effort, mirroring the `ListAppend` `catch {}` precedent); a
+///     plain `void` impl is called directly (the error branch is
+///     comptime-eliminated).
+///   * `__flowReport` — a `!T` reporter fails fast (`std.debug.panic`):
+///     there is no value to feed the downstream pins, and the generated
+///     handlers are not fallible, so `try`-propagation isn't available. A
+///     plain `T` impl is called directly. `__FlowNodePayload` computes the
+///     helper's return type — the error union's payload, or the type itself.
+///
+/// The `__` prefix is reserved for generated symbols. The adapters are
+/// `inline`, so the indirection costs nothing at runtime.
+fn emitFallibleFlowNodeHelpers(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll(
+        \\// Fallible FlowNode error policy (flow-codegen#27).
+        \\fn __FlowNodePayload(comptime f: anytype) type {
+        \\    const R = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+        \\    return switch (@typeInfo(R)) {
+        \\        .error_union => |eu| eu.payload,
+        \\        else => R,
+        \\    };
+        \\}
+        \\inline fn __flowCommand(comptime f: anytype, args: anytype) void {
+        \\    if (@typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?) == .error_union) {
+        \\        @call(.auto, f, args) catch |__err|
+        \\            std.log.scoped(.flow).err("flow command node failed: {s}", .{@errorName(__err)});
+        \\    } else {
+        \\        @call(.auto, f, args);
+        \\    }
+        \\}
+        \\inline fn __flowReport(comptime f: anytype, args: anytype) __FlowNodePayload(f) {
+        \\    if (@typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?) == .error_union) {
+        \\        return @call(.auto, f, args) catch |__err|
+        \\            std.debug.panic("flow reporter node failed: {s}", .{@errorName(__err)});
+        \\    } else {
+        \\        return @call(.auto, f, args);
+        \\    }
+        \\}
+        \\
+        \\
+    );
 }
 
 // =====================================================================
