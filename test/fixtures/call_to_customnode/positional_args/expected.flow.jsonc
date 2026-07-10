@@ -1,6 +1,5 @@
 {
   "name": "with_args",
-  "event": { "type": "OnCall" },
   "nodes": [
     { "id": 1, "type": "Literal", "value": 42, "pos": [0, 0] },
     { "id": 2, "type": "Literal", "value": 3.14, "pos": [0, 40] },

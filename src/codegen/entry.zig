@@ -354,7 +354,7 @@ fn renderEntryFunction(
     // function name (`onCall`/`setup`) — see `gateFlowFn` / `emitGate`.
     ctx.flow_fn = entryFunctionName(flow.event);
 
-    // An `OnCall` entry is a subgraph in its own right (RFC §3/§6) —
+    // A `.subgraph` entry is a subgraph in its own right (RFC §3/§6) —
     // it has no `entity` in scope, only declared `params`. An
     // entity-scoped node (`GetComponent` / `SetField`) here must wire
     // its `entity` input pin (RFC-PLUGIN-EVENTS §9); an unwired one
@@ -365,11 +365,11 @@ fn renderEntryFunction(
     // Post-Phase 6 (RFC-FLOW-VOCABULARY): the lifecycle event-header
     // path is gone — every flow that previously bound a lifecycle
     // `entity` identifier now reads `payload.entity` through a wired
-    // `Identifier` node, so `OnCall` is the only entry-function path
+    // `Identifier` node, so `.subgraph` is the only entry-function path
     // through here.
     try assertEntityAvailable(flow);
 
-    // An `OnCall` flow used as the file entry point is a subgraph in
+    // A `.subgraph` flow used as the file entry point is a subgraph in
     // its own right (RFC §3/§6): its `Output` nodes form the return
     // value, exactly as for a referenced subgraph.
     const entry_fn = entryFunctionName(flow.event);
@@ -403,7 +403,7 @@ fn renderEntryFunction(
 
     try emitBody(allocator, bw, &ctx, flow_name, true);
 
-    // Return statement for an OnCall entry with declared Outputs.
+    // Return statement for a subgraph entry with declared Outputs.
     if (outputs.len == 1) {
         const expr = (try ctx.resolveInput(allocator, outputs[0], "value")) orelse return error.DanglingPin;
         defer allocator.free(expr);
@@ -423,8 +423,8 @@ fn renderEntryFunction(
     const body = try body_aw.toOwnedSlice();
     defer allocator.free(body);
 
-    // `game` is the only fixed parameter of an `OnCall` entry — discard
-    // it when unreferenced.
+    // `game` is the only fixed parameter of a `.subgraph` entry —
+    // discard it when unreferenced.
     if (!mentionsIdent(body, "game")) try w.writeAll("    _ = game;\n");
 
     try w.writeAll(body);
@@ -449,7 +449,8 @@ fn renderEntryFunction(
 ///
 /// The v1 legacy form (`module` + `callback` + `params`) was removed
 /// in RFC-PLUGIN-EVENTS phase 6 (flow-codegen#13); a `.flow.jsonc` with
-/// the retired keys now fails to parse in `flow_io.buildEvent`.
+/// the retired keys now fails to parse in `flow_io.buildFlow`, which
+/// rejects any top-level `event:` header outright (flow-codegen#17).
 fn renderEventEntry(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -530,7 +531,7 @@ fn renderNewFormEventEntry(
     // fallback"). A new-form flow has `game` reachable through
     // `game_ptr` but no in-scope `entity` identifier, so an unwired
     // entity pin is the same `DanglingPin` case `assertEntityAvailable`
-    // already raises for `OnCall` entries and `Subflow` subgraphs.
+    // already raises for `.subgraph` entries and `Subflow` subgraphs.
     try assertEntityAvailable(flow);
 
     // Collect every in-graph `Event` node — by document order — so a
@@ -791,7 +792,7 @@ fn writeReturnType(
 /// to in-scope identifiers (RFC §3).
 ///
 /// `outputs` is the entry flow's `Output` nodes (empty for lifecycle
-/// events, which always return `void`). When non-empty — an `OnCall`
+/// events, which always return `void`). When non-empty — a `.subgraph`
 /// entry — the return type follows the subgraph rule (RFC §6): the
 /// single output's `type`, or the `<entry_fn>_Result` struct.
 fn writeFnHeader(
@@ -801,9 +802,9 @@ fn writeFnHeader(
     outputs: []const *const flow_io.Node,
 ) !void {
     switch (flow.event) {
-        // An OnCall flow used as the file entry point still needs a
+        // A subgraph flow used as the file entry point still needs a
         // callable surface — emit `pub fn onCall`.
-        .OnCall => try w.writeAll("pub fn onCall(game: anytype"),
+        .subgraph => try w.writeAll("pub fn onCall(game: anytype"),
         // `OnEvent` flows are emitted by `renderEventEntry`, which
         // never calls this header writer.
         .OnEvent => unreachable,
@@ -835,7 +836,7 @@ fn writeParamArgs(
 /// symbol namespace alongside the subgraph `fn`s.
 fn entryFunctionName(event: flow_io.Event) []const u8 {
     return switch (event) {
-        .OnCall => "onCall",
+        .subgraph => "onCall",
         // An `OnEvent` flow's public entry is its `setup` — the
         // registrar the script-runner calls (see `renderEventEntry`).
         .OnEvent => "setup",
@@ -1035,7 +1036,7 @@ fn assertNoParamCollision(
 
 /// True when `node` is entity-scoped and has no incoming edge on its
 /// optional `entity` input pin (RFC-PLUGIN-EVENTS §9). In a context
-/// where no `entity` identifier is in scope (an `OnCall` entry or a
+/// where no `entity` identifier is in scope (a `.subgraph` entry or a
 /// `Subflow`-referenced subgraph), this is the per-node `DanglingPin`
 /// signal — the v1 blanket-rejection refined to a node-level check.
 fn entityScopedAndUnwired(flow: flow_io.Flow, node: flow_io.Node) bool {
@@ -1051,7 +1052,7 @@ fn entityScopedAndUnwired(flow: flow_io.Flow, node: flow_io.Node) bool {
 
 /// Reject an entity-scoped node missing both an entity-pin wire and an
 /// in-scope `entity` identifier (RFC-PLUGIN-EVENTS §9). Called from the
-/// `OnCall` entry path and `renderSubgraphFunction` — both contexts
+/// `.subgraph` entry path and `renderSubgraphFunction` — both contexts
 /// where `entity` is not a function parameter. Returns `DanglingPin`
 /// against the first offending node so the diagnostic points at a
 /// specific `.flow.jsonc` location, per the RFC §9 per-node check that

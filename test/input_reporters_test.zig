@@ -50,7 +50,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikd_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "space", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }
@@ -89,7 +88,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "kw_key",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "return", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }
@@ -113,7 +111,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikd_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "w", "pos": [10, 20] }
             \\  ],
@@ -143,7 +140,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikd_empty",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "pos": [0, 0] }
             \\  ],
@@ -159,7 +155,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikd_bad",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "1space", "pos": [0, 0] }
             \\  ],
@@ -178,7 +173,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikp_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyPressed", "key": "enter", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }
@@ -209,7 +203,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikp_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyPressed", "key": "left", "pos": [1, 2] }
             \\  ],
@@ -263,7 +256,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "gmx_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetMouseX", "pos": [7, 8] }
             \\  ],
@@ -299,7 +291,6 @@ pub const InputReporterTests = struct {
             \\  "variables": [
             \\    { "name": "moved", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "w", "pos": [0, 0] },
             \\    { "id": 2, "type": "Branch", "pos": [0, 0] },
@@ -335,7 +326,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "gmx_cmp",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetMouseX", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": "100.0", "pos": [0, 0] },
@@ -374,7 +364,6 @@ pub const InputReporterTests = struct {
             \\  "variables": [
             \\    { "name": "ticks", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyDown", "key": "space", "pos": [0, 0] },
             \\    { "id": 2, "type": "While", "pos": [0, 0] },
@@ -427,7 +416,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikr_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyReleased", "key": "w", "pos": [3, 4] }
             \\  ],
@@ -454,7 +442,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "ikr_empty",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsKeyReleased", "pos": [0, 0] }
             \\  ],
@@ -511,7 +498,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "imbd_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsMouseButtonDown", "button": "left", "pos": [5, 6] }
             \\  ],
@@ -538,7 +524,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "imbp_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsMouseButtonPressed", "button": "right", "pos": [0, 0] }
             \\  ],
@@ -566,7 +551,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "imbd_empty",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsMouseButtonDown", "pos": [0, 0] }
             \\  ],
@@ -582,7 +566,6 @@ pub const InputReporterTests = struct {
         const src =
             \\{
             \\  "name": "imbd_bad",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsMouseButtonReleased", "button": "1left", "pos": [0, 0] }
             \\  ],
@@ -603,7 +586,6 @@ pub const InputReporterTests = struct {
             \\  "variables": [
             \\    { "name": "ticks", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IsMouseButtonDown", "button": "left", "pos": [0, 0] },
             \\    { "id": 2, "type": "While", "pos": [0, 0] },
@@ -643,7 +625,6 @@ pub const InputReporterTests = struct {
         const src = try std.fmt.allocPrint(allocator,
             \\{{
             \\  "name": "single",
-            \\  "event": {{ "type": "OnCall" }},
             \\  "nodes": [
             \\    {{ "id": 1, "type": "{s}", "key": "{s}", "pos": [0, 0] }},
             \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }}
@@ -670,7 +651,6 @@ pub const InputReporterTests = struct {
         const src = try std.fmt.allocPrint(allocator,
             \\{{
             \\  "name": "single",
-            \\  "event": {{ "type": "OnCall" }},
             \\  "nodes": [
             \\    {{ "id": 1, "type": "{s}", "button": "{s}", "pos": [0, 0] }},
             \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "bool", "pos": [0, 0] }}
@@ -698,7 +678,6 @@ pub const InputReporterTests = struct {
         const src = try std.fmt.allocPrint(allocator,
             \\{{
             \\  "name": "single",
-            \\  "event": {{ "type": "OnCall" }},
             \\  "nodes": [
             \\    {{ "id": 1, "type": "{s}", "pos": [0, 0] }},
             \\    {{ "id": 2, "type": "Output", "name": "out", "value_type": "{s}", "pos": [0, 0] }}

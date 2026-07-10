@@ -12,7 +12,6 @@ pub const SubflowTests = struct {
     const combat_subgraph =
         \\{
         \\  "name": "combat_subgraph",
-        \\  "event": { "type": "OnCall" },
         \\  "params": [ { "name": "damage", "type": "f32", "default": 10.0 } ],
         \\  "nodes": [
         \\    { "id": 1, "type": "Param", "param": "damage", "pos": [0, 0] },
@@ -31,7 +30,6 @@ pub const SubflowTests = struct {
     const void_subgraph =
         \\{
         \\  "name": "void_sub",
-        \\  "event": { "type": "OnCall" },
         \\  "nodes": [
         \\    { "id": 1, "type": "Call", "callee": "doSideEffect", "pos": [0, 0] }
         \\  ],
@@ -233,7 +231,6 @@ pub const SubflowTests = struct {
         const flow_a =
             \\{
             \\  "name": "a",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "b", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -241,7 +238,6 @@ pub const SubflowTests = struct {
         const flow_b =
             \\{
             \\  "name": "b",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "a", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -293,7 +289,6 @@ pub const SubflowTests = struct {
         const left =
             \\{
             \\  "name": "left",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "combat_subgraph", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -301,7 +296,6 @@ pub const SubflowTests = struct {
         const right =
             \\{
             \\  "name": "right",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "combat_subgraph", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -388,7 +382,6 @@ pub const SubflowTests = struct {
         const multi =
             \\{
             \\  "name": "multi",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "x", "type": "f32", "default": 1.0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "x", "pos": [0, 0] },
@@ -432,7 +425,6 @@ pub const SubflowTests = struct {
         const b_src =
             \\{
             \\  "name": "b",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "b", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -468,7 +460,6 @@ pub const SubflowTests = struct {
         const wrapper =
             \\{
             \\  "name": "wrapper",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Subflow", "flow": "combat_subgraph", "bindings": { "damage": 5.0 }, "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "f32", "pos": [0, 0] }
@@ -553,7 +544,6 @@ pub const SubflowTests = struct {
         const ab_dash =
             \\{
             \\  "name": "a-b",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -561,7 +551,6 @@ pub const SubflowTests = struct {
         const ab_under =
             \\{
             \\  "name": "a_b",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -605,7 +594,6 @@ pub const SubflowTests = struct {
         const sub_src =
             \\{
             \\  "name": "needs_entity",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "GetComponent", "component": "Health", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -638,7 +626,6 @@ pub const SubflowTests = struct {
         const src =
             \\{
             \\  "name": "binds",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Subflow", "flow": "x",
             \\      "bindings": { "zeta": 1, "alpha": 2, "mid": 3 }, "pos": [0, 0] }
@@ -662,7 +649,6 @@ pub const SubflowTests = struct {
         const sub_src =
             \\{
             \\  "name": "onCall",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -671,7 +657,6 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "uses_oncall_named",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [ { "id": 1, "type": "Subflow", "flow": "onCall", "pos": [0, 0] } ],
             \\  "edges": []
             \\}
@@ -699,7 +684,6 @@ pub const SubflowTests = struct {
         const entry_src =
             \\{
             \\  "name": "colliding_outputs",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "x", "type": "f32", "default": 1.0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "x", "pos": [0, 0] },
@@ -725,12 +709,11 @@ pub const SubflowTests = struct {
         );
     }
 
-    test "OnCall entry with a single Output returns it" {
+    test "subgraph entry with a single Output returns it" {
         const allocator = std.testing.allocator;
         const entry_src =
             \\{
             \\  "name": "scoring",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "base", "type": "f32", "default": 3.0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "base", "pos": [0, 0] },
@@ -764,12 +747,11 @@ pub const SubflowTests = struct {
         try expect.equal(ast.errors.len, @as(usize, 0));
     }
 
-    test "OnCall entry with multiple Outputs returns a result struct" {
+    test "subgraph entry with multiple Outputs returns a result struct" {
         const allocator = std.testing.allocator;
         const entry_src =
             \\{
             \\  "name": "stats",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "base", "type": "f32", "default": 1.0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "base", "pos": [0, 0] },
@@ -812,7 +794,6 @@ pub const SubflowTests = struct {
         const multi =
             \\{
             \\  "name": "odd_names",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "x", "type": "f32", "default": 1.0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "x", "pos": [0, 0] },

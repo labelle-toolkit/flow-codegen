@@ -180,7 +180,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "noop",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -212,7 +211,6 @@ pub const CoercionTests = struct {
             \\    { "name": "lo", "type": "i32", "default": 0 },
             \\    { "name": "hi", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -268,7 +266,6 @@ pub const CoercionTests = struct {
             \\    { "name": "mirror", "type": "i32", "default": 0 },
             \\    { "name": "flag", "type": "bool", "default": true }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "flag", "pos": [0, 0] },
             \\    { "id": 2, "type": "Branch", "pos": [0, 0] },
@@ -318,7 +315,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "br_shared",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
@@ -363,7 +359,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "br_exec_reporter",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
@@ -403,7 +398,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "br_default",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Branch", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -432,7 +426,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "br_rt",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Branch", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -471,7 +464,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "flat",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 4, "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
@@ -505,7 +497,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "fr_basic",
             \\  "variables": [ { "name": "acc", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -553,7 +544,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "fr_default",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -589,7 +579,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "wh_reeval",
             \\  "variables": [ { "name": "x", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -629,7 +618,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "wh_default",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "While", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 3, "pos": [0, 0] },
@@ -665,7 +653,6 @@ pub const CoercionTests = struct {
                 \\{
                 \\  "name": "ok_for",
                 \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
-                \\  "event": { "type": "OnCall" },
                 \\  "nodes": [
                 \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
                 \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
@@ -687,7 +674,6 @@ pub const CoercionTests = struct {
                 \\{
                 \\  "name": "ok_while",
                 \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
-                \\  "event": { "type": "OnCall" },
                 \\  "nodes": [
                 \\    { "id": 1, "type": "While", "pos": [0, 0] },
                 \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
@@ -709,7 +695,6 @@ pub const CoercionTests = struct {
                 \\{
                 \\  "name": "bad_src",
                 \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
-                \\  "event": { "type": "OnCall" },
                 \\  "nodes": [
                 \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
                 \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
@@ -730,7 +715,6 @@ pub const CoercionTests = struct {
                 \\{
                 \\  "name": "bad_pin",
                 \\  "variables": [ { "name": "n", "type": "?i32", "default": null } ],
-                \\  "event": { "type": "OnCall" },
                 \\  "nodes": [
                 \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
                 \\    { "id": 2, "type": "ClearVariable", "name": "n", "pos": [0, 0] }
@@ -753,7 +737,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "nested",
             \\  "variables": [ { "name": "go", "type": "bool", "default": true }, { "name": "acc", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "go", "pos": [0, 0] },
             \\    { "id": 2, "type": "While", "pos": [0, 0] },
@@ -795,7 +778,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "wh_suppress",
             \\  "variables": [ { "name": "x", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -845,7 +827,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "wh_shared",
             \\  "variables": [ { "name": "x", "type": "i32", "default": 0 }, { "name": "y", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "x", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -894,7 +875,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "fr_oos",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForRange", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
@@ -926,7 +906,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "sel_basic",
             \\  "variables": [ { "name": "picked", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 10, "pos": [0, 0] },
@@ -968,7 +947,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "sel_defaults",
             \\  "variables": [ { "name": "picked", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
             \\    { "id": 2, "type": "Select", "pos": [0, 0] },
@@ -1011,7 +989,6 @@ pub const CoercionTests = struct {
             \\    { "name": "b", "type": "i32", "default": 0 },
             \\    { "name": "c", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
@@ -1061,7 +1038,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "sw_noelse",
             \\  "variables": [ { "name": "a", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
@@ -1100,7 +1076,6 @@ pub const CoercionTests = struct {
             \\    { "name": "count", "type": "i32", "default": 0 },
             \\    { "name": "mirror", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
@@ -1152,7 +1127,6 @@ pub const CoercionTests = struct {
             \\    { "name": "a", "type": "i32", "default": 0 },
             \\    { "name": "x", "type": "?i32", "default": null }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
@@ -1185,7 +1159,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "sw_badpin",
             \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Switch", "pos": [0, 0] },
@@ -1210,7 +1183,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "sel_notexec",
             \\  "variables": [ { "name": "x", "type": "?i32", "default": null } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Select", "pos": [0, 0] },
             \\    { "id": 2, "type": "ClearVariable", "name": "x", "pos": [0, 0] }
@@ -1234,7 +1206,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_decl",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1256,7 +1227,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_append",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
             \\    { "id": 2, "type": "ListAppend", "collection": "scores", "pos": [0, 0] }
@@ -1283,7 +1253,6 @@ pub const CoercionTests = struct {
             \\  "name": "list_len",
             \\  "variables": [ { "name": "n", "type": "usize", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ListLength", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "n", "pos": [0, 0] }
@@ -1311,7 +1280,6 @@ pub const CoercionTests = struct {
             \\  "name": "list_get",
             \\  "variables": [ { "name": "v", "type": "u32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "ListGet", "collection": "scores", "pos": [0, 0] },
@@ -1339,7 +1307,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_set",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
@@ -1368,7 +1335,6 @@ pub const CoercionTests = struct {
             \\  "name": "list_contains",
             \\  "variables": [ { "name": "has", "type": "bool", "default": false } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
             \\    { "id": 2, "type": "ListContains", "collection": "scores", "pos": [0, 0] },
@@ -1396,7 +1362,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_clear",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
             \\  ],
@@ -1424,7 +1389,6 @@ pub const CoercionTests = struct {
             \\    { "name": "last", "type": "usize", "default": 0 }
             \\  ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "sum", "pos": [0, 0] },
@@ -1463,7 +1427,6 @@ pub const CoercionTests = struct {
             \\  "name": "foreach_item_only",
             \\  "variables": [ { "name": "sum", "type": "u32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "sum", "pos": [0, 0] }
@@ -1493,7 +1456,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "foreach_neither",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
@@ -1521,7 +1483,6 @@ pub const CoercionTests = struct {
             \\  "name": "list_clash_var",
             \\  "variables": [ { "name": "scores", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1536,7 +1497,6 @@ pub const CoercionTests = struct {
             \\  "name": "list_clash_local",
             \\  "locals": [ { "name": "scores", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1549,7 +1509,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "list_unknown",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ListClear", "collection": "ghost", "pos": [0, 0] }
             \\  ],
@@ -1564,7 +1523,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "kind_mismatch",
-            \\  "event": { "type": "OnCall" },
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
@@ -1580,7 +1538,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "kind_mismatch2",
-            \\  "event": { "type": "OnCall" },
             \\  "collections": [ { "name": "xs", "element": "u32" } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "MapClear", "collection": "xs", "pos": [0, 0] }
@@ -1601,7 +1558,6 @@ pub const CoercionTests = struct {
             \\  "name": "foreach_oos",
             \\  "variables": [ { "name": "out", "type": "u32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
@@ -1626,7 +1582,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_roundtrip",
             \\  "collections": [ { "name": "scores", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "ListClear", "collection": "scores", "pos": [0, 0] }
@@ -1660,7 +1615,6 @@ pub const CoercionTests = struct {
         const src =
             \\{
             \\  "name": "no_collections",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1683,7 +1637,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_decl",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1704,7 +1657,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_set",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -1733,7 +1685,6 @@ pub const CoercionTests = struct {
             \\  "name": "map_get",
             \\  "variables": [ { "name": "v", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": -1, "pos": [0, 0] },
@@ -1764,7 +1715,6 @@ pub const CoercionTests = struct {
             \\  "name": "map_get_nodef",
             \\  "variables": [ { "name": "v", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 3, "pos": [0, 0] },
             \\    { "id": 2, "type": "MapGet", "collection": "scores", "pos": [0, 0] },
@@ -1794,7 +1744,6 @@ pub const CoercionTests = struct {
             \\  "name": "map_has",
             \\  "variables": [ { "name": "h", "type": "bool", "default": false } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
             \\    { "id": 2, "type": "MapHas", "collection": "scores", "pos": [0, 0] },
@@ -1822,7 +1771,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_remove",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 5, "pos": [0, 0] },
             \\    { "id": 2, "type": "MapRemove", "collection": "scores", "pos": [0, 0] }
@@ -1849,7 +1797,6 @@ pub const CoercionTests = struct {
             \\  "name": "map_len_clear",
             \\  "variables": [ { "name": "n", "type": "usize", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "MapLength", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "n", "pos": [0, 0] },
@@ -1882,7 +1829,6 @@ pub const CoercionTests = struct {
             \\    { "name": "vsum", "type": "i32", "default": 0 }
             \\  ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "ksum", "pos": [0, 0] },
@@ -1922,7 +1868,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "mapforeach_neither",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "MapClear", "collection": "scores", "pos": [0, 0] }
@@ -1954,7 +1899,6 @@ pub const CoercionTests = struct {
             \\  "name": "mapforeach_oos",
             \\  "variables": [ { "name": "out", "type": "u32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "SetVariable", "name": "out", "pos": [0, 0] }
@@ -1980,7 +1924,6 @@ pub const CoercionTests = struct {
             \\  "name": "map_clash_var",
             \\  "variables": [ { "name": "scores", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -1994,7 +1937,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_no_key",
             \\  "collections": [ { "name": "scores", "kind": "map", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -2008,7 +1950,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_no_value",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -2022,7 +1963,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_no_element",
             \\  "collections": [ { "name": "xs" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -2036,7 +1976,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "map_roundtrip",
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "MapForEach", "collection": "scores", "pos": [0, 0] },
             \\    { "id": 2, "type": "MapClear", "collection": "scores", "pos": [0, 0] }
@@ -2073,7 +2012,6 @@ pub const CoercionTests = struct {
             \\{
             \\  "name": "list_backcompat",
             \\  "collections": [ { "name": "xs", "element": "u32" } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}

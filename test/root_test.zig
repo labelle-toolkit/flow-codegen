@@ -63,13 +63,13 @@ pub const DelayTests = @import("delay_test.zig").DelayTests;
 /// purely how `renderFlowFile` lowers a structurally-valid graph, so
 /// the parser is deliberately kept out of the loop.
 pub const CodegenValidationTests = zspec.context("codegen rejects flows that would emit invalid Zig", struct {
-    /// `flow_io.Flow` factory — an empty `OnCall` flow by default;
+    /// `flow_io.Flow` factory — an empty `.subgraph` flow by default;
     /// each test overrides only the fields under test. The factory
     /// supplies every field (it does not fall back to struct field
     /// defaults), so `params` / `nodes` / `edges` default to empty.
     const FlowFactory = zspec.Factory.define(flow_io.Flow, .{
         .name = "flow",
-        .event = flow_io.Event{ .OnCall = {} },
+        .event = flow_io.Event{ .subgraph = {} },
         .params = &.{},
         .variables = &.{},
         .locals = &.{},
@@ -144,7 +144,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
     test "allows a subgraph param named `dt` (no implicit lifecycle arg reservation)" {
         const allocator = std.testing.allocator;
         // Post-Phase 6 (RFC-FLOW-VOCABULARY) the lifecycle dt/entity
-        // args are gone; an `OnCall` subgraph emits `fn (game,
+        // args are gone; a `.subgraph` entry emits `fn (game,
         // <params>)`, so a param named `dt` is a regular param — no
         // implicit reservation, no collision.
         var sub_params = [_]flow_io.Param{
@@ -159,7 +159,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         };
         const sub = FlowFactory.build(.{
             .name = "tick_helper",
-            .event = flow_io.Event{ .OnCall = {} },
+            .event = flow_io.Event{ .subgraph = {} },
             .params = &sub_params,
             .nodes = &sub_nodes,
             .edges = &sub_edges,
@@ -169,7 +169,7 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         };
         const entry = FlowFactory.build(.{
             .name = "uses_tick_helper",
-            .event = flow_io.Event{ .OnCall = {} },
+            .event = flow_io.Event{ .subgraph = {} },
             .nodes = &entry_nodes,
         });
 
@@ -206,9 +206,9 @@ pub const CodegenValidationTests = zspec.context("codegen rejects flows that wou
         );
     }
 
-    test "rejects an entity-scoped node in an OnCall entry flow with no entity-pin wire" {
+    test "rejects an entity-scoped node in a subgraph entry flow with no entity-pin wire" {
         const allocator = std.testing.allocator;
-        // An `OnCall` entry is a subgraph in its own right (RFC §3/§6)
+        // A `.subgraph` entry is a subgraph in its own right (RFC §3/§6)
         // — no `entity` in scope. An entity-scoped node without a wire
         // on its `entity` input pin (RFC-PLUGIN-EVENTS §9) is
         // `DanglingPin`. Replaces the v1 blanket

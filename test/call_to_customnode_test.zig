@@ -75,7 +75,6 @@ pub const CallToCustomNodeTests = struct {
         const input =
             \\{
             \\  "name": "f",
-            \\  "event": { "type": "OnCall" },
             \\  "locals": [ { "name": "tmp", "type": "i32", "default": 0 } ],
             \\  "collections": [ { "name": "xs", "element": "u32" } ],
             \\  "nodes": [ { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] } ],
@@ -102,7 +101,6 @@ pub const CallToCustomNodeTests = struct {
         const input =
             \\{
             \\  "name": "f",
-            \\  "event": { "type": "OnCall" },
             \\  "collections": [ { "name": "scores", "kind": "map", "key": "u32", "value": "i32" } ],
             \\  "nodes": [ { "id": 1, "type": "MapClear", "collection": "scores", "pos": [0, 0] } ],
             \\  "edges": []
@@ -190,7 +188,6 @@ pub const CallToCustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "no_calls",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "1.5", "pos": [0, 0] }
             \\  ],
@@ -288,7 +285,6 @@ pub const CallToCustomNodeTests = struct {
         const src =
             \\{
             \\  "name": "all_paths",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Call", "callee": "box2d.applyImpulse", "pos": [0, 0] },
             \\    { "id": 2, "type": "Call", "callee": "applyImpulse", "pos": [0, 0] },

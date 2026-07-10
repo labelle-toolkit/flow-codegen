@@ -295,7 +295,7 @@ pub fn convertFlow(
     }
 
     const new_event: flow_io.Event = switch (flow.event) {
-        .OnCall => .OnCall,
+        .subgraph => .subgraph,
         .OnEvent => |b| .{ .OnEvent = .{
             .name = if (b.name) |n| try a.dupe(u8, n) else null,
             .priority = b.priority,

@@ -32,7 +32,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "fmt_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "\"hp\"", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 42, "pos": [0, 0] },
@@ -75,7 +74,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "fmt_order",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 2, "pos": [0, 0] },
@@ -112,7 +110,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "fmt_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Format", "template": "score: {d}", "pos": [10, 20] }
             \\  ],
@@ -141,7 +138,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "fmt_empty",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Format", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "[]const u8", "pos": [0, 0] }
@@ -175,7 +171,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "concat_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "\"a\"", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": "\"b\"", "pos": [0, 0] },
@@ -213,7 +208,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "concat_one",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "\"a\"", "pos": [0, 0] },
             \\    { "id": 2, "type": "Concat", "pos": [0, 0] },
@@ -248,7 +242,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "concat_zero",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Concat", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "value_type": "[]const u8", "pos": [0, 0] }
@@ -279,7 +272,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "concat_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Concat", "pos": [5, 6] }
             \\  ],
@@ -309,7 +301,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "i2s_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
             \\    { "id": 2, "type": "IntToString", "pos": [0, 0] },
@@ -342,7 +333,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "i2s_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "IntToString", "pos": [1, 2] }
             \\  ],
@@ -372,7 +362,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "f2s_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": "1.5", "pos": [0, 0] },
             \\    { "id": 2, "type": "FloatToString", "pos": [0, 0] },
@@ -405,7 +394,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "f2s_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "FloatToString", "pos": [3, 4] }
             \\  ],
@@ -439,7 +427,6 @@ pub const StringNodeTests = struct {
         const src =
             \\{
             \\  "name": "shared_fmt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 9, "pos": [0, 0] },
             \\    { "id": 2, "type": "Format", "template": "v={d}", "pos": [0, 0] },

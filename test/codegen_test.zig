@@ -28,7 +28,6 @@ pub const FlowCodegenTests = struct {
         const allocator = std.testing.allocator;
         const out = try render(allocator,
             \\{
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "damage", "type": "f32", "default": 5.0 } ],
             \\  "nodes": [ { "id": 1, "type": "Param", "param": "damage", "pos": [0, 0] } ],
             \\  "edges": []
@@ -261,7 +260,7 @@ pub const FlowCodegenTests = struct {
     // unwired case is `DanglingPin`. The "all-wired" subcase is
     // covered by the `renders GetComponent / SetField` tests above.
 
-    test "OnCall entry with a wired entity-pin GetComponent is allowed" {
+    test "subgraph entry with a wired entity-pin GetComponent is allowed" {
         const allocator = std.testing.allocator;
         // An `OnCall` entry has no in-scope `entity`. RFC-PLUGIN-EVENTS
         // §9 lifts the v1 blanket-rejection: a `GetComponent` whose
@@ -270,7 +269,6 @@ pub const FlowCodegenTests = struct {
         const out = try render(allocator,
             \\{
             \\  "name": "oncall_wired",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "subject", "type": "u32" } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Param", "param": "subject", "pos": [0, 0] },

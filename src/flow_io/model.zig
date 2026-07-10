@@ -8,18 +8,23 @@
 
 const std = @import("std");
 
-/// Event entry point for a flow. Per RFC-FLOW-VOCABULARY §3 (Phase 6),
-/// event-driven flows declare their trigger as an in-graph `Event` node;
-/// the loader synthesizes `Flow.event = .{ .OnEvent = ... }` from the
-/// node's name so downstream consumers (assembler `flow_scanner`,
-/// codegen's `FlowEventHandler` path) keep working unchanged. The
-/// legacy file-level `event:` header is retained for one case only:
-/// `OnCall` (RFC §3) — the entry point for a *subgraph* invoked by a
-/// `Subflow` node rather than dispatched by an event.
+/// Event entry point for a flow. Per RFC-FLOW-VOCABULARY §3, a flow's
+/// trigger is determined entirely from its graph: event-driven flows
+/// declare their trigger as one or more in-graph `Event` nodes and the
+/// loader synthesizes `Flow.event = .{ .OnEvent = ... }` from the node's
+/// name (so downstream consumers — assembler `flow_scanner`, codegen's
+/// `FlowEventHandler` path — keep working unchanged); a flow with ZERO
+/// `Event` nodes is a *subgraph* (`.subgraph`), the entry point invoked
+/// by a `Subflow` node rather than dispatched by an event.
+///
+/// The legacy file-level `event:` header — including the retired
+/// `OnCall` discriminator (flow-codegen#17) — is no longer accepted; any
+/// top-level `event:` key is rejected by `buildFlow`.
 pub const Event = union(enum) {
-    /// Subgraph entry point (RFC §3). Set via the file-level
-    /// `event: { "type": "OnCall" }` header.
-    OnCall,
+    /// Subgraph entry point (RFC §3). Synthesized by `buildFlow` for any
+    /// flow that declares no in-graph `Event` node — the mechanism that
+    /// superseded the retired `OnCall` header (flow-codegen#17).
+    subgraph,
     /// Synthesized from an in-graph `Event` node (RFC-FLOW-VOCABULARY §3).
     /// `name` is the dotted event name (`"box2d.collision_begin"`,
     /// `"engine.tick"`). Resolution is the assembler's comptime
@@ -632,11 +637,11 @@ pub const Flow = struct {
     /// Effective name (RFC §5): the top-level `"name"` field, else the
     /// filename basename. Empty when neither is available.
     name: []const u8 = "",
-    /// The flow's trigger. Either set from the file-level `event:`
-    /// header (legacy / lifecycle path) or synthesized from an `Event`
-    /// node in `nodes` (RFC-FLOW-VOCABULARY §3 — new-form flows). At
-    /// most one of the two sources may be present; `buildFlow`
-    /// rejects a file with both.
+    /// The flow's trigger, derived from the graph (RFC-FLOW-VOCABULARY
+    /// §3): `.{ .OnEvent = ... }` synthesized from the first in-graph
+    /// `Event` node, or `.subgraph` when the flow declares no `Event`
+    /// node. There is no file-level `event:` header — `buildFlow`
+    /// rejects any top-level `event:` key (flow-codegen#17).
     event: Event,
     params: []Param = &.{},
     /// Top-level declared variables (RFC-FLOW-VOCABULARY §4). Each
@@ -699,7 +704,11 @@ pub const ParseError = error{
     MalformedFlow,
     /// A node's `"type"` string is not a known node kind.
     UnknownNodeType,
-    /// An `"event"`'s `"type"` is not a known event kind.
+    /// A top-level `event:` header is present. Post-flow-codegen#17 the
+    /// file-level `event:` header (including the retired `OnCall`
+    /// discriminator) is no longer accepted — a flow's trigger is derived
+    /// from its in-graph `Event` nodes, and a flow with none is a
+    /// subgraph. Any `event:` key is rejected with this error.
     UnknownEventType,
     /// Two nodes share the same `id`.
     DuplicateNodeId,
@@ -713,9 +722,13 @@ pub const ParseError = error{
     DuplicateParamName,
     /// Two `Output` nodes share a `name` (RFC §3).
     DuplicateOutputName,
-    /// A flow file declares both an `event:` header and an in-graph
-    /// `Event` node, or declares neither (RFC-FLOW-VOCABULARY §3 —
-    /// exactly one trigger source).
+    /// Reserved — formerly returned when a flow declared both an
+    /// `event:` header and an in-graph `Event` node, or neither
+    /// (RFC-FLOW-VOCABULARY §3). Post-flow-codegen#17 the header is gone
+    /// (`UnknownEventType` rejects any `event:` key) and a flow with no
+    /// `Event` node is a subgraph, so this is no longer returned. Kept in
+    /// the public error set so downstream exhaustive switches still
+    /// compile.
     ConflictingEventSource,
     /// Reserved — formerly returned for flows with multiple `Event`
     /// nodes. Multi-trigger flows are now allowed (RFC-FLOW-VOCABULARY

@@ -1,6 +1,5 @@
 {
   "name": "uses_import",
-  "event": { "type": "OnCall" },
   "nodes": [
     { "id": 1, "type": "Call", "callee": "@import(\"../hits.zig\").currentTotal", "pos": [0, 0] }
   ],

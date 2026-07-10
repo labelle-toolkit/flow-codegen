@@ -84,7 +84,11 @@ pub const FlowVocabularyTests = struct {
         try expect.toBeTrue(std.mem.indexOf(u8, rendered, "\"event\":") == null);
     }
 
-    test "rejects file with both header and Event node" {
+    test "rejects any top-level event header (flow-codegen#17)" {
+        // Post-flow-codegen#17 the file-level `event:` header — including
+        // the retired `OnCall` discriminator — is gone. A flow's trigger
+        // is derived from its in-graph `Event` nodes, so ANY `event:` key
+        // is rejected, even alongside a valid Event node.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -96,12 +100,14 @@ pub const FlowVocabularyTests = struct {
             \\}
         ;
         try std.testing.expectError(
-            error.ConflictingEventSource,
+            error.UnknownEventType,
             flow_io.parseFlow(allocator, src),
         );
     }
 
-    test "rejects file with no event source" {
+    test "a flow with no Event node is a subgraph (flow-codegen#17)" {
+        // RFC-FLOW-VOCABULARY §3: "a flow with zero Event nodes is a
+        // subgraph" — the mechanism that superseded the `OnCall` header.
         const allocator = std.testing.allocator;
         const src =
             \\{
@@ -109,10 +115,9 @@ pub const FlowVocabularyTests = struct {
             \\  "edges": []
             \\}
         ;
-        try std.testing.expectError(
-            error.ConflictingEventSource,
-            flow_io.parseFlow(allocator, src),
-        );
+        var loaded = try flow_io.parseFlow(allocator, src);
+        defer loaded.deinit();
+        try expect.equal(@as(std.meta.Tag(flow_io.Event), loaded.flow.event), .subgraph);
     }
 
     test "parses a multi-trigger flow with two Event nodes" {
@@ -165,7 +170,6 @@ pub const FlowVocabularyTests = struct {
             \\    { "name": "x", "type": "i32", "default": 0 },
             \\    { "name": "x", "type": "f32", "default": 1.0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -296,7 +300,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "count", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "count", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 1, "pos": [0, 0] },
@@ -335,7 +338,6 @@ pub const FlowVocabularyTests = struct {
             \\  "locals": [
             \\    { "name": "tmp", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "tmp", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 1, "pos": [0, 0] },
@@ -383,7 +385,6 @@ pub const FlowVocabularyTests = struct {
             \\  "locals": [
             \\    { "name": "tmp", "type": "i32", "default": 7 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "GetVariable", "name": "tmp", "pos": [0, 0] },
             \\    { "id": 2, "type": "Output", "name": "out", "pos": [0, 0] }
@@ -421,7 +422,6 @@ pub const FlowVocabularyTests = struct {
             \\  "locals": [
             \\    { "name": "scratch", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ChangeVariable", "name": "total", "by": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "ChangeVariable", "name": "scratch", "by": 1, "pos": [0, 0] }
@@ -457,7 +457,6 @@ pub const FlowVocabularyTests = struct {
             \\  "locals": [
             \\    { "name": "x", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -477,7 +476,6 @@ pub const FlowVocabularyTests = struct {
             \\    { "name": "y", "type": "i32", "default": 0 },
             \\    { "name": "y", "type": "f32", "default": 1.0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -496,7 +494,6 @@ pub const FlowVocabularyTests = struct {
             \\  "locals": [
             \\    { "name": "tmp", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ChangeVariable", "name": "tmp", "by": 1, "pos": [0, 0] }
             \\  ],
@@ -527,7 +524,6 @@ pub const FlowVocabularyTests = struct {
         const src =
             \\{
             \\  "name": "no_locals",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [],
             \\  "edges": []
             \\}
@@ -559,7 +555,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "target", "type": "?EntityId", "default": null }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
             \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
@@ -594,7 +589,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "target", "type": "?EntityId", "default": null }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
             \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
@@ -623,7 +617,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "target", "type": "?u32", "default": null }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "HasValueVariable", "name": "target", "pos": [0, 0] },
             \\    { "id": 2, "type": "ClearVariable", "name": "target", "pos": [0, 0] }
@@ -656,7 +649,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "count", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ClearVariable", "name": "count", "pos": [0, 0] }
             \\  ],
@@ -676,7 +668,6 @@ pub const FlowVocabularyTests = struct {
             \\  "variables": [
             \\    { "name": "count", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "HasValueVariable", "name": "count", "pos": [0, 0] }
             \\  ],
@@ -698,7 +689,6 @@ pub const FlowVocabularyTests = struct {
         const src =
             \\{
             \\  "variables": [],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "ClearVariable", "name": "ghost", "pos": [0, 0] }
             \\  ],

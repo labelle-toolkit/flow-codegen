@@ -84,7 +84,6 @@ pub const loadFromFile = parse.loadFromFile;
 pub const parseFlow = parse.parseFlow;
 pub const parseFlowNamed = parse.parseFlowNamed;
 pub const displayNameFromPath = parse.displayNameFromPath;
-pub const buildEvent = parse.buildEvent;
 
 // ---------------------------------------------------------------------
 // Render / save entry points (flow_io/write.zig)

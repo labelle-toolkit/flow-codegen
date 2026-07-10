@@ -52,7 +52,6 @@ pub const DelayTests = struct {
     const callee_sub =
         \\{
         \\  "name": "deferred_body",
-        \\  "event": { "type": "OnCall" },
         \\  "params": [
         \\    { "name": "amount", "type": "i32", "default": 0 },
         \\    { "name": "flag", "type": "bool", "default": false }
@@ -82,7 +81,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_demo",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 2.5, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] },
@@ -152,7 +150,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_default",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] }
@@ -191,7 +188,6 @@ pub const DelayTests = struct {
         const noparam_sub =
             \\{
             \\  "name": "noparam_body",
-            \\  "event": { "type": "OnCall" },
             \\  "locals": [ { "name": "sink", "type": "i32", "default": 0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -205,7 +201,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_noparam",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "noparam_body", "pos": [0, 0] }
@@ -254,7 +249,6 @@ pub const DelayTests = struct {
         const mid_sub =
             \\{
             \\  "name": "mid_caller",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 3.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] }
@@ -268,7 +262,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_caller",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 2.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "mid_caller", "pos": [0, 0] }
@@ -327,7 +320,6 @@ pub const DelayTests = struct {
             \\{
             \\  "name": "bad_delay_target",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
@@ -350,7 +342,6 @@ pub const DelayTests = struct {
         const src =
             \\{
             \\  "name": "dangling_delay",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1.0, "pos": [0, 0] }
             \\  ],
@@ -373,7 +364,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_out",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] },
@@ -414,7 +404,6 @@ pub const DelayTests = struct {
         const entry_src =
             \\{
             \\  "name": "delay_param",
-            \\  "event": { "type": "OnCall" },
             \\  "params": [ { "name": "delay_amt", "type": "i32", "default": 0 } ],
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1, "pos": [0, 0] },
@@ -454,7 +443,6 @@ pub const DelayTests = struct {
         const src =
             \\{
             \\  "name": "delay_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Delay", "seconds": 1.5, "pos": [10, 20] },
             \\    { "id": 2, "type": "Subflow", "flow": "deferred_body", "pos": [0, 0] }

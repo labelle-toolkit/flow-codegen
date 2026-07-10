@@ -33,20 +33,11 @@ pub fn renderFlowJsonc(allocator: std.mem.Allocator, loaded: LoadedFlow) ![]u8 {
         try w.writeAll(",\n");
     }
 
-    // The `event:` header is emitted only when the flow does NOT carry
-    // an in-graph `Event` node (RFC-FLOW-VOCABULARY §3). When the file
-    // uses the new-form trigger node, the event source lives in
-    // `nodes` and the header is omitted; the loader's `buildFlow`
-    // round-trips the same way.
-    const has_event_node = blk: {
-        for (flow.nodes) |n| if (n.kind == .Event) break :blk true;
-        break :blk false;
-    };
-    if (!has_event_node) {
-        try w.writeAll("  \"event\": ");
-        try writeEvent(w, flow.event);
-        try w.writeAll(",\n");
-    }
+    // No `event:` header is ever emitted (RFC-FLOW-VOCABULARY §3,
+    // flow-codegen#17): an event-driven flow carries its trigger as an
+    // in-graph `Event` node and a subgraph declares no trigger at all, so
+    // the flow's trigger round-trips through `nodes` alone. The loader's
+    // `buildFlow` rejects any top-level `event:` key.
 
     // Variables block (RFC-FLOW-VOCABULARY §4). Omitted when empty.
     if (flow.variables.len != 0) {
@@ -483,18 +474,6 @@ fn writeNodePayload(w: anytype, allocator: std.mem.Allocator, k: NodeKind) !void
             try w.writeAll(", \"collection\": ");
             try writeJsonString(w, collection);
         },
-    }
-}
-
-fn writeEvent(w: anytype, ev: Event) !void {
-    switch (ev) {
-        .OnCall => try w.writeAll("{ \"type\": \"OnCall\" }"),
-        // `OnEvent` is only ever synthesized from an in-graph `Event`
-        // node post-Phase 6 — the in-graph form is the on-disk source
-        // of truth and `renderFlowJsonc` omits the `event:` header for
-        // any flow that carries an Event node (see the `has_event_node`
-        // guard there). This arm is therefore unreachable at runtime.
-        .OnEvent => unreachable,
     }
 }
 

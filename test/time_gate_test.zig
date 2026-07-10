@@ -47,7 +47,6 @@ pub const TimeGateTests = struct {
             \\{
             \\  "name": "once_demo",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Once", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
@@ -95,7 +94,6 @@ pub const TimeGateTests = struct {
         const src =
             \\{
             \\  "name": "once_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Once", "pos": [10, 20] }
             \\  ],
@@ -125,7 +123,6 @@ pub const TimeGateTests = struct {
             \\{
             \\  "name": "cd_demo",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Cooldown", "seconds": 2.5, "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
@@ -177,7 +174,6 @@ pub const TimeGateTests = struct {
             \\{
             \\  "name": "cd_default",
             \\  "variables": [ { "name": "out", "type": "i32", "default": 0 } ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Cooldown", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 9, "pos": [0, 0] },
@@ -207,7 +203,6 @@ pub const TimeGateTests = struct {
         const src =
             \\{
             \\  "name": "cd_rt",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Cooldown", "seconds": 1.5, "pos": [10, 20] }
             \\  ],
@@ -244,7 +239,6 @@ pub const TimeGateTests = struct {
             \\    { "name": "a", "type": "i32", "default": 0 },
             \\    { "name": "b", "type": "i32", "default": 0 }
             \\  ],
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Once", "pos": [0, 0] },
             \\    { "id": 2, "type": "Literal", "value": 1, "pos": [0, 0] },
@@ -302,7 +296,6 @@ pub const TimeGateTests = struct {
         \\{
         \\  "name": "inner_once_sub",
         \\  "locals": [ { "name": "inner_out", "type": "i32", "default": 0 } ],
-        \\  "event": { "type": "OnCall" },
         \\  "nodes": [
         \\    { "id": 1, "type": "Once", "pos": [0, 0] },
         \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -324,7 +317,6 @@ pub const TimeGateTests = struct {
         const entry_src =
             \\{
             \\  "name": "gated_caller",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Once", "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "inner_once_sub", "pos": [0, 0] }
@@ -379,7 +371,6 @@ pub const TimeGateTests = struct {
         \\{
         \\  "name": "inner_cd_sub",
         \\  "locals": [ { "name": "inner_out", "type": "i32", "default": 0 } ],
-        \\  "event": { "type": "OnCall" },
         \\  "nodes": [
         \\    { "id": 1, "type": "Cooldown", "seconds": 1.0, "pos": [0, 0] },
         \\    { "id": 2, "type": "Literal", "value": 7, "pos": [0, 0] },
@@ -399,7 +390,6 @@ pub const TimeGateTests = struct {
         const entry_src =
             \\{
             \\  "name": "cd_caller",
-            \\  "event": { "type": "OnCall" },
             \\  "nodes": [
             \\    { "id": 1, "type": "Cooldown", "seconds": 2.0, "pos": [0, 0] },
             \\    { "id": 2, "type": "Subflow", "flow": "inner_cd_sub", "pos": [0, 0] }

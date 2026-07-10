@@ -104,19 +104,22 @@ pub fn buildFlow(
     const edges = try buildEdges(a, obj.get("edges"));
     const exec_edges = try buildExecEdges(a, obj.get("exec_edges"));
 
-    // Resolve the flow's trigger. Per RFC-FLOW-VOCABULARY §3 (Phase 6),
-    // event-driven flows declare their trigger as one or more in-graph
-    // `Event` nodes; the only file-level `event:` header still allowed
-    // is `event: { "type": "OnCall" }` for subgraphs. Declaring both an
-    // `OnCall` header AND any Event node, or declaring neither source,
-    // is `ConflictingEventSource`.
+    // Resolve the flow's trigger entirely from the graph
+    // (RFC-FLOW-VOCABULARY §3). Event-driven flows declare their trigger
+    // as one or more in-graph `Event` nodes; a flow with ZERO `Event`
+    // nodes is a subgraph (`.subgraph`) — the mechanism that superseded
+    // the retired `OnCall` header (flow-codegen#17). The legacy
+    // file-level `event:` header — including the `OnCall` discriminator —
+    // is no longer accepted: any top-level `event:` key is rejected with
+    // `UnknownEventType`.
     //
     // The `Flow.event` field carries a single `Event` for back-compat
     // with downstream consumers (`flow_scanner`). For the multi-trigger
     // case we populate it from the *first* Event node by document
     // order; codegen reads the full set of Event nodes off `flow.nodes`
     // directly and emits one `FlowEventHandler` method per trigger.
-    const header_event_val = obj.get("event");
+    if (obj.get("event") != null) return error.UnknownEventType;
+
     var event_node_count: usize = 0;
     var first_event_node_name: []const u8 = "";
     for (nodes) |n| if (n.kind == .Event) {
@@ -124,19 +127,16 @@ pub fn buildFlow(
         event_node_count += 1;
     };
 
-    const event: Event = blk: {
-        if (header_event_val) |v| {
-            if (event_node_count != 0) return error.ConflictingEventSource;
-            break :blk try buildEvent(a, v);
-        }
-        if (event_node_count >= 1) {
-            break :blk .{ .OnEvent = .{
-                .name = try a.dupe(u8, first_event_node_name),
-                .priority = null,
-            } };
-        }
-        return error.ConflictingEventSource;
-    };
+    const event: Event = if (event_node_count >= 1)
+        // `first_event_node_name` is already owned by the arena — it was
+        // duped out of the JSON in `buildNodeKind`'s `reqStr` — so we
+        // reference it directly rather than re-dup it.
+        .{ .OnEvent = .{
+            .name = first_event_node_name,
+            .priority = null,
+        } }
+    else
+        .subgraph;
 
     return .{
         .name = name,
@@ -149,26 +149,6 @@ pub fn buildFlow(
         .edges = edges,
         .exec_edges = exec_edges,
     };
-}
-
-pub fn buildEvent(a: std.mem.Allocator, v: std.json.Value) !Event {
-    _ = a;
-    if (v != .object) return error.MalformedFlow;
-    const t = (v.object.get("type") orelse return error.MalformedFlow);
-    if (t != .string) return error.MalformedFlow;
-
-    // Phase 6 (RFC-FLOW-VOCABULARY): the only file-level `event:` header
-    // still accepted is `OnCall` (subgraph entry point). Every
-    // event-driven flow — including the formerly lifecycle-headered
-    // `OnUpdate`/`OnCreate`/`OnDestroy` and the legacy
-    // `OnEvent` — must declare its trigger as an in-graph `Event` node
-    // referencing a name from the assembler-emitted `<project>/.labelle/
-    // flow_catalog.json` (e.g. `engine.tick`, `engine.entity_created`,
-    // `engine.entity_destroyed`, `box2d.collision_begin`).
-    if (std.mem.eql(u8, t.string, "OnCall")) {
-        return .OnCall;
-    }
-    return error.UnknownEventType;
 }
 
 pub fn buildVariables(a: std.mem.Allocator, maybe: ?std.json.Value) ![]Variable {
